@@ -946,7 +946,7 @@ def generate_project(
         # Cross-layer validation: bind → hardware/task reference integrity
         if bind_raw:
             from generator.validator import validate_bind_cross_refs
-            cross_errors = validate_bind_cross_refs(hw_raw, task_raw, bind_raw)
+            cross_errors = validate_bind_cross_refs(hw_raw, task_raw, bind_raw, components_raw)
             if cross_errors:
                 _report_validation_errors(cross_errors)
                 sys.exit(1)
@@ -957,6 +957,20 @@ def generate_project(
         hw_model = HardwareModel.model_validate(hw_raw)
         hw = hw_model.model_dump(exclude_none=True)
         logger.info("[OK] Pydantic model validation passed")
+
+        # Inject merged software fields into hw (needed by business
+        # validation AND context building — behavior actions must be
+        # validated at generation time, not at runtime).
+        if "app_tasks" in merged:
+            hw["app_tasks"] = merged["app_tasks"]
+        if "behavior" in merged:
+            hw["behavior"] = merged["behavior"]
+        if "periodic_events" in merged:
+            hw["periodic_events"] = merged["periodic_events"]
+        if "bind_routings" in merged:
+            hw["bind_routings"] = merged["bind_routings"]
+        if pubsub_raw and "topics" in pubsub_raw:
+            hw["topics"] = pubsub_raw["topics"]
 
         # Cross-field business logic validation
         errors = validate_fn(hw)
@@ -1012,16 +1026,6 @@ def generate_project(
                 logger.info("Pin auto-allocation: nothing to allocate")
         elif not allocate_pins:
             logger.info("Pin allocation skipped (--no-allocate-pins)")
-
-        # Inject merged software fields into hw for build_context
-        if "app_tasks" in merged:
-            hw["app_tasks"] = merged["app_tasks"]
-        if "behavior" in merged:
-            hw["behavior"] = merged["behavior"]
-        if "periodic_events" in merged:
-            hw["periodic_events"] = merged["periodic_events"]
-        if "bind_routings" in merged:
-            hw["bind_routings"] = merged["bind_routings"]
 
         # Context building
         project_name = os.path.basename(actual_output) or "hw2code"

@@ -112,6 +112,7 @@ class ProjectIR(IRObject):
     timer_events: list[str] = field(default_factory=list)
     published_events: list[str] = field(default_factory=list)
     transition_events: list[str] = field(default_factory=list)
+    events: list[dict] = field(default_factory=list)
 
     # ---------- Bootloader ----------
     boot: BootIR = field(default_factory=BootIR)

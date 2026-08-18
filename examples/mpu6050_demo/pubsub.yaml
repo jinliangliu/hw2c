@@ -5,11 +5,16 @@
 topics:
   - name: att_roll
     description: "Fused roll angle, scaled int32, unit=0.01 deg"
+    value: { type: int32, unit: "0.01 deg" }
   - name: att_pitch
     description: "Fused pitch angle, scaled int32, unit=0.01 deg"
+    value: { type: int32, unit: "0.01 deg" }
   - name: att_yaw
     description: "Integrated yaw angle (drifts, no magnetometer), unit=0.01 deg"
+    value: { type: int32, unit: "0.01 deg" }
   - name: imu_temp
     description: "MPU6050 die temperature, scaled int32, unit=0.1 C"
+    value: { type: int32, unit: "0.1 C" }
   - name: button_press
     description: "Button press event (button_id as value)"
+    value: { type: uint32, unit: "button_id" }

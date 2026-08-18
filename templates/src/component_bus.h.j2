@@ -69,6 +69,21 @@ int bus_unsubscribe(topic_id_t topic, bus_handler_t handler);
  */
 const char *bus_topic_name(topic_id_t topic);
 
+/* ---- Typed publish wrappers (from pubsub.yaml value declarations) ---- */
+{% for t in topics %}
+{% if t.value and t.value.get('type') %}
+{% if t.value.type == 'float' %}{% set ctype = 'float' %}
+{% elif t.value.type == 'int32' %}{% set ctype = 'int32_t' %}
+{% elif t.value.type == 'bool' %}{% set ctype = 'bool' %}
+{% else %}{% set ctype = 'uint32_t' %}
+{% endif %}
+/**
+ * @brief  Publish to {{ t.name }} ({{ t.value.type }}{% if t.value.unit %}, unit={{ t.value.unit }}{% endif %})
+ */
+int bus_publish_{{ t.name }}({{ ctype }} value);
+
+{% endif %}
+{% endfor %}
 #ifdef __cplusplus
 }
 #endif

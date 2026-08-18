@@ -12,6 +12,8 @@
 {% set motor_comp = components | selectattr('type', 'eq', 'foc_motor') | first %}
 {% set motor_peri = peripherals | selectattr('type', 'eq', 'FOC_Motor') | first %}
 {% set has_knob_topic = topics | selectattr('name', 'eq', 'knob_angle') | list | length > 0 %}
+{% set knob_topic_typed = topics | selectattr('name', 'eq', 'knob_angle') | selectattr('value.type', 'defined') | list | length > 0 %}
+{% set knob_evt = events | selectattr('name', 'eq', 'KNOB_TURNED') | first %}
 
 #include "component_registry.h"
 #include "event_mgr.h"
@@ -47,26 +49,26 @@ static struct {{ comp_name }}_ctx g_knob_ctx;
 int {{ motor_comp.name }}_get_state({{ motor_peri.name }}_state_t *out);
 int {{ motor_comp.name }}_set_torque(float torque_nm);
 
-/* ---- param helpers ---- */
-static float knob_load_param(const char *name, float fallback)
-{
-    param_t *p = param_get(name);
-    float v = fallback;
-    if (p != NULL) {
-        (void)param_get_float(p, &v);
-    }
-    return v;
-}
-
 int {{ comp_name }}_init(component_t *c, void *cfg)
 {
     struct {{ comp_name }}_ctx *ctx = &g_knob_ctx;
     (void)cfg;
 
-    ctx->damping        = knob_load_param("knob_damping", 0.05f);
-    ctx->friction       = knob_load_param("knob_friction", 0.02f);
-    ctx->turn_threshold = knob_load_param("knob_turn_threshold_deg", 5.0f)
-                          * FOC_PI_F / 180.0f;
+{% if params | selectattr('name', 'eq', 'knob_damping') %}
+    ctx->damping        = param_knob_damping_get();
+{% else %}
+    ctx->damping        = 0.05f;
+{% endif %}
+{% if params | selectattr('name', 'eq', 'knob_friction') %}
+    ctx->friction       = param_knob_friction_get();
+{% else %}
+    ctx->friction       = 0.02f;
+{% endif %}
+{% if params | selectattr('name', 'eq', 'knob_turn_threshold_deg') %}
+    ctx->turn_threshold = param_knob_turn_threshold_deg_get() * FOC_PI_F / 180.0f;
+{% else %}
+    ctx->turn_threshold = 5.0f * FOC_PI_F / 180.0f;
+{% endif %}
     ctx->last_angle     = 0.0f;
     ctx->turns          = 0;
     ctx->torque_nm      = 0.0f;
@@ -102,15 +104,30 @@ void {{ comp_name }}_step(component_t *c)
     if (delta < -FOC_PI_F) delta += 2.0f * FOC_PI_F;
     if (fabsf(delta) >= ctx->turn_threshold) {
         ctx->turns++;
-        event_t evt = { .id = EVENT_KNOB_TURNED, .param = ctx->turns };
-        xQueueSend(event_queue, &evt, 0);
-{% if has_knob_topic %}
+{% if knob_evt and knob_evt.payload and knob_evt.payload.type in ('float', 'uint32') %}
+        event_post_knob_turned(ctx->turns);
+{% if knob_topic_typed %}
+        bus_publish_knob_angle((int32_t)(st.angle_rad * 1000.0f));
+{% elif has_knob_topic %}
         bus_publish(TOPIC_KNOB_ANGLE, (uint32_t)(st.angle_rad * 1000.0f));
 {% endif %}
 #ifndef TEST
         log_info("knob turned (turns=%lu, torque=%.3f N*m)",
                  (unsigned long)ctx->turns, (double)torque);
 #endif
+{% else %}
+        event_t evt = { .id = EVENT_KNOB_TURNED, .param = ctx->turns };
+        xQueueSend(event_queue, &evt, 0);
+{% if knob_topic_typed %}
+        bus_publish_knob_angle((int32_t)(st.angle_rad * 1000.0f));
+{% elif has_knob_topic %}
+        bus_publish(TOPIC_KNOB_ANGLE, (uint32_t)(st.angle_rad * 1000.0f));
+{% endif %}
+#ifndef TEST
+        log_info("knob turned (turns=%lu, torque=%.3f N*m)",
+                 (unsigned long)ctx->turns, (double)torque);
+#endif
+{% endif %}
     }
     ctx->last_angle = st.angle_rad;
 }

@@ -123,4 +123,17 @@ int param_set_bool(param_t *p, bool val);
 }
 #endif
 
+/* ---- Typed accessors (generated from params.yaml) ----
+ * Name/type typos surface at generation/link time instead of runtime.
+ * Sets clamp to the declared min/max. */
+{% for p in params %}
+{% if p.type == 'int32' %}{% set ct = 'int32_t' %}
+{% elif p.type == 'uint32' %}{% set ct = 'uint32_t' %}
+{% elif p.type == 'float' %}{% set ct = 'float' %}
+{% else %}{% set ct = 'bool' %}
+{% endif %}
+{{ ct }} param_{{ p.name }}_get(void);
+void    param_{{ p.name }}_set({{ ct }} value);
+{% endfor %}
+
 #endif /* __PARAM_REGISTRY_H */

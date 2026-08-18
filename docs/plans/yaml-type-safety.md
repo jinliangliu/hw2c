@@ -1,6 +1,6 @@
 # YAML 类型安全增强规划（保留 YAML 声明式设计）
 
-> 状态：规划中 · 目标：在保留六层 YAML 作为一等公民的前提下，把
+> 状态：已落地（P0-P3 全部实现） · 目标：在保留六层 YAML 作为一等公民的前提下，把
 > "运行时字符串解析 / 裸 uint32 载荷 / 手写参数读取"前移到
 > **生成期静态校验 + 生成强类型代码**，不引入 TypeScript 替换。
 
@@ -146,3 +146,56 @@ uint32_t param_fall_impact_get(void);
   全量回归；保守方案是保留 `param` 字段并新增 `payload`（共存一个版本）
 - **P3 警告策略**：无生产者/消费者默认 warning 而非 error，避免
   破坏现有合法（但松耦合）配置
+
+## 8. 落地记录（2026-08-19）
+
+### P0 动作生成期校验 — 完成
+
+- `generator/validator.py` 补全动作表（`led_pattern` / `log` /
+  `shell_temp` / `telemetry_snapshot` / `power_status` 等），
+  `led_pattern` 枚举校验、`publish <topic>` 主题声明校验、dict 格式动作
+  全覆盖；未知动作/非法参数生成期直接报错并给出可用动作列表。
+- `generator/generate.py` 修复 merged 软件字段注入时序：behavior 等字段
+  提前到业务校验之前注入，动作校验不再空转。
+- 负向用例：`led_pattern fast_blik`、`foobar arg` 生成期报错。
+
+### P1 事件载荷类型化 — 完成
+
+- `event_t` 增加 `payload` 联合体（`raw`/`f`），task.yaml 的
+  `behavior.events` 契约驱动生成 `event_post_<name>(typed)` 类型化投递
+  函数（float/uint32，含 range 钳位，直接 xQueueSend）。
+- mpu6050_demo（`FALL_DETECTED` float [0,4] g）、knob_demo
+  （`KNOB_TURNED` uint32）已接入；无 `events` 契约时保持旧 `param`
+  语义零改动。
+
+### P2 参数访问器生成 — 完成
+
+- `param_registry` 模板按 params.yaml 生成
+  `param_<name>_get()/set()` 类型化访问器（min/max 钳位）；
+  fall/knob 组件模板改用访问器，删除硬编码默认值。
+- 修复 Jinja 陷阱：bool 参数无 min/max 时 `p.min is not none` 误判，
+  改为 `p.min is defined and p.min is not none`。
+
+### P3 跨组件契约校验 — 完成
+
+1. **事件生产-消费闭环**：validator 收集 transition 消费事件与
+   producer（behavior.events / periodic_events / RTC 闹钟 /
+   EXTI+button / publish / send_to / timer），无生产者 → WARNING，
+   孤儿 typed 事件 / publish 事件 → INFO 提示。
+2. **pubsub 主题值类型**：topic 声明 `value: {type, unit}`（float /
+   int32 / uint32 / bool），`component_bus` 生成
+   `bus_publish_<topic>(typed)` 包装函数；模板发布契约表
+   （`_TEMPLATE_PUBLISH_CONTRACTS`）与声明类型/单位不匹配 → 生成器
+   报错/警告；mpu6050 / knob / fall 组件迁移到包装函数。
+3. **bind.yaml 强化**：`interrupt[].event` 与引脚号交叉校验
+   （EXTI<num> 匹配）、事件须有生产者/消费者、`component` 字段与
+   components.yaml 交叉校验。
+
+### 验证
+
+- 负向用例：无生产者事件 / topic 类型不匹配 / bind 事件不匹配均生成期
+  报错；新增 10 个 P3 单测。
+- 全量回归：base / modbus / spi_flash / pwm / mpu6050 / knob 重新
+  生成 + 交叉编译 + 主机测试 + SIL 全部通过；`pytest` 302 项通过。
+- 顺带修复：modbus 组件 TEST 隔离（ISR/传输回调）使 modbus SIL 首次
+  可构建运行。

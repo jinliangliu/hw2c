@@ -16,6 +16,12 @@ event_task:
 
 behavior:
   initial_state: IDLE
+  # Typed event contract: KNOB_TURNED carries a uint32 payload (turn count).
+  events:
+    - name: KNOB_TURNED
+      source: custom
+      type: asynchronous
+      payload: { type: uint32 }
   states:
     - name: IDLE
       transitions:

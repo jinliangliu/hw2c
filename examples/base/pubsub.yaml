@@ -5,9 +5,13 @@
 topics:
   - name: led_state
     description: "LED on/off state change (0=off, 1=on)"
+    value: { type: uint32, unit: "0/1" }
   - name: button_press
     description: "Button press event (button_id as value)"
+    value: { type: uint32, unit: "button_id" }
   - name: temperature
     description: "Temperature reading (scaled to int32, unit=0.1C)"
+    value: { type: int32, unit: "0.1 C" }
   - name: alarm
     description: "Alarm notification (alarm_id as value)"
+    value: { type: uint32, unit: "alarm_id" }

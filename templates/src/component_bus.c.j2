@@ -116,3 +116,25 @@ const char *bus_topic_name(topic_id_t topic)
 {% endif %}
     return NULL;
 }
+
+/* ---- Typed publish wrappers (from pubsub.yaml value declarations) ---- */
+{% for t in topics %}
+{% if t.value and t.value.get('type') %}
+{% if t.value.type == 'float' %}{% set ctype = 'float' %}
+{% elif t.value.type == 'int32' %}{% set ctype = 'int32_t' %}
+{% elif t.value.type == 'bool' %}{% set ctype = 'bool' %}
+{% else %}{% set ctype = 'uint32_t' %}
+{% endif %}
+int bus_publish_{{ t.name }}({{ ctype }} value)
+{
+{% if t.value.type == 'float' %}
+    union { float f; uint32_t u; } conv;
+    conv.f = value;
+    return bus_publish(TOPIC_{{ t.name | upper }}, conv.u);
+{% else %}
+    return bus_publish(TOPIC_{{ t.name | upper }}, (uint32_t)value);
+{% endif %}
+}
+
+{% endif %}
+{% endfor %}

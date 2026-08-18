@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from generator.validator import validate_hardware
+from generator.validator import validate_bind_cross_refs, validate_hardware
 from generator.schemas.hardware import (
     BootloaderModel,
     ExtiConfig,
@@ -1718,6 +1718,165 @@ def test_bf_calc_rhs_complex_identifier():
     assert _has_error(result, "INFO", "not a declared variable")
 
 
+# ---------- P3: cross-component contract validation ----------
+
+
+def test_p3_transition_event_no_producer_warns():
+    """P3: transition event with no producer emits a WARNING"""
+    hw = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "behavior": {
+            "initial_state": "IDLE",
+            "states": [
+                {"name": "IDLE",
+                 "transitions": [{"event": "GHOST_EVENT", "target": "IDLE"}]},
+            ],
+        },
+    }
+    result = validate_hardware(hw)
+    assert _has_error(result, "WARNING", "GHOST_EVENT")
+    assert "GHOST_EVENT" in _errors_by_severity(result, "WARNING")[0]
+
+
+def test_p3_typed_event_contract_is_producer():
+    """P3: event declared in behavior.events is a valid producer"""
+    hw = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "behavior": {
+            "initial_state": "IDLE",
+            "events": [
+                {"name": "FALL_DETECTED", "source": "custom",
+                 "type": "asynchronous",
+                 "payload": {"type": "float", "unit": "g", "range": [0, 4]}},
+            ],
+            "states": [
+                {"name": "IDLE",
+                 "transitions": [{"event": "FALL_DETECTED", "target": "IDLE"}]},
+            ],
+        },
+    }
+    result = validate_hardware(hw)
+    assert not _has_error(result, "WARNING", "FALL_DETECTED")
+
+
+def test_p3_orphan_typed_event_hints():
+    """P3: typed event never consumed by a transition emits an INFO hint"""
+    hw = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "behavior": {
+            "initial_state": "IDLE",
+            "events": [{"name": "UNUSED_EVENT", "source": "custom"}],
+            "states": [{"name": "IDLE"}],
+        },
+    }
+    result = validate_hardware(hw)
+    assert _has_error(result, "INFO", "UNUSED_EVENT")
+
+
+def test_p3_button_pin_produces_gesture_events():
+    """P3: BUTTON-labeled EXTI pin produces gesture events (no warning)"""
+    hw = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [
+            {"id": "PC13", "function": "GPIO_Input", "label": "BUTTON",
+             "exti": {"enable": True, "trigger": "both"}},
+        ],
+        "behavior": {
+            "initial_state": "IDLE",
+            "states": [
+                {"name": "IDLE",
+                 "transitions": [{"event": "BUTTON_SHORT_PRESS", "target": "IDLE"}]},
+            ],
+        },
+    }
+    result = validate_hardware(hw)
+    assert not _has_error(result, "WARNING", "BUTTON_SHORT_PRESS")
+
+
+def test_p3_topic_value_type_mismatch_errors():
+    """P3: component publishes int32, topic declares float -> ERROR"""
+    hw = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "topics": [
+            {"name": "att_roll", "value": {"type": "float", "unit": "deg"}},
+        ],
+    }
+    result = validate_hardware(hw)
+    assert _has_error(result, "ERROR", "att_roll")
+
+
+def test_p3_topic_value_type_invalid_errors():
+    """P3: unknown topic value.type -> ERROR"""
+    hw = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "topics": [{"name": "led_state", "value": {"type": "string"}}],
+    }
+    result = validate_hardware(hw)
+    assert _has_error(result, "ERROR", "string")
+
+
+def test_p3_topic_missing_value_declaration_infos():
+    """P3: component-published topic without value declaration -> INFO"""
+    hw = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "topics": [{"name": "att_roll"}],
+    }
+    result = validate_hardware(hw)
+    assert _has_error(result, "INFO", "att_roll")
+
+
+def test_p3_topic_declared_type_matches_contract():
+    """P3: matching topic value declaration passes"""
+    hw = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "topics": [
+            {"name": "att_roll", "value": {"type": "int32", "unit": "0.01 deg"}},
+        ],
+    }
+    result = validate_hardware(hw)
+    errors = _errors_by_severity(result, "ERROR")
+    assert len(errors) == 0
+
+
+def test_p3_bind_event_pin_mismatch_warns():
+    """P3: bind interrupt EXTI<num> must match the pin number"""
+    hw = {
+        "pins": [
+            {"id": "PC13", "function": "GPIO_Input", "label": "BUTTON",
+             "exti": {"enable": True, "trigger": "both"}},
+        ],
+    }
+    task = {"behavior": {"initial_state": "IDLE", "states": [{"name": "IDLE"}]}}
+    bind = {"interrupt": [{"pin": "PC13", "task": "events_process_task",
+                           "event": "EXTI12"}]}
+    result = validate_bind_cross_refs(hw, task, bind)
+    assert _has_error(result, "WARNING", "EXTI12")
+    assert _has_error(result, "WARNING", "expected EXTI13")
+
+
+def test_p3_bind_component_not_found_errors():
+    """P3: bind interrupt component must exist in components.yaml"""
+    hw = {
+        "pins": [
+            {"id": "PC13", "function": "GPIO_Input", "label": "BUTTON",
+             "exti": {"enable": True, "trigger": "both"}},
+        ],
+    }
+    task = {"behavior": {"initial_state": "IDLE", "states": [{"name": "IDLE"}]}}
+    bind = {"interrupt": [{"pin": "PC13", "component": "nope_btn"}]}
+    result = validate_bind_cross_refs(
+        hw, task, bind, {"components": [{"name": "btn"}]}
+    )
+    assert _has_error(result, "ERROR", "nope_btn")
+
+
 if __name__ == "__main__":
     # Valid
     test_valid_minimal_hw()
@@ -1809,5 +1968,17 @@ if __name__ == "__main__":
     test_pin_no_id()
     test_pin_no_function()
     test_peripheral_model_not_found()
+
+    # P3
+    test_p3_transition_event_no_producer_warns()
+    test_p3_typed_event_contract_is_producer()
+    test_p3_orphan_typed_event_hints()
+    test_p3_button_pin_produces_gesture_events()
+    test_p3_topic_value_type_mismatch_errors()
+    test_p3_topic_value_type_invalid_errors()
+    test_p3_topic_missing_value_declaration_infos()
+    test_p3_topic_declared_type_matches_contract()
+    test_p3_bind_event_pin_mismatch_warns()
+    test_p3_bind_component_not_found_errors()
 
     print("All validator tests passed.")

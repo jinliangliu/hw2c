@@ -1048,6 +1048,7 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
         timer_events=sorted(timer_events),
         published_events=sorted(published_events),
         transition_events=sorted(transition_events),
+        events=behavior.get('events', []),
         boot=boot_ir,
         exti=exti_ir,
         hil=hil_ir,

@@ -30,6 +30,10 @@
 {% set has_att_pitch = topics | selectattr('name', 'eq', 'att_pitch') | list | length > 0 %}
 {% set has_att_yaw   = topics | selectattr('name', 'eq', 'att_yaw') | list | length > 0 %}
 {% set has_imu_temp  = topics | selectattr('name', 'eq', 'imu_temp') | list | length > 0 %}
+{% set att_roll_typed  = topics | selectattr('name', 'eq', 'att_roll') | selectattr('value.type', 'defined') | list | length > 0 %}
+{% set att_pitch_typed = topics | selectattr('name', 'eq', 'att_pitch') | selectattr('value.type', 'defined') | list | length > 0 %}
+{% set att_yaw_typed   = topics | selectattr('name', 'eq', 'att_yaw') | selectattr('value.type', 'defined') | list | length > 0 %}
+{% set imu_temp_typed  = topics | selectattr('name', 'eq', 'imu_temp') | selectattr('value.type', 'defined') | list | length > 0 %}
 
 #include "component_registry.h"
 {% if is_spi %}
@@ -131,16 +135,24 @@ void {{ comp_name }}_step(component_t *c)
                     ctx->imu.gyro_dps[0], ctx->imu.gyro_dps[1], ctx->imu.gyro_dps[2],
                     ctx->imu.accel_g[0], ctx->imu.accel_g[1], ctx->imu.accel_g[2]);
 
-{% if has_att_roll %}
+{% if att_roll_typed %}
+    bus_publish_att_roll((int32_t)(ctx->att.roll_deg * 100.0f));
+{% elif has_att_roll %}
     bus_publish(TOPIC_ATT_ROLL, (uint32_t)(int32_t)(ctx->att.roll_deg * 100.0f));
 {% endif %}
-{% if has_att_pitch %}
+{% if att_pitch_typed %}
+    bus_publish_att_pitch((int32_t)(ctx->att.pitch_deg * 100.0f));
+{% elif has_att_pitch %}
     bus_publish(TOPIC_ATT_PITCH, (uint32_t)(int32_t)(ctx->att.pitch_deg * 100.0f));
 {% endif %}
-{% if has_att_yaw %}
+{% if att_yaw_typed %}
+    bus_publish_att_yaw((int32_t)(ctx->att.yaw_deg * 100.0f));
+{% elif has_att_yaw %}
     bus_publish(TOPIC_ATT_YAW, (uint32_t)(int32_t)(ctx->att.yaw_deg * 100.0f));
 {% endif %}
-{% if has_imu_temp %}
+{% if imu_temp_typed %}
+    bus_publish_imu_temp((int32_t)(ctx->imu.temp_c * 10.0f));
+{% elif has_imu_temp %}
     bus_publish(TOPIC_IMU_TEMP, (uint32_t)(int32_t)(ctx->imu.temp_c * 10.0f));
 {% endif %}
 }

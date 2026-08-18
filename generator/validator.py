@@ -291,6 +291,286 @@ def _validate_extra_fields(peripheral: dict, model_path: str, errors: list[str])
             errors.append(f"[WARNING] Peripheral '{pname}' field '{field_name}' value '{value}' is not in recommended list: {allowed_values}.")
 
 
+# =========================================================================
+# P3: Cross-component contract validation helpers
+# =========================================================================
+
+_VALID_TOPIC_VALUE_TYPES = {'float', 'int32', 'uint32', 'bool'}
+
+# Templates' publish payload types per topic. Each entry is
+# (payload_type, payload_unit). The generator checks that pubsub.yaml
+# declares a matching value.type / value.unit so a component can never
+# silently publish a scaled int32 to a topic declared as float (or the
+# reverse) without failing generation.
+_TEMPLATE_PUBLISH_CONTRACTS = {
+    'att_roll':     ('int32', '0.01 deg'),
+    'att_pitch':    ('int32', '0.01 deg'),
+    'att_yaw':      ('int32', '0.01 deg'),
+    'imu_temp':     ('int32', '0.1 C'),
+    'knob_angle':   ('int32', '0.001 rad'),
+    'fall_detected': ('int32', '0.01 g'),
+}
+
+
+def _collect_transition_event_names(bf: dict) -> set[str]:
+    """Event names consumed by state machine transitions (states/regions)."""
+    consumed = set()
+
+    def walk(states):
+        for st in states or []:
+            for tr in st.get('transitions', []) or []:
+                if isinstance(tr, dict) and tr.get('event'):
+                    consumed.add(str(tr['event']).strip())
+            walk(st.get('states'))
+
+    walk((bf or {}).get('states'))
+    for region in (bf or {}).get('regions', []):
+        walk(region.get('states'))
+    return consumed
+
+
+def _extract_publish_targets_from_action(action) -> set[str]:
+    """Extract publish / publish_async / send_to event names from an action."""
+    targets = set()
+    if isinstance(action, str):
+        s = action.strip()
+        if s.startswith('publish ') or s.startswith('publish_async '):
+            targets.add(s.split()[-1])
+        elif s.startswith('send_to '):
+            parts = s.split(' ')
+            if len(parts) >= 3:
+                targets.add(parts[2])
+        elif '=>' in s:
+            sub = s.split('=>', 1)[1].strip()
+            if sub.startswith('publish ') or sub.startswith('publish_async '):
+                targets.add(sub.split()[-1])
+        if s.startswith('timeline:'):
+            content = s.split(':', 1)[1].strip() if ':' in s else s
+            for part in content.split(','):
+                if '=>' in part:
+                    sub = part.split('=>', 1)[1].strip()
+                    if sub.startswith('publish ') or sub.startswith('publish_async '):
+                        targets.add(sub.split()[-1])
+    elif isinstance(action, dict):
+        for key, params in action.items():
+            if key in ('publish', 'publish_async'):
+                if isinstance(params, str):
+                    targets.add(params.strip())
+                elif isinstance(params, dict) and params.get('topic'):
+                    targets.add(str(params['topic']).strip())
+            elif key == 'send_to':
+                if isinstance(params, str):
+                    targets.add(params.strip())
+                elif isinstance(params, dict) and params.get('event'):
+                    targets.add(str(params['event']).strip())
+    return targets
+
+
+def _collect_published_event_names(bf: dict) -> set[str]:
+    """Event names produced by publish/publish_async/send_to actions."""
+    produced = set()
+
+    def walk(states):
+        for st in states or []:
+            for action in st.get('on_entry', []) or []:
+                produced.update(_extract_publish_targets_from_action(action))
+            for action in st.get('on_exit', []) or []:
+                produced.update(_extract_publish_targets_from_action(action))
+            for tr in st.get('transitions', []) or []:
+                if isinstance(tr, dict):
+                    for action in tr.get('actions', []) or []:
+                        produced.update(_extract_publish_targets_from_action(action))
+            walk(st.get('states'))
+
+    walk((bf or {}).get('states'))
+    for region in (bf or {}).get('regions', []):
+        walk(region.get('states'))
+    return produced
+
+
+def _collect_timer_event_names(bf: dict) -> set[str]:
+    """Timer-expiry events produced by start_timer / state.after actions."""
+    names = set()
+
+    def walk(states, prefix=''):
+        for st in states or []:
+            for action in st.get('on_entry', []) or []:
+                if isinstance(action, str) and action.strip().startswith('start_timer '):
+                    names.add(action.strip().split(' ')[1])
+            for action in st.get('on_exit', []) or []:
+                if isinstance(action, str) and action.strip().startswith('start_timer '):
+                    names.add(action.strip().split(' ')[1])
+            for tr in st.get('transitions', []) or []:
+                if isinstance(tr, dict):
+                    for action in tr.get('actions', []) or []:
+                        if isinstance(action, str) and action.strip().startswith('start_timer '):
+                            names.add(action.strip().split(' ')[1])
+            if st.get('after'):
+                names.add(f"{prefix}{st.get('name', 'state')}_timeout")
+            walk(st.get('states'), prefix)
+
+    walk((bf or {}).get('states'))
+    for region in (bf or {}).get('regions', []):
+        walk(region.get('states'), region.get('name', '') + '_')
+    return {f"TIMER_EXPIRED_{n}" for n in names}
+
+
+def _collect_event_producers(hw: dict, bf: dict) -> set[str]:
+    """All event names that have a producer in this project."""
+    produced = set()
+
+    # 1) behavior.events typed contracts (components call event_post_<name>)
+    for evt in (bf or {}).get('events', []) or []:
+        if isinstance(evt, dict) and evt.get('name'):
+            produced.add(str(evt['name']).strip())
+
+    # 2) RTC periodic events
+    for pe in hw.get('periodic_events', []) or []:
+        if isinstance(pe, dict) and pe.get('event'):
+            produced.add(str(pe['event']).strip())
+
+    # 3) RTC peripheral alarms
+    for p in hw.get('peripherals', []) or []:
+        if isinstance(p, dict) and p.get('type') == 'Internal_RTC':
+            for alarm in (p.get('extra', {}) or {}).get('alarms', []) or []:
+                if isinstance(alarm, dict) and alarm.get('event'):
+                    produced.add(str(alarm['event']).strip())
+
+    # 4) Button gesture events — produced by the btn component from EXTI
+    has_btn = any(
+        isinstance(pin, dict)
+        and ('BUTTON' in (pin.get('label') or '').upper()
+             or 'BTN' in (pin.get('label') or '').upper())
+        and (pin.get('exti') or {}).get('enable')
+        for pin in hw.get('pins', [])
+    )
+    if has_btn:
+        produced.update({
+            'BUTTON_PRESS', 'BUTTON_RELEASE',
+            'BUTTON_SHORT_PRESS', 'BUTTON_DOUBLE_PRESS', 'BUTTON_LONG_PRESS',
+        })
+
+    # 5) EXTI bind events (e.g. EXTI13)
+    for pin in hw.get('pins', []) or []:
+        if isinstance(pin, dict) and pin.get('bind_event'):
+            produced.add(str(pin['bind_event']).strip())
+
+    # 6) Published events (publish / publish_async / send_to)
+    produced.update(_collect_published_event_names(bf))
+
+    # 7) Timer expiry events
+    produced.update(_collect_timer_event_names(bf))
+
+    # 8) Platform built-ins
+    has_rtc = any(
+        isinstance(p, dict) and p.get('type') == 'Internal_RTC'
+        for p in hw.get('peripherals', [])
+    )
+    if has_rtc:
+        produced.update({'RTC_TICK', 'RTC_ALARM', 'MINUTE_TICK', 'HOUR_TICK'})
+    if any(
+        isinstance(p, dict) and p.get('type') in ('I2C_Sensor_MPU6050', 'SPI_Sensor_MPU6500')
+        for p in hw.get('peripherals', [])
+    ):
+        produced.add('MPU6050_ALERT')
+    produced.add('RETURN')
+
+    return produced
+
+
+def _validate_event_producer_closure(hw: dict, bf: dict, errors: list[str]) -> None:
+    """P3.1: every transition event must have a producer; orphan typed
+    events / published events are reported as hints."""
+    consumed = _collect_transition_event_names(bf)
+    produced = _collect_event_producers(hw, bf)
+
+    if consumed:
+        missing = sorted(consumed - produced)
+        for evt in missing:
+            errors.append(
+                f"[WARNING] Transition event '{evt}' has no producer: no "
+                f"behavior.events contract, periodic RTC event, EXTI/button "
+                f"source, publish action or timer declares it. Add an event "
+                f"contract under 'events:' in task.yaml (or a producer action)."
+            )
+
+    # Hints only for typed contracts and published events (built-in events
+    # such as RTC_TICK / RETURN are consumed internally by the platform).
+    orphanable = (
+        {str(e.get('name', '')).strip() for e in (bf or {}).get('events', []) if isinstance(e, dict)}
+        | _collect_published_event_names(bf)
+    )
+    for evt in sorted(produced & orphanable - consumed):
+        errors.append(
+            f"[INFO] Event '{evt}' is produced but never consumed by a "
+            f"state machine transition. Add a transition with "
+            f"'event: {evt}' or remove the producer."
+        )
+
+
+def _validate_topic_contracts(hw: dict, errors: list[str]) -> None:
+    """P3.2: pubsub topic value declarations and component publish contracts."""
+    topics = hw.get('topics', []) or []
+    if not topics:
+        return
+
+    declared: dict[str, dict] = {}
+    topic_names = set()
+    for i, topic in enumerate(topics):
+        if not isinstance(topic, dict):
+            continue
+        name = topic.get('name', f'#{i}')
+        topic_names.add(name)
+        val = topic.get('value')
+        if val is None:
+            continue
+        if not isinstance(val, dict):
+            errors.append(
+                f"[ERROR] Topic '{name}' value must be a mapping "
+                f"{{type, unit, range}}, got {type(val).__name__}."
+            )
+            continue
+        declared[name] = val
+        vtype = val.get('type')
+        if vtype and vtype not in _VALID_TOPIC_VALUE_TYPES:
+            errors.append(
+                f"[ERROR] Topic '{name}' value.type '{vtype}' is not "
+                f"supported. Valid: {sorted(_VALID_TOPIC_VALUE_TYPES)}."
+            )
+        if 'unit' in val and not isinstance(val['unit'], str):
+            errors.append(f"[ERROR] Topic '{name}' value.unit must be a string.")
+        rng = val.get('range')
+        if rng is not None and (not isinstance(rng, list) or len(rng) != 2):
+            errors.append(f"[ERROR] Topic '{name}' value.range must be [min, max].")
+
+    # Template publish contracts must match the declared topic value type/unit.
+    for topic_name, (expected_type, expected_unit) in sorted(_TEMPLATE_PUBLISH_CONTRACTS.items()):
+        if topic_name not in topic_names:
+            continue  # topic not used in this project
+        decl = declared.get(topic_name)
+        if decl is None:
+            errors.append(
+                f"[INFO] Topic '{topic_name}' is published by a generated "
+                f"component but has no 'value' declaration in pubsub.yaml. "
+                f"Declare value: {{type: {expected_type}, unit: "
+                f"\"{expected_unit}\"}} to enable the typed publish API."
+            )
+            continue
+        if decl.get('type') and decl['type'] != expected_type:
+            errors.append(
+                f"[ERROR] Topic '{topic_name}' declares value.type "
+                f"'{decl['type']}', but the generated component publishes "
+                f"a {expected_type} payload. Set value.type: {expected_type} "
+                f"to match the component contract."
+            )
+        if decl.get('unit') and decl['unit'] != expected_unit:
+            errors.append(
+                f"[WARNING] Topic '{topic_name}' declares value.unit "
+                f"'{decl['unit']}', but the generated component publishes "
+                f"'{expected_unit}'. Align the unit to avoid scaling bugs."
+            )
+
+
 _ERROR_PREFIX_RE = re.compile(r'\[(CRITICAL|ERROR|WARNING|INFO)\]\s*(.*)')
 
 
@@ -419,8 +699,18 @@ def validate_hardware(hw: dict) -> list[ValidationError]:
         if not ('states' in bf or 'regions' in bf):
             errors.append("[ERROR] behavior has neither 'states' nor 'regions' defined.")
 
-        valid_actions = ['toggle_led', 'return', 'EVENT_NONE']
-        valid_action_prefixes = ['start_timer ', 'stop_timer ', 'set ', 'calc ', 'publish ', 'publish_async ', 'when ', 'defer ', 'timeline:', 'send_to ']
+        valid_actions = [
+            'toggle_led', 'return', 'EVENT_NONE',
+            'shell_temp', 'telemetry_snapshot', 'power_status',
+        ]
+        valid_action_prefixes = [
+            'start_timer ', 'stop_timer ', 'set ', 'calc ',
+            'publish ', 'publish_async ', 'when ', 'defer ',
+            'timeline:', 'send_to ',
+            'led_pattern ', 'log ',
+        ]
+        valid_led_patterns = ['off', 'fast_blink', 'slow_blink', 'fault']
+        valid_topics = [t.get('name', '') for t in hw.get('topics', [])]
         state_names = []
 
         def validate_actions(action_list, location):
@@ -437,8 +727,18 @@ def validate_hardware(hw: dict) -> list[ValidationError]:
                     elif action_name == 'timeline':
                         # timeline: [{ms: N, do: ACTION}, ...]
                         continue
+                    elif action_name == 'led_pattern':
+                        pattern = (action[action_name] or {})
+                        if isinstance(pattern, dict):
+                            pattern = pattern.get('pattern', '')
+                        if pattern not in valid_led_patterns:
+                            errors.append(
+                                f"[ERROR] Action #{idx} in {location}: unknown led_pattern "
+                                f"'{pattern}'. Valid: {valid_led_patterns}."
+                            )
+                        continue
                     elif action_name in ('defer', 'start_timer', 'stop_timer', 'set', 'calc',
-                                         'publish', 'publish_async', 'when', 'send_to'):
+                                         'publish', 'publish_async', 'when', 'send_to', 'log'):
                         continue
                     else:
                         errors.append(f"[ERROR] Unknown dict-format action '{action_name}' in {location}.")
@@ -452,6 +752,22 @@ def validate_hardware(hw: dict) -> list[ValidationError]:
                 is_valid = False
                 if action in valid_actions:
                     is_valid = True
+                elif action.startswith('led_pattern '):
+                    is_valid = True
+                    pattern = action[len('led_pattern '):].strip()
+                    if pattern not in valid_led_patterns:
+                        errors.append(
+                            f"[ERROR] Action '{action}' in {location}: unknown led_pattern "
+                            f"'{pattern}'. Valid: {valid_led_patterns}."
+                        )
+                elif action.startswith('publish ') or action.startswith('publish_async '):
+                    is_valid = True
+                    topic = action.split(' ', 1)[1].strip()
+                    if valid_topics and topic not in valid_topics:
+                        errors.append(
+                            f"[ERROR] Action '{action}' in {location}: unknown topic "
+                            f"'{topic}'. Declared topics: {valid_topics}."
+                        )
                 else:
                     for prefix in valid_action_prefixes:
                         if action.startswith(prefix):
@@ -605,6 +921,12 @@ def validate_hardware(hw: dict) -> list[ValidationError]:
                     if var['type'] not in _VALID_C_TYPES and var['type'] not in custom_type_names:
                         errors.append(f"[WARNING] Variable '{var.get('name', 'unknown')}' has type '{var['type']}' which is not in the recommended list: {sorted(_VALID_C_TYPES)} and not a custom type.")
 
+        # ---------- P3: cross-component contract validation ----------
+        _validate_event_producer_closure(hw, bf, errors)
+
+    # ---------- P3: pubsub topic value contracts ----------
+    _validate_topic_contracts(hw, errors)
+
     return [_parse_error(e) for e in errors]
 
 
@@ -616,6 +938,7 @@ def validate_bind_cross_refs(
     hw_raw: dict,
     task_raw: dict | None,
     bind_raw: dict | None,
+    components_raw: dict | None = None,
 ) -> list[ValidationError]:
     """Validate that bind.yaml references are consistent with hardware.yaml
     and task.yaml.
@@ -624,6 +947,9 @@ def validate_bind_cross_refs(
       - bind.interrupt[].pin exists in hw.pins
       - bind.interrupt[].task exists in task.app_tasks
       - bind.interrupt[].event matches a pin with EXTI enabled
+      - bind.interrupt[].event is consumed by a state machine transition
+        (or is a platform event) and EXTI<num> matches the pin number
+      - bind.interrupt[].component exists in components.yaml
       - bind.peripheral_assign[].peripheral exists in hw.peripherals
       - bind.peripheral_assign[].task exists in task.app_tasks
       - bind.routing[].from / .to tasks exist in task.app_tasks
@@ -633,6 +959,7 @@ def validate_bind_cross_refs(
         hw_raw:  Parsed hardware.yaml dict.
         task_raw: Parsed task.yaml dict (may be None).
         bind_raw: Parsed bind.yaml dict (may be None).
+        components_raw: Parsed components.yaml dict (may be None).
 
     Returns:
         List of ValidationError objects.
@@ -663,6 +990,21 @@ def validate_bind_cross_refs(
         if isinstance(p, dict) and p.get("name"):
             peri_names.add(p["name"])
 
+    component_names: set[str] = set()
+    if components_raw and isinstance(components_raw, dict):
+        for c in components_raw.get("components", []):
+            if isinstance(c, dict) and c.get("name"):
+                component_names.add(c["name"])
+
+    # ---------- Collect behavior events for cross-validation ----------
+    behavior = {}
+    if task_raw and isinstance(task_raw, dict):
+        behavior = task_raw.get("behavior", {}) or {}
+    elif hw_raw and isinstance(hw_raw, dict):
+        behavior = hw_raw.get("behavior", {}) or {}
+    consumed_events = _collect_transition_event_names(behavior)
+    produced_events = _collect_event_producers(hw_raw, behavior)
+
     # ---------- Validate interrupt bindings ----------
     for i, binding in enumerate(bind_raw.get("interrupt", [])):
         if not isinstance(binding, dict):
@@ -670,6 +1012,7 @@ def validate_bind_cross_refs(
         pin_id = binding.get("pin", "")
         task_name = binding.get("task", "")
         event_name = binding.get("event", "")
+        component_name = binding.get("component", "")
         loc = f"bind.yaml interrupt #{i + 1}"
 
         if pin_id:
@@ -692,12 +1035,50 @@ def validate_bind_cross_refs(
                             f"[WARNING] {loc}: pin '{pin_id}' has event "
                             f"'{event_name}' but EXTI is not enabled in hardware.yaml."
                         )
+                    if event_name:
+                        # EXTI<num> must match the pin number (e.g. PC13 -> EXTI13)
+                        m_evt = re.match(r'^EXTI(\d+)$', event_name.strip().upper())
+                        m_pin = re.match(r'^P[A-F](\d+)$', pin_id.strip().upper())
+                        if m_evt and m_pin and m_evt.group(1) != m_pin.group(1):
+                            errors.append(
+                                f"[WARNING] {loc}: event '{event_name}' does not "
+                                f"match pin '{pin_id}' (expected EXTI{m_pin.group(1)})."
+                            )
 
         if task_name and task_names:
             if task_name not in task_names:
                 errors.append(
                     f"[ERROR] {loc}: task '{task_name}' not found in task.yaml "
                     f"app_tasks. Available: {sorted(task_names)}"
+                )
+
+        if component_name and component_names and component_name not in component_names:
+            errors.append(
+                f"[ERROR] {loc}: component '{component_name}' not found in "
+                f"components.yaml. Available: {sorted(component_names)}"
+            )
+
+        known_exti_events: set[str] = set()
+        for pin in hw_raw.get("pins", []):
+            if (isinstance(pin, dict) and pin.get("exti")
+                    and isinstance(pin["exti"], dict) and pin["exti"].get("enable")
+                    and pin.get("id")):
+                m = re.match(r'^P[A-F](\d+)$', pin["id"].strip().upper())
+                if m:
+                    known_exti_events.add(f"EXTI{m.group(1)}")
+
+        if event_name:
+            event_upper = event_name.strip().upper()
+            if not re.match(r'^(EXTI\d+|EVENT_\w+)$', event_upper):
+                errors.append(
+                    f"[WARNING] {loc}: event '{event_name}' does not look like "
+                    f"an event name (expected 'EXTI<num>' or 'EVENT_<name>')."
+                )
+            if (event_upper not in consumed_events | produced_events | known_exti_events):
+                errors.append(
+                    f"[WARNING] {loc}: event '{event_name}' is not consumed by "
+                    f"any state machine transition and has no producer. "
+                    f"Consumed events: {sorted(consumed_events) or 'none'}."
                 )
 
     # ---------- Validate peripheral_assign ----------

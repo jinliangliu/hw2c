@@ -25,10 +25,6 @@ uint32_t rtc_uptime_sec = 0;
 /* FreeRTOS stubs not provided by mock_hal.h */
 #define portTICK_PERIOD_MS    1
 
-/* Queue handles referenced by component sources (not exercised in SIL) */
-void *btn_queue = NULL;
-void *event_queue = NULL;
-
 static int xTaskCreate_stub(void (*task)(void*), const char *name,
                             unsigned short stack, void *params,
                             unsigned long prio, TaskHandle_t *handle)

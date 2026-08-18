@@ -73,8 +73,21 @@ typedef enum {
 /** @brief Event payload structure */
 typedef struct {
     event_id_t id;      /**< Event type identifier */
-    uint32_t   param;   /**< Optional event parameter */
+    uint32_t   param;   /**< Optional event parameter (legacy raw) */
+    union {
+        uint32_t raw;   /**< typed raw payload (events contract) */
+        float    f;     /**< typed float payload (events contract) */
+    } payload;
 } event_t;
+
+/* ---- Typed event post functions (from behavior.events contract) ---- */
+{% for evt in events %}
+{% if evt.payload and evt.payload.type in ('float', 'uint32') %}
+/* Posts EVENT_{{ evt.name }} with a typed payload
+ * ({{ evt.payload.type }}{% if evt.payload.unit %}, {{ evt.payload.unit }}{% endif %}). */
+int event_post_{{ evt.name | lower }}({{ 'float' if evt.payload.type == 'float' else 'uint32_t' }} value);
+{% endif %}
+{% endfor %}
 
 /** @brief Global FreeRTOS event queue handle */
 extern QueueHandle_t event_queue;

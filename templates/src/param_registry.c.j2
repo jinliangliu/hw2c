@@ -167,3 +167,32 @@ int param_set_bool(param_t *p, bool val)
     *(bool *)p->value_ptr = val;
     return PARAM_OK;
 }
+
+/* ---- Typed accessors (generated from params.yaml) ---- */
+{% for p in params %}
+{% if p.type == 'int32' %}{% set ct = 'int32_t' %}
+{% elif p.type == 'uint32' %}{% set ct = 'uint32_t' %}
+{% elif p.type == 'float' %}{% set ct = 'float' %}
+{% else %}{% set ct = 'bool' %}
+{% endif %}
+{{ ct }} param_{{ p.name }}_get(void)
+{
+    return g_{{ p.name }}_val;
+}
+
+void param_{{ p.name }}_set({{ ct }} value)
+{
+{% if p.min is defined and p.min is not none %}
+    if (value < ({{ ct }}){{ p.min }}) {
+        value = ({{ ct }}){{ p.min }};
+    }
+{% endif %}
+{% if p.max is defined and p.max is not none %}
+    if (value > ({{ ct }}){{ p.max }}) {
+        value = ({{ ct }}){{ p.max }};
+    }
+{% endif %}
+    g_{{ p.name }}_val = value;
+}
+
+{% endfor %}

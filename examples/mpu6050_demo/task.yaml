@@ -25,6 +25,12 @@ event_task:
 # Button gesture → LED pattern mapping
 behavior:
   initial_state: IDLE
+  # Typed event contracts: FALL_DETECTED carries a float payload (g).
+  events:
+    - name: FALL_DETECTED
+      source: custom
+      type: asynchronous
+      payload: { type: float, unit: "g", range: [0, 4] }
   states:
     - name: IDLE
       transitions:

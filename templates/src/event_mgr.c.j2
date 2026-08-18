@@ -19,6 +19,29 @@ Auto-generated — do not edit manually.
 
 #include "event_mgr.h"
 
+/* ---- Typed event post functions (from behavior.events contract) ---- */
+{% for evt in events %}
+{% if evt.payload and evt.payload.type in ('float', 'uint32') %}
+{% set c_type = 'float' if evt.payload.type == 'float' else 'uint32_t' %}
+{% set p_field = 'f' if evt.payload.type == 'float' else 'raw' %}
+int event_post_{{ evt.name | lower }}({{ c_type }} value)
+{
+    event_t e = { .id = EVENT_{{ evt.name }}, .param = 0, .payload.{{ p_field }} = 0 };
+{% if evt.payload.range and evt.payload.range | length == 2 %}
+    /* range clamp from the events contract */
+    if (value < ({{ c_type }}){{ evt.payload.range[0] }}) {
+        value = ({{ c_type }}){{ evt.payload.range[0] }};
+    }
+    if (value > ({{ c_type }}){{ evt.payload.range[1] }}) {
+        value = ({{ c_type }}){{ evt.payload.range[1] }};
+    }
+{% endif %}
+    e.payload.{{ p_field }} = value;
+    return xQueueSend(event_queue, &e, 0) == pdTRUE ? 0 : -1;
+}
+{% endif %}
+{% endfor %}
+
 {% if has_log %}
 #ifndef TEST
 #include "drv_log.h"
@@ -43,9 +66,13 @@ Auto-generated — do not edit manually.
 #endif
 {% endif %}
 
+{% if drivers %}
+#ifndef TEST
 {% for drv in drivers if drv.header_template %}
 #include "drv_{{ drv.name }}.h"
 {% endfor %}
+#endif
+{% endif %}
 
 {% if has_led_task and led_task_name %}
 extern TaskHandle_t {{ led_task_name }}_handle;

@@ -43,8 +43,10 @@
 {% set use_temp_mapping = has_temp_topic and temp_reg is defined and temp_reg and reg_count > 0 %}
 
 #include "component_registry.h"
+#ifndef TEST
 #include "uart_api.h"
 #include "gpio_api.h"
+#endif
 #include "drv_{{ mb.name }}.h"
 #include "component_bus.h"
 #include <string.h>
@@ -73,6 +75,7 @@ static volatile uint16_t g_rx_tail = 0;
 /* Called from USART1_IRQHandler (see stm32g0xx_it.c) */
 void modbus_component_uart_isr(void)
 {
+#ifndef TEST
     uint32_t isr = USART1->ISR;
     if (isr & USART_ISR_RXNE_RXFNE) {
         uint8_t ch = (uint8_t)(USART1->RDR & 0xFF);
@@ -85,15 +88,22 @@ void modbus_component_uart_isr(void)
     if (isr & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE)) {
         USART1->ICR = USART_ICR_ORECF | USART_ICR_FECF | USART_ICR_NECF;
     }
+#endif
 }
 
 static uint8_t modbus_comp_tx(uint8_t *data, uint16_t len)
 {
+#ifndef TEST
     return (uart_write(g_uart_handle, data, len) > 0) ? 1 : 0;
+#else
+    (void)data; (void)len;
+    return 1;  /* mock transport accepts all writes */
+#endif
 }
 
 static uint8_t modbus_comp_rx(uint8_t *buf, uint16_t len, uint32_t timeout)
 {
+#ifndef TEST
     /* Pull bytes from the ISR-filled ring buffer; wait up to timeout for
      * the first byte (modbus_process / master exchange reads byte-by-byte). */
     uint32_t start = HAL_GetTick();
@@ -112,6 +122,10 @@ static uint8_t modbus_comp_rx(uint8_t *buf, uint16_t len, uint32_t timeout)
         __NOP();
     }
     return (got > 0) ? 1 : 0;
+#else
+    (void)buf; (void)len; (void)timeout;
+    return 0;  /* no hardware ISR ring buffer in host/SIL tests */
+#endif
 }
 
 

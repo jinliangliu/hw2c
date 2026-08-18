@@ -31,6 +31,7 @@ add_library(posix_mock STATIC
 add_executable(test_component_sil
     test_component_sil.c
     unity/unity.c
+    ${CMAKE_SOURCE_DIR}/../../src/event_mgr.c
 {% if has_mpu6050 %}
     ${CMAKE_SOURCE_DIR}/../../src/attitude.c
     ${CMAKE_SOURCE_DIR}/../../src/drivers/drv_mpu6050.c
@@ -41,6 +42,9 @@ add_executable(test_component_sil
 {% if has_foc %}
     ${CMAKE_SOURCE_DIR}/../../src/foc_math.c
     ${CMAKE_SOURCE_DIR}/../../src/drivers/drv_{{ (peripherals | selectattr('type', 'eq', 'FOC_Motor') | first).name }}.c
+{% endif %}
+{% if has_modbus_component %}
+    ${CMAKE_SOURCE_DIR}/../../src/drivers/drv_modbus.c
 {% endif %}
 )
 

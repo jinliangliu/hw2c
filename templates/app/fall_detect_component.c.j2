@@ -14,6 +14,8 @@
 {% set mpu_peri = peripherals | selectattr('type', 'in', ['I2C_Sensor_MPU6050', 'SPI_Sensor_MPU6500']) | first %}
 {% set imu_ref = comp_config.get('imu', imu_comp.name if imu_comp else 'imu') %}
 {% set has_fall_topic = topics | selectattr('name', 'eq', 'fall_detected') | list | length > 0 %}
+{% set fall_topic_typed = topics | selectattr('name', 'eq', 'fall_detected') | selectattr('value.type', 'defined') | list | length > 0 %}
+{% set fall_evt = events | selectattr('name', 'eq', 'FALL_DETECTED') | first %}
 
 #include "component_registry.h"
 #include "event_mgr.h"
@@ -48,27 +50,6 @@ static struct {{ comp_name }}_ctx g_fall_ctx;
 int {{ imu_comp.name }}_get_imu({{ mpu_peri.name }}_data_t *out);
 {% endif %}
 
-/* ---- param helpers: read a runtime param, keep default on failure ---- */
-static void fall_load_param_float(struct {{ comp_name }}_ctx *ctx,
-                                  const char *name, float *dst)
-{
-    param_t *p = param_get(name);
-    if (p != NULL) {
-        (void)param_get_float(p, dst);
-    }
-    (void)ctx;
-}
-
-static void fall_load_param_uint32(struct {{ comp_name }}_ctx *ctx,
-                                   const char *name, uint32_t *dst)
-{
-    param_t *p = param_get(name);
-    if (p != NULL) {
-        (void)param_get_uint32(p, dst);
-    }
-    (void)ctx;
-}
-
 /* ---- init: reset detector, load tunable thresholds ---- */
 int {{ comp_name }}_init(component_t *c, void *cfg)
 {
@@ -76,10 +57,26 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
     (void)cfg;
 
     fall_detect_init(&ctx->det);
-    fall_load_param_float(ctx, "fall_free_fall_g", &ctx->det.free_fall_g);
-    fall_load_param_uint32(ctx, "fall_free_fall_ms", &ctx->det.free_fall_ms);
-    fall_load_param_float(ctx, "fall_impact_g", &ctx->det.impact_g);
-    fall_load_param_uint32(ctx, "fall_still_ms", &ctx->det.still_ms);
+{% if params | selectattr('name', 'eq', 'fall_free_fall_g') %}
+    ctx->det.free_fall_g = param_fall_free_fall_g_get();
+{% else %}
+    ctx->det.free_fall_g = 0.4f;
+{% endif %}
+{% if params | selectattr('name', 'eq', 'fall_free_fall_ms') %}
+    ctx->det.free_fall_ms = param_fall_free_fall_ms_get();
+{% else %}
+    ctx->det.free_fall_ms = 200U;
+{% endif %}
+{% if params | selectattr('name', 'eq', 'fall_impact_g') %}
+    ctx->det.impact_g = param_fall_impact_g_get();
+{% else %}
+    ctx->det.impact_g = 2.5f;
+{% endif %}
+{% if params | selectattr('name', 'eq', 'fall_still_ms') %}
+    ctx->det.still_ms = param_fall_still_ms_get();
+{% else %}
+    ctx->det.still_ms = 2000U;
+{% endif %}
     ctx->events        = 0;
     ctx->read_failures = 0;
     ctx->initialized   = 1;
@@ -108,13 +105,29 @@ void {{ comp_name }}_step(component_t *c)
         }
         if (fall_detect_update(&ctx->det, now,
                                imu.accel_g[0], imu.accel_g[1], imu.accel_g[2])) {
+{% if fall_evt and fall_evt.payload and fall_evt.payload.type == 'float' %}
+            ctx->events++;
+            event_post_fall_detected(ctx->det.last_impact_g);
+{% if fall_topic_typed %}
+            bus_publish_fall_detected((int32_t)(ctx->det.last_impact_g * 100.0f));
+{% elif has_fall_topic %}
+            bus_publish(TOPIC_FALL_DETECTED, (uint32_t)(ctx->det.last_impact_g * 100.0f));
+{% endif %}
+#ifndef TEST
+            log_info("FALL detected, impact %.1fg (count %lu)",
+                     (double)ctx->det.last_impact_g,
+                     (unsigned long)ctx->events);
+#endif
+{% else %}
             event_t evt = {
                 .id    = EVENT_FALL_DETECTED,
                 .param = (uint32_t)(ctx->det.last_impact_g * 100.0f),
             };
             ctx->events++;
             xQueueSend(event_queue, &evt, 0);
-{% if has_fall_topic %}
+{% if fall_topic_typed %}
+            bus_publish_fall_detected((int32_t)evt.param);
+{% elif has_fall_topic %}
             bus_publish(TOPIC_FALL_DETECTED, evt.param);
 {% endif %}
 #ifndef TEST
@@ -122,6 +135,7 @@ void {{ comp_name }}_step(component_t *c)
                      (double)ctx->det.last_impact_g,
                      (unsigned long)ctx->events);
 #endif
+{% endif %}
         }
     }
 {% else %}

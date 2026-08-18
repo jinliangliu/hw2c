@@ -134,3 +134,4 @@ class BuildContext(TypedDict):
     defer_actions: list[dict]
     defer_timer_names: list[str]
     published_events: list[str]
+    events: list[dict]
