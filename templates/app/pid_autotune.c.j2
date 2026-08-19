@@ -1,0 +1,195 @@
+/**
+ * @file  pid_autotune.c
+ * @brief Relay-oscillation PID autotune (Ziegler-Nichols) implementation
+ *
+ * Auto-generated — do not edit manually.
+ */
+
+#include "pid_autotune.h"
+#include <stddef.h>
+
+#define PID_AUTOTUNE_PI_F (3.14159265358979f)
+
+void pid_autotune_start(pid_autotune_t *a, float target, float min_temp,
+                        int cycles, float power_max)
+{
+    if (a == NULL) return;
+    a->target        = target;
+    a->min_temp      = min_temp;
+    a->power_max     = power_max;
+    a->power_low     = 0.0f;
+    a->cycles_needed = (cycles >= 1) ? cycles : 2;
+    a->timeout_ms    = 600000U;
+
+    /* thresholds: overshoot to target + half the span, undershoot below */
+    {
+        float span = (target - min_temp) * 0.5f;
+        if (span < 1.0f) span = 1.0f;
+        a->hi_temp = target + span;
+        a->lo_temp = target - span;
+    }
+
+    a->state        = 0;
+    a->prev_temp    = min_temp;
+    a->peak_a = a->trough_a = a->peak_b = a->trough_b = 0.0f;
+    a->t_peak_a = a->t_trough_a = a->t_peak_b = a->t_trough_b = 0U;
+    a->t_start      = 0U;
+    a->cycles_done  = 0;
+    a->tu_s         = 0.0f;
+    a->ku           = 0.0f;
+    a->amplitude    = 0.0f;
+    a->done         = 0;
+    a->failed       = 0;
+}
+
+const char *pid_autotune_stage_name(const pid_autotune_t *a)
+{
+    if (a == NULL) return "?";
+    if (a->failed) return "FAILED";
+    if (a->done)   return "DONE";
+    switch (a->state) {
+    case 0: return "HEAT_UP";    /* full power until overshoot          */
+    case 1: return "PEAK";       /* off, wait for temperature to fall   */
+    case 2: return "COOL_DOWN";  /* full power until undershoot         */
+    case 3: return "TROUGH";     /* off, wait for temperature to rise   */
+    case 4: return "CYCLE_HEAT"; /* full power, next oscillation cycle  */
+    case 5: return "CYCLE_PEAK"; /* off, wait for next peak             */
+    case 6: return "CYCLE_COOL"; /* full power, next undershoot         */
+    default: return "FINISH";
+    }
+}
+
+/* ---- helpers: peak = temp stops rising, trough = temp stops falling ---- */
+static int temp_peaked(float t, float prev) { return t < prev; }
+static int temp_troughed(float t, float prev) { return t > prev; }
+
+int pid_autotune_step(pid_autotune_t *a, float temp_c, uint32_t now_ms,
+                      float *out_power)
+{
+    if (a == NULL || out_power == NULL) {
+        return -1;
+    }
+    if (a->done) {
+        *out_power = 0.0f;
+        return 1;
+    }
+    if (a->failed) {
+        *out_power = 0.0f;
+        return -1;
+    }
+
+    if (a->t_start == 0U) {
+        a->t_start = now_ms;
+    }
+    if (now_ms - a->t_start > a->timeout_ms) {
+        a->failed = 1;
+        *out_power = 0.0f;
+        return -1;
+    }
+
+    switch (a->state) {
+    case 0: /* full power until we overshoot hi_temp */
+        *out_power = a->power_max;
+        if (temp_c >= a->hi_temp) {
+            a->state = 1;
+        }
+        break;
+
+    case 1: /* relay off; detect the overshoot peak */
+        *out_power = a->power_low;
+        if (temp_peaked(temp_c, a->prev_temp)) {
+            a->peak_a = a->prev_temp;
+            a->t_peak_a = now_ms;
+            a->state = 2;
+        }
+        break;
+
+    case 2: /* relay off, keep cooling until we undershoot lo_temp */
+        *out_power = a->power_low;
+        if (temp_c <= a->lo_temp) {
+            a->state = 3;
+        }
+        break;
+
+    case 3: /* relay back ON; detect the trough as temperature rises */
+        *out_power = a->power_max;
+        if (temp_troughed(temp_c, a->prev_temp)) {
+            a->trough_a = a->prev_temp;
+            a->t_trough_a = now_ms;
+            a->state = 4;
+        }
+        break;
+
+    case 4: /* full power toward the next peak */
+        *out_power = a->power_max;
+        if (temp_c >= a->hi_temp) {
+            a->state = 5;
+        }
+        break;
+
+    case 5: /* relay off; detect the second peak -> full period */
+        *out_power = a->power_low;
+        if (temp_peaked(temp_c, a->prev_temp)) {
+            a->peak_b = a->prev_temp;
+            a->t_peak_b = now_ms;
+            a->cycles_done++;
+            if (a->cycles_done >= a->cycles_needed) {
+                a->state = 6;
+            } else {
+                a->state = 4;    /* another cycle */
+            }
+        }
+        break;
+
+    case 6: /* relay off, keep cooling toward the final trough */
+        *out_power = a->power_low;
+        if (temp_c <= a->lo_temp) {
+            a->state = 7;
+        }
+        break;
+
+    case 7: /* relay back ON; detect final trough then compute */
+        *out_power = a->power_max;
+        if (temp_troughed(temp_c, a->prev_temp)) {
+            a->trough_b = a->prev_temp;
+            a->t_trough_b = now_ms;
+            a->state = 8;
+        }
+        break;
+
+    default: /* state 8: compute and finish */
+        {
+            float peak = (a->peak_a + a->peak_b) * 0.5f;
+            float trough = (a->trough_a + a->trough_b) * 0.5f;
+            float tu_ms = (float)(a->t_peak_b - a->t_peak_a);
+            float d = (a->power_max - a->power_low) * 0.5f;
+
+            a->amplitude = (peak - trough) * 0.5f;
+            if (a->amplitude <= 0.001f || tu_ms <= 1.0f || d <= 0.0f) {
+                a->failed = 1;
+                *out_power = 0.0f;
+                return -1;
+            }
+            a->tu_s = tu_ms / 1000.0f;
+            a->ku = 4.0f * d / (PID_AUTOTUNE_PI_F * a->amplitude);
+            a->done = 1;
+            *out_power = 0.0f;
+            return 1;
+        }
+    }
+
+    a->prev_temp = temp_c;
+    return 0;
+}
+
+int pid_autotune_result(pid_autotune_t *a, float *kp, float *ki, float *kd)
+{
+    if (a == NULL || !a->done || kp == NULL || ki == NULL || kd == NULL) {
+        return -1;
+    }
+    /* Ziegler-Nichols ultimate-gain tuning rules */
+    *kp = 0.6f * a->ku;
+    *ki = 1.2f * a->ku / a->tu_s;
+    *kd = 0.075f * a->ku * a->tu_s;
+    return 0;
+}

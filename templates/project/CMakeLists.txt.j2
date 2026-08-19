@@ -154,6 +154,7 @@ set(APP_SOURCES
 {% endif %}
 {% if has_pid_ctrl %}
     src/pid_math.c
+    src/pid_autotune.c
 {% endif %}
 {% if has_components %}
     src/component_registry.c

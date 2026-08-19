@@ -315,6 +315,8 @@ def render_templates(env: Environment, context: dict, output_dir: str,
         pid_templates = {
             "app/pid_math.h.j2": os.path.join(output_dir, "src", "pid_math.h"),
             "app/pid_math.c.j2": os.path.join(output_dir, "src", "pid_math.c"),
+            "app/pid_autotune.h.j2": os.path.join(output_dir, "src", "pid_autotune.h"),
+            "app/pid_autotune.c.j2": os.path.join(output_dir, "src", "pid_autotune.c"),
         }
         for tmpl_name, out_path in pid_templates.items():
             template = env.get_template(tmpl_name)
@@ -562,6 +564,7 @@ def render_templates(env: Environment, context: dict, output_dir: str,
         test_templates["test/test_foc_math.c.j2"] = os.path.join(test_dir, "test_foc_math.c")
     if context.get("has_pid_ctrl"):
         test_templates["test/test_pid_math.c.j2"] = os.path.join(test_dir, "test_pid_math.c")
+        test_templates["test/test_pid_autotune.c.j2"] = os.path.join(test_dir, "test_pid_autotune.c")
     if context.get("has_ir"):
         test_templates["test/test_ir.c.j2"] = os.path.join(test_dir, "test_ir.c")
     if context.get("has_cellular"):

@@ -57,6 +57,7 @@ static void bus_handler_stub(topic_id_t topic, uint32_t value, void *ctx);
 /* ---- Test setup/teardown ---- */
 void setUp(void)
 {
+    mock_tick_reset();
     uart_mock_reset_all();
     gpio_mock_reset_all();
     adc_mock_reset_all();
@@ -271,6 +272,48 @@ static void ntc_sim_set_temp(float t_c)
     adc_mock_set_reading("{{ pid_ntc.get('extra', {}).get('adc', 'adc1') }}",
                          (uint32_t)v);
 }
+
+/* thermal-mass model with transport delay (needed for relay oscillation) */
+static float g_tune_delay[8];
+static unsigned g_tune_delay_idx;
+
+static float thermo_sim_step(float t, float duty, float ambient)
+{
+    float delayed = g_tune_delay[g_tune_delay_idx];
+    g_tune_delay[g_tune_delay_idx] = duty;
+    g_tune_delay_idx = (g_tune_delay_idx + 1) % 8;
+    /* same dynamics as test_pid_autotune (known to oscillate) */
+    return t + (delayed * 0.2f - (t - ambient) * 0.2f) * 0.1f;
+}
+
+void test_pid_ctrl_autotune_completes(void)
+{
+    component_t *comp = component_get("{{ pid_comp.name }}");
+    float pv = 25.0f, sp = 0.0f;
+    uint32_t duty = 0, stage = 0, fault = 0;
+    int tune_active = 1;
+    int i;
+    unsigned k;
+    for (k = 0; k < 8; k++) g_tune_delay[k] = 0.0f;
+    g_tune_delay_idx = 0;
+
+    TEST_ASSERT_NOT_NULL(comp);
+    TEST_ASSERT_EQUAL_INT(0, comp->init(comp, NULL));
+    ntc_sim_set_temp(pv);
+    TEST_ASSERT_EQUAL_INT(0, {{ pid_comp.name }}_start_autotune(50.0f, 2));
+
+    for (i = 0; i < 8000 && tune_active && fault == 0; i++) {
+        comp->step(comp);
+        mock_tick_advance(100);
+        (void){{ pid_comp.name }}_get_status(&pv, &sp, &duty, &stage, &fault);
+        (void){{ pid_comp.name }}_get_autotune(&tune_active, NULL, NULL);
+        pv = thermo_sim_step(pv, (float)duty, 25.0f);
+        ntc_sim_set_temp(pv);
+    }
+    TEST_ASSERT_EQUAL_INT(0, tune_active);   /* run finished */
+    TEST_ASSERT_EQUAL_UINT32(0, fault);      /* no interlock tripped */
+    TEST_ASSERT_TRUE(param_pid_kp_get() > 0.0f);  /* gains applied */
+}
 {% endif %}
 
 void test_pid_ctrl_closed_loop_reaches_target(void)
@@ -387,6 +430,9 @@ int main(void)
 {% if has_pid_ctrl %}
     RUN_TEST(test_pid_ctrl_closed_loop_reaches_target);
     RUN_TEST(test_pid_ctrl_overpressure_trips_fault);
+{% if pid_ntc %}
+    RUN_TEST(test_pid_ctrl_autotune_completes);
+{% endif %}
 {% endif %}
 
     return UNITY_END();

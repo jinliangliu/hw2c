@@ -670,7 +670,10 @@ void mock_NVIC_SystemReset_reset(void) {
 }
 
 /* ========== Other HAL stubs ========== */
-uint32_t HAL_GetTick(void) { return 0; }
+static uint32_t mock_hal_tick = 0;
+uint32_t HAL_GetTick(void) { return mock_hal_tick; }
+void mock_tick_advance(uint32_t ms) { mock_hal_tick += ms; }
+void mock_tick_reset(void) { mock_hal_tick = 0; }
 void HAL_Delay(uint32_t ms) { (void)ms; }
 void HAL_InitTick(uint32_t TickPriority) { (void)TickPriority; }
 void HAL_TIM_Base_Start_IT(TIM_HandleTypeDef *htim) { (void)htim; }

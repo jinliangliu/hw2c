@@ -66,6 +66,7 @@
 
 #include "component_registry.h"
 #include "pid_math.h"
+#include "pid_autotune.h"
 #include "param_registry.h"
 {% if fb_peri %}
 #include "drv_{{ fb_peri.name }}.h"
@@ -106,6 +107,7 @@ typedef enum {
 #define PID_FAULT_OVP          1u   /* process value exceeded pid_max_value */
 #define PID_FAULT_SENSOR       2u   /* repeated sensor read failures        */
 #define PID_FAULT_RAMP_TIMEOUT 3u   /* target not reached in ramp_timeout   */
+#define PID_FAULT_TUNE         4u   /* autotune failed (no oscillation)     */
 
 /* ---- Component-private context ---- */
 struct {{ comp_name }}_ctx {
@@ -124,6 +126,8 @@ struct {{ comp_name }}_ctx {
     uint32_t duty_max;
     float    hold_hysteresis;
     uint32_t events;
+    pid_autotune_t autotune;
+    uint8_t  autotune_active;
 };
 
 static struct {{ comp_name }}_ctx g_pid_ctx;
@@ -171,6 +175,7 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
     ctx->read_failures   = 0;
     ctx->events          = 0;
     ctx->hold_hysteresis = {{ hold_hyst }}f;
+    ctx->autotune_active = 0;
 {% if p_ramp %}
 {% if p_ramp.name == 'pid_ramp_timeout_ms' %}
     ctx->ramp_timeout_ms = param_pid_ramp_timeout_ms_get();
@@ -259,6 +264,7 @@ int {{ comp_name }}_set_setpoint(float value)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized) return -1;
+    if (ctx->autotune_active) return -1;   /* not while tuning */
 {% if p_max %}
 {% if p_max.name == 'pid_max_value' %}
     if (value < {{ target_min | float }}f || value > param_pid_max_value_get()) {
@@ -283,6 +289,7 @@ int {{ comp_name }}_start(void)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized || ctx->fault != PID_FAULT_NONE) return -1;
+    if (ctx->autotune_active) return -1;
 {% if p_target and p_target.name == 'pid_target' %}
     return {{ comp_name }}_set_setpoint(param_pid_target_get());
 {% elif p_target %}
@@ -310,6 +317,47 @@ int {{ comp_name }}_vent(void)
     ctx->stage = PID_STAGE_STANDBY;
     ctx->heat_duty = 0;
     ctx->cool_duty = 0;
+    return 0;
+}
+
+/* ---- PID autotune (relay oscillation, Ziegler-Nichols) ---- */
+int {{ comp_name }}_start_autotune(float target, int cycles)
+{
+    struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
+    if (!ctx->initialized) return -1;
+    if (ctx->autotune_active) return -1;
+{% if p_max and p_max.name == 'pid_max_value' %}
+    if (target < {{ target_min | float }}f || target > param_pid_max_value_get()) {
+        return -1;                       /* reject out-of-range target */
+    }
+{% elif p_max %}
+    if (target < {{ target_min | float }}f || target > param_pressure_max_kpa_get()) {
+        return -1;
+    }
+{% else %}
+    if (target < {{ target_min | float }}f || target > 1000.0f) {
+        return -1;
+    }
+{% endif %}
+    ctx->fault = PID_FAULT_NONE;
+    ctx->stage = PID_STAGE_STANDBY;
+    ctx->read_failures = 0;
+    pid_autotune_start(&ctx->autotune, target,
+                       ctx->process_value,   /* ambient as oscillation floor */
+                       cycles, 100.0f);
+    ctx->autotune_active = 1;
+    return 0;
+}
+
+int {{ comp_name }}_get_autotune(int *active, const char **stage,
+                                float *target)
+{
+    struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
+    if (!ctx->initialized) return -1;
+    if (active) *active = ctx->autotune_active;
+    if (stage)  *stage  = ctx->autotune_active
+                          ? pid_autotune_stage_name(&ctx->autotune) : "-";
+    if (target) *target = ctx->autotune.target;
     return 0;
 }
 
@@ -408,7 +456,39 @@ void {{ comp_name }}_step(component_t *c)
     }
 {% endif %}
 
-    /* 3) stage machine */
+    /* 3) autotune takes priority over the normal stage machine */
+    if (ctx->autotune_active && ctx->fault == PID_FAULT_NONE) {
+        float power = 0.0f;
+        int rc = pid_autotune_step(&ctx->autotune, ctx->process_value,
+                                   now, &power);
+        if (rc == 1) {
+            float kp = 0.0f, ki = 0.0f, kd = 0.0f;
+            ctx->autotune_active = 0;
+            if (pid_autotune_result(&ctx->autotune, &kp, &ki, &kd) == 0) {
+                pid_set_gains(&ctx->pid, kp, ki, kd);
+{% if params | selectattr('name', 'eq', 'pid_kp') %}
+                param_pid_kp_set(kp);
+{% endif %}
+{% if params | selectattr('name', 'eq', 'pid_ki') %}
+                param_pid_ki_set(ki);
+{% endif %}
+{% if params | selectattr('name', 'eq', 'pid_kd') %}
+                param_pid_kd_set(kd);
+{% endif %}
+#ifndef TEST
+                log_info("PID autotune done: Kp=%.2f Ki=%.3f Kd=%.2f "
+                         "(Tu=%.1fs a=%.1f)", (double)kp, (double)ki,
+                         (double)kd, (double)ctx->autotune.tu_s,
+                         (double)ctx->autotune.amplitude);
+#endif
+            }
+        } else if (rc == -1) {
+            ctx->autotune_active = 0;
+            pid_trip_fault(ctx, PID_FAULT_TUNE);
+        } else {
+            pid_apply_output(power);
+        }
+    } else {
     switch (ctx->stage) {
     case PID_STAGE_STANDBY:
         pid_apply_output(0.0f);
@@ -450,6 +530,7 @@ void {{ comp_name }}_step(component_t *c)
     case PID_STAGE_FAULT:
         pid_apply_output(0.0f);
         break;
+    }
     }
 
     /* 4) publish process value to the configured topic (if any) */

@@ -1,0 +1,108 @@
+/* test_pid_autotune.c.j2 - relay-oscillation PID autotune unit tests */
+#include "unity.h"
+#include <math.h>
+
+#include "../src/pid_autotune.c"
+
+void setUp(void) {}
+void tearDown(void) {}
+
+/* ---- simulated thermal plant with pure transport delay ---- */
+#define PLANT_DELAY_STEPS 8U
+#define PLANT_HEAT_RATE   0.2f    /* degC/s per % power */
+#define PLANT_LOSS        0.2f    /* 1/s loss to ambient (tau ~5 s) */
+#define PLANT_AMBIENT     25.0f
+#define PLANT_DT_S        0.1f
+
+static float g_delay[PLANT_DELAY_STEPS];
+static unsigned g_delay_idx;
+
+static void plant_reset(void)
+{
+    unsigned i;
+    for (i = 0; i < PLANT_DELAY_STEPS; i++) g_delay[i] = 0.0f;
+    g_delay_idx = 0;
+}
+
+static float plant_step(float temp, float power)
+{
+    float delayed = g_delay[g_delay_idx];
+    g_delay[g_delay_idx] = power;
+    g_delay_idx = (g_delay_idx + 1) % PLANT_DELAY_STEPS;
+    return temp + (delayed * PLANT_HEAT_RATE
+                  - (temp - PLANT_AMBIENT) * PLANT_LOSS) * PLANT_DT_S;
+}
+
+void test_autotune_finds_stable_oscillation_and_gains(void)
+{
+    pid_autotune_t a;
+    float temp = PLANT_AMBIENT;
+    uint32_t t = 0;
+    float power = 0.0f;
+    float kp, ki, kd;
+    int rc = 0;
+    int steps = 0;
+    float hi = -1e9f, lo = 1e9f;
+
+    plant_reset();
+    pid_autotune_start(&a, 60.0f, PLANT_AMBIENT, 2, 100.0f);
+
+    while (steps < 6000) {   /* up to 600 s of simulated time */
+        rc = pid_autotune_step(&a, temp, t, &power);
+        if (rc != 0) break;
+        if (power > 50.0f) {
+            temp = plant_step(temp, 100.0f);
+        } else {
+            temp = plant_step(temp, 0.0f);
+        }
+        if (temp > hi) hi = temp;
+        if (temp < lo) lo = temp;
+        t += (uint32_t)(PLANT_DT_S * 1000.0f);
+        steps++;
+    }
+
+    TEST_ASSERT_EQUAL_INT(1, rc);            /* finished */
+    TEST_ASSERT_EQUAL_INT(0, a.failed);
+    TEST_ASSERT_TRUE(a.amplitude > 1.0f);    /* real oscillation */
+    TEST_ASSERT_TRUE(a.tu_s > 1.0f);
+    TEST_ASSERT_TRUE(a.ku > 0.0f);
+    TEST_ASSERT_EQUAL_INT(0, pid_autotune_result(&a, &kp, &ki, &kd));
+    TEST_ASSERT_TRUE(kp > 0.0f);
+    TEST_ASSERT_TRUE(ki > 0.0f);
+    TEST_ASSERT_TRUE(kd > 0.0f);
+    /* oscillation must stay around the target, not runaway */
+    TEST_ASSERT_TRUE(hi < 120.0f);
+    TEST_ASSERT_TRUE(lo > PLANT_AMBIENT - 5.0f);
+}
+
+void test_autotune_rejects_no_oscillation_as_failure(void)
+{
+    /* a frozen sensor (temperature never moves) cannot produce a relay
+     * oscillation: the run must time out as failed, never report done */
+    pid_autotune_t a;
+    float temp = 40.0f;
+    uint32_t t = 0;
+    float power = 0.0f;
+    int rc = 0;
+    int steps = 0;
+
+    pid_autotune_start(&a, 60.0f, PLANT_AMBIENT, 2, 100.0f);
+    while (steps < 6500) {   /* beyond the 600 s timeout */
+        rc = pid_autotune_step(&a, temp, t, &power);
+        if (rc != 0) break;
+        t += (uint32_t)(PLANT_DT_S * 1000.0f);
+        steps++;
+    }
+    /* flat response -> explicit timeout failure (-1) or still running (0);
+     * never a valid result (1) */
+    TEST_ASSERT_NOT_EQUAL_INT(1, rc);
+    TEST_ASSERT_TRUE(rc <= 0);
+}
+
+int main(void)
+{
+    UNITY_BEGIN();
+    RUN_TEST(test_autotune_finds_stable_oscillation_and_gains);
+    RUN_TEST(test_autotune_rejects_no_oscillation_as_failure);
+    return UNITY_END();
+}

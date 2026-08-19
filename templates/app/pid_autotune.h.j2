@@ -1,0 +1,92 @@
+/**
+ * @file  pid_autotune.h
+ * @brief Relay (on/off) PID autotune, Ziegler-Nichols ultimate-gain method
+ *
+ * The tuning approach follows the classic relay-oscillation method used by
+ * Marlin's M303 (heat the plant at full power, let it oscillate around the
+ * target, measure the ultimate period Tu and amplitude a, then apply the
+ * Ziegler-Nichols tuning rules).  This is an original implementation of the
+ * textbook formulas — no Marlin code is copied.
+ *
+ *   Ku = 4*d / (pi*a)   with d = (P_max - P_min)/2, a = (peak-trough)/2
+ *   Tu = oscillation period (s)
+ *   Kp = 0.6*Ku
+ *   Ki = 1.2*Ku/Tu      (= 2*Kp/Tu, classic ZN)
+ *   Kd = 0.075*Ku*Tu    (= Kp*Tu/8,  classic ZN)
+ *
+ * Pure C, no HAL/RTOS dependency — host-testable.
+ *
+ * Auto-generated — do not edit manually.
+ */
+
+#ifndef __PID_AUTOTUNE_H
+#define __PID_AUTOTUNE_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    float    target;         /* temperature to tune around (degC)      */
+    float    min_temp;       /* ambient/min temp for hi/lo thresholds  */
+    float    power_max;      /* full heater power (e.g. 100.0)         */
+    float    power_low;      /* power when relay is off (usually 0)    */
+    int      cycles_needed;  /* complete oscillation cycles (default 2)*/
+    uint32_t timeout_ms;     /* overall timeout before failure         */
+
+    /* internal state */
+    int      state;          /* 0..7 relay state machine               */
+    float    hi_temp;        /* overshoot threshold                    */
+    float    lo_temp;        /* undershoot threshold                   */
+    float    prev_temp;      /* previous sample (peak/trough detect)   */
+    float    peak_a, trough_a;      /* first peak/trough               */
+    float    peak_b, trough_b;      /* second peak/trough              */
+    uint32_t t_peak_a, t_trough_a;  /* timestamps                      */
+    uint32_t t_peak_b, t_trough_b;
+    uint32_t t_start;
+    int      cycles_done;
+    float    tu_s;           /* ultimate period (s)                    */
+    float    ku;             /* ultimate gain                          */
+    float    amplitude;      /* (peak - trough) / 2                    */
+    int      done;
+    int      failed;
+} pid_autotune_t;
+
+/**
+ * @brief  Start an autotune run.
+ * @param  a         Autotune context.
+ * @param  target    Target temperature (must be above min_temp).
+ * @param  min_temp  Ambient / minimum temperature for thresholds.
+ * @param  cycles    Complete cycles to average (>=1, 2 is standard).
+ * @param  power_max Full heater power used during the run.
+ */
+void pid_autotune_start(pid_autotune_t *a, float target, float min_temp,
+                        int cycles, float power_max);
+
+/**
+ * @brief  Advance one control step.
+ * @param  a         Autotune context.
+ * @param  temp_c    Current process temperature (degC).
+ * @param  now_ms    Monotonic time in ms.
+ * @param  out_power Heater power to apply (0..power_max).
+ * @return 0 = running, 1 = finished (result valid), -1 = failed.
+ */
+int pid_autotune_step(pid_autotune_t *a, float temp_c, uint32_t now_ms,
+                      float *out_power);
+
+/**
+ * @brief  Read the tuned gains after a successful run.
+ * @return 0 on success, -1 if the run is not finished.
+ */
+int pid_autotune_result(pid_autotune_t *a, float *kp, float *ki, float *kd);
+
+/** @brief Human-readable relay stage name (for CLI status). */
+const char *pid_autotune_stage_name(const pid_autotune_t *a);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __PID_AUTOTUNE_H */

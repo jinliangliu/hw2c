@@ -213,6 +213,9 @@ typedef int32_t IRQn_Type;
 typedef uint32_t HAL_StatusTypeDef;
 /* For test builds, provide a stub HAL_GetTick */
 uint32_t HAL_GetTick(void);
+/* Advance/reset the mock HAL tick (default 0) for time-based tests */
+void mock_tick_advance(uint32_t ms);
+void mock_tick_reset(void);
 
 #define RCC_RTCCLKSOURCE_LSI     1   /* or actual value from HAL, not critical */
 #define RTC_OUTPUT_POLARITY_HIGH 0   /* dummy */

@@ -31,11 +31,35 @@ R_ntc = R_fixed * (VCC/V_adc - 1)        (ntc_high=true)
 solenoid start [degC]   启动加热到目标温度
 solenoid stop           停止（关闭加热）
 solenoid set <degC>     在线修改目标温度
+solenoid tune <degC> [cycles]    PID 自整定（默认 2 个振荡周期）
 solenoid status         显示 stage/temperature/setpoint/duty/fault
 solenoid reset          清除故障
 ```
 
 > CLI 命令名沿用 `solenoid`（与压力 demo 一致）；温度场景语义相同。
+
+## PID 自整定（`solenoid tune <target>`）
+
+整定思路参考 Marlin M303 的继电振荡法（Ziegler-Nichols 临界增益法），
+实现为原创代码（Marlin 为 GPL，未复制其源码）：
+
+1. 满功率加热直到温度过冲 `target + (target - 环境)/2`
+2. 关断加热，等温度回落；再满功率，形成极限环振荡
+3. 完成 2 个完整周期后，由振荡幅值与周期计算：
+
+```
+Ku = 4·d / (π·a)      d = 满功率/2，a = 峰谷温差/2
+Tu = 振荡周期
+Kp = 0.6·Ku
+Ki = 1.2·Ku/Tu        （= 2·Kp/Tu）
+Kd = 0.075·Ku·Tu      （= Kp·Tu/8）
+```
+
+完成后自动把 Kp/Ki/Kd 写入运行时参数（`param_*_set`）并打印结果；
+自整定期间超温/传感器联锁仍然生效，无振荡（传感器失效）会超时判失败。
+
+> 自整定会让温度在目标附近振荡 ±10°C 量级，务必在台架/安全环境下进行；
+> 整定得到的增益适用于相近目标温度，跨大范围目标建议重新整定。
 
 ## 参数
 
@@ -48,4 +72,6 @@ solenoid reset          清除故障
 - 主机单测：复用 `test_pid_math`（算法与领域无关）
 - SIL 闭环：NTC 反算分压电压驱动 ADC mock，热质量模型（加热升温
   ~0.05°C/s·%）验证升温到目标进入 HOLD、超温触发 FAULT 且加热器关闭
+- 自整定：`test_pid_autotune` 用带纯滞后的热模型验证整定收敛并给出
+  合理 Kp/Ki/Kd；SIL 组件级测试验证 `solenoid tune` 全流程并应用增益
 - 台架联调：`solenoid start 50` 观察温度逼近 50°C 后进入 HOLD
