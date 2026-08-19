@@ -396,6 +396,38 @@ void test_pid_ctrl_overpressure_trips_fault(void)
     TEST_ASSERT_EQUAL_UINT32(0, duty);           /* heater forced off */
 {% endif %}
 }
+
+{% if pid_sensor %}
+void test_pid_ctrl_steptune_completes(void)
+{
+    component_t *comp = component_get("{{ pid_comp.name }}");
+    float p = 0.0f, sp = 0.0f;
+    uint32_t duty = 0, stage = 0, fault = 0;
+    int step_active = 1;
+    int i;
+    TEST_ASSERT_NOT_NULL(comp);
+    TEST_ASSERT_EQUAL_INT(0, {{ pid_pwm.name }}_init());
+    TEST_ASSERT_EQUAL_INT(0, comp->init(comp, NULL));
+    i2c_mock_add_device("{{ pid_sensor.bus }}", {{ pid_sensor.address }}, NULL, 0);
+    pid_sim_set_pressure(0.0f);
+
+    TEST_ASSERT_EQUAL_INT(0, {{ pid_comp.name }}_start_steptune(30.0f, 60.0f));
+    /* linear fill model: p += duty * 1.0 kPa/s * 0.062 s */
+    for (i = 0; i < 4000 && step_active && fault == 0; i++) {
+        comp->step(comp);
+        mock_tick_advance(62);
+        (void){{ pid_comp.name }}_get_status(&p, &sp, &duty, &stage, &fault);
+        (void){{ pid_comp.name }}_get_steptune(&step_active, NULL, NULL, NULL);
+        if (duty > 0) {
+            p += (float)duty * 1.0f * 0.062f;
+            pid_sim_set_pressure(p);
+        }
+    }
+    TEST_ASSERT_EQUAL_INT(0, step_active);   /* finished or failed */
+    TEST_ASSERT_EQUAL_UINT32(0, fault);
+    TEST_ASSERT_TRUE(param_pid_kp_get() > 0.0f);  /* gains applied */
+}
+{% endif %}
 {% endif %}
 
 /* ---- Test runner ---- */
@@ -430,6 +462,9 @@ int main(void)
 {% if has_pid_ctrl %}
     RUN_TEST(test_pid_ctrl_closed_loop_reaches_target);
     RUN_TEST(test_pid_ctrl_overpressure_trips_fault);
+{% if pid_sensor %}
+    RUN_TEST(test_pid_ctrl_steptune_completes);
+{% endif %}
 {% if pid_ntc %}
     RUN_TEST(test_pid_ctrl_autotune_completes);
 {% endif %}

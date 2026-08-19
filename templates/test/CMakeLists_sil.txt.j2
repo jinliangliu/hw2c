@@ -49,6 +49,7 @@ add_executable(test_component_sil
 {% set pid_pwm = peripherals | selectattr('type', 'eq', 'Internal_PWM') | first %}
     ${CMAKE_SOURCE_DIR}/../../src/pid_math.c
     ${CMAKE_SOURCE_DIR}/../../src/pid_autotune.c
+    ${CMAKE_SOURCE_DIR}/../../src/pid_steptune.c
 {% if pid_sensor %}
     ${CMAKE_SOURCE_DIR}/../../src/drivers/drv_{{ pid_sensor.name }}.c
 {% endif %}

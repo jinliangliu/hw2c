@@ -1,0 +1,85 @@
+/* test_pid_steptune.c.j2 - open-loop step-response PID tuning tests */
+#include "unity.h"
+#include <math.h>
+
+#include "../src/pid_steptune.c"
+
+void setUp(void) {}
+void tearDown(void) {}
+
+/* ---- first-order-plus-dead-time plant ---- */
+#define PLANT_K   300.0f   /* kPa per fractional duty */
+#define PLANT_TAU 3.0f     /* time constant (s)       */
+#define PLANT_LAG 0.5f     /* dead time (s)           */
+#define PLANT_P0  10.0f
+#define PLANT_U   0.3f     /* test duty 30%           */
+
+static float plant_pressure(float t_s)
+{
+    if (t_s < PLANT_LAG) {
+        return PLANT_P0;
+    }
+    return PLANT_P0 + PLANT_K * PLANT_U
+                      * (1.0f - expf(-(t_s - PLANT_LAG) / PLANT_TAU));
+}
+
+void test_steptune_identifies_model_and_gains(void)
+{
+    pid_steptune_t s;
+    const float stop = 99.0f;   /* below steady state 100 -> finite time */
+    float t_s = 0.0f;
+    uint32_t t_ms = 0;
+    float duty = 0.0f;
+    float kp, ki, kd;
+    int rc = 0;
+    int steps = 0;
+
+    pid_steptune_start(&s, 30.0f, stop, PLANT_P0, 0);
+    while (steps < 4000) {
+        rc = pid_steptune_step(&s, plant_pressure(t_s), t_ms, &duty);
+        if (rc != 0) break;
+        t_ms += 10;
+        t_s = (float)t_ms / 1000.0f;
+        steps++;
+    }
+
+    TEST_ASSERT_EQUAL_INT(1, rc);              /* finished */
+    TEST_ASSERT_EQUAL_INT(2, s.state);
+    /* identified model close to the true plant */
+    TEST_ASSERT_FLOAT_WITHIN(PLANT_TAU * 0.4f, PLANT_TAU, s.tau);
+    TEST_ASSERT_FLOAT_WITHIN(PLANT_LAG * 0.5f, PLANT_LAG, s.lag);
+    TEST_ASSERT_FLOAT_WITHIN(PLANT_K * 0.3f, PLANT_K, s.k);
+    /* ZN open-loop gains are positive and finite */
+    TEST_ASSERT_EQUAL_INT(0, pid_steptune_result(&s, &kp, &ki, &kd));
+    TEST_ASSERT_TRUE(kp > 0.0f);
+    TEST_ASSERT_TRUE(ki > 0.0f);
+    TEST_ASSERT_TRUE(kd > 0.0f);
+}
+
+void test_steptune_flat_response_times_out(void)
+{
+    pid_steptune_t s;
+    uint32_t t_ms = 0;
+    float duty = 0.0f;
+    int rc = 0;
+    int steps = 0;
+
+    pid_steptune_start(&s, 30.0f, 99.0f, PLANT_P0, 0);
+    while (steps < 14000) {   /* beyond the 120 s timeout */
+        rc = pid_steptune_step(&s, PLANT_P0, t_ms, &duty);
+        if (rc != 0) break;
+        t_ms += 10;
+        steps++;
+    }
+    /* flat response -> timeout failure (-1); never a valid result (1) */
+    TEST_ASSERT_NOT_EQUAL_INT(1, rc);
+    TEST_ASSERT_TRUE(rc <= 0);
+}
+
+int main(void)
+{
+    UNITY_BEGIN();
+    RUN_TEST(test_steptune_identifies_model_and_gains);
+    RUN_TEST(test_steptune_flat_response_times_out);
+    return UNITY_END();
+}

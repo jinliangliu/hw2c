@@ -1,0 +1,94 @@
+/**
+ * @file  pid_steptune.h
+ * @brief Open-loop step-response PID tuning (first-order + dead time)
+ *
+ * Tunes a pressure / flow / temperature loop from an open-loop step test,
+ * which is safe for pressurizing pipelines (no relay oscillation, pressure
+ * rises monotonically).  The classic S-curve method fits a first-order-plus-
+ * dead-time model:
+ *
+ *   P(t) = P0 + K*u*(1 - exp(-(t-L)/tau))      t >= L
+ *
+ * with K = final span per fractional duty, tau the time constant and L the
+ * dead time.  tau/L are recovered from the 28.3% / 63.2% crossing times
+ * (tau = 1.5*(t2-t1), L = t2-tau), then the Ziegler-Nichols open-loop
+ * tuning rules give:
+ *
+ *   Kp = 1.2*tau/(K*L)     Ki = Kp/(2*L)      Kd = Kp*(0.5*L)
+ *
+ * Note: a pipeline pressurizing at constant opening approximates an
+ * integrator; the first-order fit still yields usable (conservative)
+ * gains.  Tune in a safe rig and verify on the bench.
+ *
+ * Pure C, no HAL/RTOS dependency — host-testable.
+ *
+ * Auto-generated — do not edit manually.
+ */
+
+#ifndef __PID_STEPTUNE_H
+#define __PID_STEPTUNE_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    float    duty_test;      /* open-loop duty to apply (0..100)        */
+    float    stop_pressure;  /* stop the test when P reaches this       */
+    float    p0;             /* pressure at test start                  */
+    uint32_t timeout_ms;     /* max test duration                       */
+
+    /* internal */
+    uint32_t t_start;
+    float    delta_final;    /* stop_pressure - p0                      */
+    uint32_t t_283;          /* time of 28.3% crossing                  */
+    uint32_t t_632;          /* time of 63.2% crossing                  */
+    uint32_t t_stop;         /* time the test ended                     */
+    float    p_stop;
+    int      state;          /* 0 idle, 1 running, 2 done, 3 failed     */
+
+    /* identified model + gains */
+    float    k;              /* kPa per fractional duty                 */
+    float    tau;            /* time constant (s)                       */
+    float    lag;            /* dead time (s)                           */
+    float    kp, ki, kd;
+} pid_steptune_t;
+
+/**
+ * @brief  Start an open-loop step test.
+ * @param  s              Context.
+ * @param  duty           Open-loop duty in percent (5..100).
+ * @param  stop_pressure  Stop the test at this pressure (must exceed p0).
+ * @param  p0             Current pressure at start.
+ * @param  now_ms         Monotonic time.
+ */
+void pid_steptune_start(pid_steptune_t *s, float duty, float stop_pressure,
+                        float p0, uint32_t now_ms);
+
+/**
+ * @brief  Advance one step.
+ * @param  s          Context.
+ * @param  pressure   Current pressure (kPa).
+ * @param  now_ms     Monotonic time.
+ * @param  out_duty   Duty to apply while running (0 when finished).
+ * @return 0 = running, 1 = finished (result valid), -1 = failed.
+ */
+int pid_steptune_step(pid_steptune_t *s, float pressure, uint32_t now_ms,
+                      float *out_duty);
+
+/**
+ * @brief  Read the tuned gains after a successful run.
+ * @return 0 on success, -1 if the run is not finished.
+ */
+int pid_steptune_result(pid_steptune_t *s, float *kp, float *ki, float *kd);
+
+/** @brief Human-readable stage name (for CLI status). */
+const char *pid_steptune_stage_name(const pid_steptune_t *s);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __PID_STEPTUNE_H */

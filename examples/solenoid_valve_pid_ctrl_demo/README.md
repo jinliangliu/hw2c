@@ -37,19 +37,50 @@ solenoid start [kpa]   启动加压（可选指定目标）
 solenoid stop          停止（进入 STANDBY）
 solenoid vent          泄压
 solenoid set <kpa>     在线修改目标
+solenoid step_test <duty> <stop_kpa>   开环阶跃辨识整定（推荐，单阀适用）
 solenoid status        显示 stage/pressure/setpoint/duty/fault
 solenoid reset         清除故障
 ```
 
 ## 参数（params.yaml，运行时经 `param set`）
 
-`pid_kp / pid_ki / pid_kd`、`target_pressure_kpa`、`pressure_max_kpa`、
-`duty_min_pct`（低于此占空比阀门保持关闭）、`duty_max_pct`、
-`ramp_timeout_ms`。
+`pid_kp / pid_ki / pid_kd`、`pid_target`、`pid_max_value`（超压联锁）、
+`pid_duty_min_pct`（低于此占空比阀门保持关闭）、`pid_duty_max_pct`、
+`pid_ramp_timeout_ms`。
+
+## 开环阶跃辨识整定（`solenoid step_test <duty> <stop_kpa>`）
+
+燃气管道加压的**安全整定方式**：不做继电器振荡（压力不自然下降），
+而是开环固定占空比加压、记录压力上升曲线，拟合一阶惯性+纯滞后模型：
+
+```
+P(t) = P0 + K·u·(1 - exp(-(t-L)/τ))
+```
+
+辨识步骤：
+
+1. 以指定 `duty`（建议 20~40%）开阀加压，压力单调上升，到达
+   `stop_kpa`（建议取目标压力的 70~90%，确保低于超压联锁）时停止
+2. 记录压力跨过终值 28.3% 与 63.2% 的时刻 t1/t2：
+   `τ = 1.5·(t2-t1)`，`L = t2-τ`，`K = ΔP / (duty/100)`
+3. 按 Ziegler-Nichols 开环阶跃公式计算并自动写入参数：
+
+```
+Kp = 1.2·τ/(K·L)
+Ki = Kp/(2·L)
+Kd = Kp·(0.5·L)
+```
+
+安全要点：整定全程压力单调上升、无振荡、无超压风险；`stop_kpa` 必须
+低于 `pressure_max_kpa` 联锁值；完成后 `solenoid start <目标>` 即可用
+整定参数闭环。管道加压近似积分过程，一阶拟合给出保守参数，台架上按
+需微调 Kp/Ki/Kd。
 
 ## 验证
 
 - 主机单测：`test_pid_math`（阶跃收敛、抗饱和、微分滤波、setpoint ramp）
 - SIL 闭环：压力罐模型（开阀升压 ~1 kPa/s·%duty，关阀保压）验证升压
   到达目标进入 HOLD、超压触发 FAULT 且阀门全关
+- 整定：`test_pid_steptune` 用一阶+滞后模型验证辨识 K/τ/L 精度与
+  ZN 参数；SIL 组件级 `step_test` 全流程通过并应用增益
 - 台架联调：`solenoid start 100` 观察压力逼近目标后进入 HOLD

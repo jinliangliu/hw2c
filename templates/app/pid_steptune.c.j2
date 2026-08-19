@@ -1,0 +1,116 @@
+/**
+ * @file  pid_steptune.c
+ * @brief Open-loop step-response PID tuning implementation
+ *
+ * Auto-generated — do not edit manually.
+ */
+
+#include "pid_steptune.h"
+#include <stddef.h>
+
+/* 28.3% and 63.2% of a first-order step (1-e^-1 = 0.632, and tau =
+ * 1.5*(t63.2 - t28.3) is exact for a pure first-order response). */
+#define STEPTUNE_K1 0.283f
+#define STEPTUNE_K2 0.632f
+
+void pid_steptune_start(pid_steptune_t *s, float duty, float stop_pressure,
+                        float p0, uint32_t now_ms)
+{
+    if (s == NULL) return;
+    s->duty_test     = (duty < 5.0f) ? 5.0f : (duty > 100.0f ? 100.0f : duty);
+    s->stop_pressure = stop_pressure;
+    s->p0            = p0;
+    s->timeout_ms    = 120000U;          /* 2 minutes hard limit */
+    s->t_start       = now_ms;
+    s->delta_final   = stop_pressure - p0;
+    s->t_283 = s->t_632 = s->t_stop = 0U;
+    s->p_stop = 0.0f;
+    s->k = s->tau = s->lag = 0.0f;
+    s->kp = s->ki = s->kd = 0.0f;
+    s->state = 1;                        /* running */
+}
+
+const char *pid_steptune_stage_name(const pid_steptune_t *s)
+{
+    if (s == NULL) return "?";
+    switch (s->state) {
+    case 1: return "RAMP";
+    case 2: return "DONE";
+    case 3: return "FAILED";
+    default: return "IDLE";
+    }
+}
+
+int pid_steptune_step(pid_steptune_t *s, float pressure, uint32_t now_ms,
+                      float *out_duty)
+{
+    float dp;
+    if (s == NULL || out_duty == NULL) {
+        return -1;
+    }
+    if (s->state == 2) {                 /* finished */
+        *out_duty = 0.0f;
+        return 1;
+    }
+    if (s->state == 3) {                 /* failed */
+        *out_duty = 0.0f;
+        return -1;
+    }
+
+    dp = pressure - s->p0;
+
+    /* record the 28.3% / 63.2% crossing times of the final span */
+    if (s->t_283 == 0U && s->delta_final > 0.0f &&
+        dp >= s->delta_final * STEPTUNE_K1) {
+        s->t_283 = now_ms - s->t_start;
+    }
+    if (s->t_632 == 0U && s->delta_final > 0.0f &&
+        dp >= s->delta_final * STEPTUNE_K2) {
+        s->t_632 = now_ms - s->t_start;
+    }
+
+    /* stop at the requested pressure or timeout */
+    if (pressure >= s->stop_pressure ||
+        (now_ms - s->t_start) > s->timeout_ms) {
+        s->t_stop = now_ms - s->t_start;
+        s->p_stop = pressure;
+
+        /* fit first-order-plus-dead-time model */
+        if (s->t_632 > s->t_283 && s->t_283 > 0U && s->delta_final > 0.0f) {
+            float u = s->duty_test / 100.0f;
+            s->tau = 1.5f * (float)(s->t_632 - s->t_283) / 1000.0f;
+            s->lag = (float)s->t_632 / 1000.0f - s->tau;
+            if (s->lag < 0.1f) {
+                s->lag = 0.1f;           /* guard against zero dead time */
+            }
+            s->k = s->delta_final / u;
+
+            if (s->k > 0.0f && s->tau > 0.0f) {
+                /* Ziegler-Nichols open-loop tuning rules */
+                s->kp = 1.2f * s->tau / (s->k * s->lag);
+                s->ki = s->kp / (2.0f * s->lag);
+                s->kd = s->kp * (0.5f * s->lag);
+                s->state = 2;
+                *out_duty = 0.0f;
+                return 1;
+            }
+        }
+        s->state = 3;                    /* no usable step response */
+        *out_duty = 0.0f;
+        return -1;
+    }
+
+    *out_duty = s->duty_test;
+    return 0;
+}
+
+int pid_steptune_result(pid_steptune_t *s, float *kp, float *ki, float *kd)
+{
+    if (s == NULL || s->state != 2 || kp == NULL || ki == NULL || kd == NULL) {
+        return -1;
+    }
+    *kp = s->kp;
+    *ki = s->ki;
+    *kd = s->kd;
+    return 0;
+}

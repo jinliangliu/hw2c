@@ -67,6 +67,7 @@
 #include "component_registry.h"
 #include "pid_math.h"
 #include "pid_autotune.h"
+#include "pid_steptune.h"
 #include "param_registry.h"
 {% if fb_peri %}
 #include "drv_{{ fb_peri.name }}.h"
@@ -128,6 +129,8 @@ struct {{ comp_name }}_ctx {
     uint32_t events;
     pid_autotune_t autotune;
     uint8_t  autotune_active;
+    pid_steptune_t steptune;
+    uint8_t  steptune_active;
 };
 
 static struct {{ comp_name }}_ctx g_pid_ctx;
@@ -176,6 +179,7 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
     ctx->events          = 0;
     ctx->hold_hysteresis = {{ hold_hyst }}f;
     ctx->autotune_active = 0;
+    ctx->steptune_active = 0;
 {% if p_ramp %}
 {% if p_ramp.name == 'pid_ramp_timeout_ms' %}
     ctx->ramp_timeout_ms = param_pid_ramp_timeout_ms_get();
@@ -264,7 +268,7 @@ int {{ comp_name }}_set_setpoint(float value)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized) return -1;
-    if (ctx->autotune_active) return -1;   /* not while tuning */
+    if (ctx->autotune_active || ctx->steptune_active) return -1;
 {% if p_max %}
 {% if p_max.name == 'pid_max_value' %}
     if (value < {{ target_min | float }}f || value > param_pid_max_value_get()) {
@@ -289,7 +293,7 @@ int {{ comp_name }}_start(void)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized || ctx->fault != PID_FAULT_NONE) return -1;
-    if (ctx->autotune_active) return -1;
+    if (ctx->autotune_active || ctx->steptune_active) return -1;
 {% if p_target and p_target.name == 'pid_target' %}
     return {{ comp_name }}_set_setpoint(param_pid_target_get());
 {% elif p_target %}
@@ -358,6 +362,53 @@ int {{ comp_name }}_get_autotune(int *active, const char **stage,
     if (stage)  *stage  = ctx->autotune_active
                           ? pid_autotune_stage_name(&ctx->autotune) : "-";
     if (target) *target = ctx->autotune.target;
+    return 0;
+}
+
+/* ---- Open-loop step-response tuning (pressure-safe) ---- */
+int {{ comp_name }}_start_steptune(float duty, float stop_pressure)
+{
+    struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
+    if (!ctx->initialized) return -1;
+    if (ctx->autotune_active || ctx->steptune_active) return -1;
+{% if p_max and p_max.name == 'pid_max_value' %}
+    if (duty <= 0.0f || duty > 100.0f ||
+        stop_pressure <= ctx->process_value ||
+        stop_pressure > param_pid_max_value_get()) {
+        return -1;
+    }
+{% elif p_max %}
+    if (duty <= 0.0f || duty > 100.0f ||
+        stop_pressure <= ctx->process_value ||
+        stop_pressure > param_pressure_max_kpa_get()) {
+        return -1;
+    }
+{% else %}
+    if (duty <= 0.0f || duty > 100.0f ||
+        stop_pressure <= ctx->process_value ||
+        stop_pressure > 1000.0f) {
+        return -1;
+    }
+{% endif %}
+    ctx->fault = PID_FAULT_NONE;
+    ctx->stage = PID_STAGE_STANDBY;
+    ctx->read_failures = 0;
+    pid_steptune_start(&ctx->steptune, duty, stop_pressure,
+                       ctx->process_value, HAL_GetTick());
+    ctx->steptune_active = 1;
+    return 0;
+}
+
+int {{ comp_name }}_get_steptune(int *active, const char **stage,
+                                float *duty, float *stop)
+{
+    struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
+    if (!ctx->initialized) return -1;
+    if (active) *active = ctx->steptune_active;
+    if (stage)  *stage  = ctx->steptune_active
+                          ? pid_steptune_stage_name(&ctx->steptune) : "-";
+    if (duty)   *duty   = ctx->steptune.duty_test;
+    if (stop)   *stop   = ctx->steptune.stop_pressure;
     return 0;
 }
 
@@ -456,8 +507,41 @@ void {{ comp_name }}_step(component_t *c)
     }
 {% endif %}
 
-    /* 3) autotune takes priority over the normal stage machine */
-    if (ctx->autotune_active && ctx->fault == PID_FAULT_NONE) {
+    /* 3) step-response tuning takes priority (open-loop ramp) */
+    if (ctx->steptune_active && ctx->fault == PID_FAULT_NONE) {
+        float duty_out = 0.0f;
+        int rc = pid_steptune_step(&ctx->steptune, ctx->process_value,
+                                   now, &duty_out);
+        if (rc == 1) {
+            float kp = 0.0f, ki = 0.0f, kd = 0.0f;
+            ctx->steptune_active = 0;
+            if (pid_steptune_result(&ctx->steptune, &kp, &ki, &kd) == 0) {
+                pid_set_gains(&ctx->pid, kp, ki, kd);
+{% if params | selectattr('name', 'eq', 'pid_kp') %}
+                param_pid_kp_set(kp);
+{% endif %}
+{% if params | selectattr('name', 'eq', 'pid_ki') %}
+                param_pid_ki_set(ki);
+{% endif %}
+{% if params | selectattr('name', 'eq', 'pid_kd') %}
+                param_pid_kd_set(kd);
+{% endif %}
+#ifndef TEST
+                log_info("PID step-tune done: Kp=%.2f Ki=%.3f Kd=%.2f "
+                         "(K=%.2f tau=%.1fs L=%.2fs)",
+                         (double)kp, (double)ki, (double)kd,
+                         (double)ctx->steptune.k,
+                         (double)ctx->steptune.tau,
+                         (double)ctx->steptune.lag);
+#endif
+            }
+        } else if (rc == -1) {
+            ctx->steptune_active = 0;
+            pid_trip_fault(ctx, PID_FAULT_TUNE);
+        } else {
+            pid_apply_output(duty_out);
+        }
+    } else if (ctx->autotune_active && ctx->fault == PID_FAULT_NONE) {
         float power = 0.0f;
         int rc = pid_autotune_step(&ctx->autotune, ctx->process_value,
                                    now, &power);
