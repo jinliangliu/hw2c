@@ -387,9 +387,6 @@ void RTC_Init(void)
     }
 {% endif %}
 
-    /* fixed 1-second wakeup heartbeat */
-    RTC_WakeUp_Config();
-
     /*
      * Disarm leftover backup-domain wakeup/alarm state BEFORE enabling
      * the RTC interrupt.  The backup domain survives system resets, so a
@@ -403,6 +400,12 @@ void RTC_Init(void)
     __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);
     __HAL_RTC_WRITEPROTECTION_ENABLE(&hrtc);
     NVIC_ClearPendingIRQ(RTC_TAMP_IRQn);
+
+    /* Fixed 1-second wakeup heartbeat.  Must be (re)armed AFTER the
+     * disarm step above: DeactivateWakeUpTimer clears WUTE, so calling
+     * RTC_WakeUp_Config() before it would leave the heartbeat disabled
+     * and rtc_uptime_sec stuck at 0 (no RTC periodic timers fire). */
+    RTC_WakeUp_Config();
 
     /* RTC must be the top-priority interrupt so the wakeup timer can
      * wake the core from STOP mode and preempt everything else.
@@ -447,6 +450,12 @@ void RTC_Init(void)
 {% endfor %}
 
     rtc_ready = true;
+
+    /* Timers were inserted while rtc_ready was still false, so
+     * rtc_arm_alarm_a() bailed out during RTC_TimerStart.  Re-arm Alarm A
+     * now that the RTC is ready, otherwise no Alarm A deadline is set and
+     * periodic alarms (SECONDS_30, ...) never fire. */
+    rtc_arm_alarm_a();
 }
 
 void RTC_Start(void) {}
