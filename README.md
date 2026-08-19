@@ -257,6 +257,7 @@ cmake --build build --target flash-daplink   # DAP-Link（CMSIS-DAP）/ OpenOCD
 | `examples/pwm_demo` | TIM2 双通道 PWM（CH1=PA0/CH2=PA1），逐路占空比可调 + 频率可改；CLI `pwm list/set/freq` | 7 套件（含 test_pwm 多通道） |
 | `examples/knob_demo` | TIM1 直驱 FOC 力矩反馈阻尼旋钮：三相互补 PWM + 电流环 + AS5600 编码器 + Knob 阻尼/摩擦力觉；CLI `motor`/`knob` | 9 套件（含 test_foc_math） |
 | `examples/solenoid_valve_pid_ctrl_demo` | **过程变量 PID 中间件**（`pid_math` + `pid_ctrl` 组件，可选装，压力/温度/流量通用）：燃气电磁阀开关阀 16 Hz PWM 占空比调制加压，I2C 压力/温度反馈（I2C_Pressure/I2C_TempSensor），单路/双路（加热+制冷）执行器，升压/保压/故障联锁（超限/传感器失效/超时）；CLI `solenoid`；SIL 压力罐闭环仿真 | 8 套件（含 test_pid_math + SIL 闭环） |
+| `examples/thermo_pid_ctrl_demo` | **NTC 温控**（同一 PID 中间件）：NTC 100K/3950 分压 + ADC（B 参数方程换算），PWM 加热器，超温联锁；SIL 热质量模型闭环仿真验证升温到 HOLD / 超温 FAULT | 8 套件（含 SIL 闭环） |
 
 每个示例均为六层 YAML 完整配置，可独立生成、编译并通过全部单元测试。各示例的接线、生成与对测方法见 `examples/*/README.md`。
 

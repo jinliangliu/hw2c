@@ -211,6 +211,13 @@ static int pid_feedback_read(float *out)
     }
     *out = s.process_value;
     return 0;
+{% elif fb_peri and fb_peri.type == 'NTC_TempSensor' %}
+    {{ fb_peri.name }}_data_t s;
+    if ({{ fb_peri.name }}_read(&s) != 0) {
+        return -1;
+    }
+    *out = s.temp_c;
+    return 0;
 {% else %}
     (void)out;
     return -1;   /* pid_ctrl: unsupported feedback source type */

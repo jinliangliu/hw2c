@@ -69,6 +69,14 @@ void setUp(void)
 {% if has_topics %}
     bus_init();
 {% endif %}
+{% if has_pid_ctrl %}
+{% set pid_pwm = peripherals | selectattr('type', 'eq', 'Internal_PWM') | first %}
+    (void){{ pid_pwm.name }}_init();   /* timer base before any pid step */
+{% set pid_ntc = peripherals | selectattr('type', 'eq', 'NTC_TempSensor') | first %}
+{% if pid_ntc %}
+    (void){{ pid_ntc.name }}_init();   /* open ADC so mock set_reading works */
+{% endif %}
+{% endif %}
 }
 
 void tearDown(void) {}
@@ -227,77 +235,123 @@ void test_param_{{ p.name }}_set_within_range(void)
 {% endif %}
 
 {% if has_pid_ctrl %}
-/* ---- Test: PID solenoid closed-loop pressure simulation ---- */
-{% set pid_pressure = peripherals | selectattr('type', 'eq', 'I2C_Pressure') | first %}
+/* ---- Test: PID process-control closed-loop simulation ---- */
+{% set pid_sensor = peripherals | selectattr('type', 'in', ['I2C_Pressure', 'I2C_TempSensor']) | first %}
+{% set pid_ntc = peripherals | selectattr('type', 'eq', 'NTC_TempSensor') | first %}
 {% set pid_pwm = peripherals | selectattr('type', 'eq', 'Internal_PWM') | first %}
 {% set pid_comp = components | selectattr('type', 'eq', 'pid_ctrl') | first %}
+{% if pid_sensor %}
 static void pid_sim_set_pressure(float kpa)
 {
     /* mock I2C pressure sensor: raw = kpa / scale, 24-bit big-endian */
-    uint32_t raw = (uint32_t)(kpa / {{ pid_pressure.get('extra', {}).get('scale_per_lsb', pid_pressure.get('extra', {}).get('scale_kpa_per_lsb', 0.001)) }});
-    i2c_mock_set_reg("{{ pid_pressure.bus }}", {{ pid_pressure.address }},
-                     {{ pid_pressure.get('extra', {}).get('reg_start', 0) }},
+    uint32_t raw = (uint32_t)(kpa / {{ pid_sensor.get('extra', {}).get('scale_per_lsb', pid_sensor.get('extra', {}).get('scale_kpa_per_lsb', 0.001)) }});
+    i2c_mock_set_reg("{{ pid_sensor.bus }}", {{ pid_sensor.address }},
+                     {{ pid_sensor.get('extra', {}).get('reg_start', 0) }},
                      (uint8_t)((raw >> 16) & 0xFF));
-    i2c_mock_set_reg("{{ pid_pressure.bus }}", {{ pid_pressure.address }},
-                     {{ pid_pressure.get('extra', {}).get('reg_start', 0) }} + 1,
+    i2c_mock_set_reg("{{ pid_sensor.bus }}", {{ pid_sensor.address }},
+                     {{ pid_sensor.get('extra', {}).get('reg_start', 0) }} + 1,
                      (uint8_t)((raw >> 8) & 0xFF));
-    i2c_mock_set_reg("{{ pid_pressure.bus }}", {{ pid_pressure.address }},
-                     {{ pid_pressure.get('extra', {}).get('reg_start', 0) }} + 2,
+    i2c_mock_set_reg("{{ pid_sensor.bus }}", {{ pid_sensor.address }},
+                     {{ pid_sensor.get('extra', {}).get('reg_start', 0) }} + 2,
                      (uint8_t)(raw & 0xFF));
 }
+{% elif pid_ntc %}
+static void ntc_sim_set_temp(float t_c)
+{
+    /* invert the B-parameter equation + divider to get the ADC voltage:
+     *   R = R0 * exp(B*(1/T - 1/T0));  V = VCC * R_fixed / (R + R_fixed) */
+    float t_k = t_c + 273.15f;
+    float t0_k = {{ pid_ntc.get('extra', {}).get('t0_c', 25.0) }}f + 273.15f;
+    float r = {{ pid_ntc.get('extra', {}).get('r0_ohm', 100000.0) }}f
+              * expf({{ pid_ntc.get('extra', {}).get('b_value', 3950.0) }}f
+                     * (1.0f / t_k - 1.0f / t0_k));
+    float v = {{ pid_ntc.get('extra', {}).get('vref_mv', 3300.0) }}f
+              * {{ pid_ntc.get('extra', {}).get('r_fixed_ohm', 100000.0) }}f
+              / (r + {{ pid_ntc.get('extra', {}).get('r_fixed_ohm', 100000.0) }}f);
+    adc_mock_set_reading("{{ pid_ntc.get('extra', {}).get('adc', 'adc1') }}",
+                         (uint32_t)v);
+}
+{% endif %}
 
 void test_pid_ctrl_closed_loop_reaches_target(void)
 {
     component_t *comp = component_get("{{ pid_comp.name }}");
-    float pressure = 0.0f, setpoint = 0.0f;
+    float pv = 0.0f, setpoint = 0.0f;
     uint32_t duty = 0, stage = 0, fault = 0;
     int i;
     TEST_ASSERT_NOT_NULL(comp);
     TEST_ASSERT_EQUAL_INT(0, {{ pid_pwm.name }}_init());  /* timer base first */
     TEST_ASSERT_EQUAL_INT(0, comp->init(comp, NULL));
-    i2c_mock_add_device("{{ pid_pressure.bus }}", {{ pid_pressure.address }}, NULL, 0);
+{% if pid_sensor %}
+    i2c_mock_add_device("{{ pid_sensor.bus }}", {{ pid_sensor.address }}, NULL, 0);
     pid_sim_set_pressure(0.0f);
 
     TEST_ASSERT_EQUAL_INT(0, {{ pid_comp.name }}_set_setpoint(100.0f));
-    /* solenoid tank model: while the valve is open the pressure rises at
-     * ~1 kPa/s per % duty; when duty == 0 the valve is closed and pressure
-     * holds (slow leak ignored).  This reflects an ON/OFF valve modulated
-     * by PWM average opening, not a proportional valve. */
+    /* ON/OFF valve tank model: open valve raises pressure ~1 kPa/s per % */
     for (i = 0; i < 4000 && fault == 0; i++) {
         comp->step(comp);
-        (void){{ pid_comp.name }}_get_status(&pressure, &setpoint, &duty,
+        (void){{ pid_comp.name }}_get_status(&pv, &setpoint, &duty,
                                             &stage, &fault);
         if (duty > 0) {
-            pressure += (float)duty * 1.0f * 0.062f;
-            if (pressure > 150.0f) {
-                pressure = 150.0f;
+            pv += (float)duty * 1.0f * 0.062f;
+            if (pv > 150.0f) {
+                pv = 150.0f;
             }
-            pid_sim_set_pressure(pressure);
+            pid_sim_set_pressure(pv);
         }
     }
-    (void){{ pid_comp.name }}_get_status(&pressure, &setpoint, &duty,
+    (void){{ pid_comp.name }}_get_status(&pv, &setpoint, &duty,
                                         &stage, &fault);
     TEST_ASSERT_EQUAL_UINT32(0, fault);
     TEST_ASSERT_EQUAL_UINT32(2, stage);          /* HOLD */
-    TEST_ASSERT_FLOAT_WITHIN(5.0f, 100.0f, pressure);
+    TEST_ASSERT_FLOAT_WITHIN(5.0f, 100.0f, pv);
+{% elif pid_ntc %}
+    ntc_sim_set_temp(25.0f);
+    TEST_ASSERT_EQUAL_INT(0, {{ pid_comp.name }}_set_setpoint(50.0f));
+    /* thermal mass model: heater raises temperature ~0.05 degC/s per % */
+    for (i = 0; i < 4000 && fault == 0; i++) {
+        comp->step(comp);
+        (void){{ pid_comp.name }}_get_status(&pv, &setpoint, &duty,
+                                            &stage, &fault);
+        if (duty > 0) {
+            pv += (float)duty * 0.05f * 0.1f;
+            ntc_sim_set_temp(pv);
+        }
+    }
+    (void){{ pid_comp.name }}_get_status(&pv, &setpoint, &duty,
+                                        &stage, &fault);
+    TEST_ASSERT_EQUAL_UINT32(0, fault);
+    TEST_ASSERT_EQUAL_UINT32(2, stage);          /* HOLD */
+    TEST_ASSERT_FLOAT_WITHIN(2.0f, 50.0f, pv);
+{% endif %}
 }
 
 void test_pid_ctrl_overpressure_trips_fault(void)
 {
     component_t *comp = component_get("{{ pid_comp.name }}");
-    float pressure = 0.0f, setpoint = 0.0f;
+    float pv = 0.0f, setpoint = 0.0f;
     uint32_t duty = 0, stage = 0, fault = 0;
     TEST_ASSERT_NOT_NULL(comp);
     TEST_ASSERT_EQUAL_INT(0, {{ pid_pwm.name }}_init());  /* timer base first */
     TEST_ASSERT_EQUAL_INT(0, comp->init(comp, NULL));
-    i2c_mock_add_device("{{ pid_pressure.bus }}", {{ pid_pressure.address }}, NULL, 0);
+{% if pid_sensor %}
+    i2c_mock_add_device("{{ pid_sensor.bus }}", {{ pid_sensor.address }}, NULL, 0);
     pid_sim_set_pressure(600.0f);                /* above pressure_max_kpa */
     comp->step(comp);
-    (void){{ pid_comp.name }}_get_status(&pressure, &setpoint, &duty,
+    (void){{ pid_comp.name }}_get_status(&pv, &setpoint, &duty,
                                         &stage, &fault);
     TEST_ASSERT_EQUAL_UINT32(1, fault);          /* OVP */
     TEST_ASSERT_EQUAL_UINT32(3, stage);          /* FAULT */
-    TEST_ASSERT_EQUAL_UINT32(0, duty);           /* valve forced closed */
+    TEST_ASSERT_EQUAL_UINT32(0, duty);           /* actuator forced off */
+{% elif pid_ntc %}
+    ntc_sim_set_temp(150.0f);                    /* above pid_max_value */
+    comp->step(comp);
+    (void){{ pid_comp.name }}_get_status(&pv, &setpoint, &duty,
+                                        &stage, &fault);
+    TEST_ASSERT_EQUAL_UINT32(1, fault);          /* OVT */
+    TEST_ASSERT_EQUAL_UINT32(3, stage);          /* FAULT */
+    TEST_ASSERT_EQUAL_UINT32(0, duty);           /* heater forced off */
+{% endif %}
 }
 {% endif %}
 

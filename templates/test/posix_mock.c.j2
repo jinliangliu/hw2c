@@ -215,8 +215,9 @@ adc_handle_t adc_open(const char *name, const adc_cfg_t *cfg)
     return NULL;
 }
 
-int32_t adc_read(adc_handle_t h, uint32_t *millivolts)
+int32_t adc_read(adc_handle_t h, uint32_t channel, uint32_t *millivolts)
 {
+    (void)channel;   /* single-channel mock */
     if (h == NULL || millivolts == NULL) return -1;
     *millivolts = ((struct adc_mock *)h)->millivolts;
     return 0;

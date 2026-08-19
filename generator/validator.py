@@ -637,6 +637,8 @@ def validate_hardware(hw: dict) -> list[ValidationError]:
                 errors.append(f"[ERROR] SPI peripheral '{p.get('name', 'unknown')}' is missing 'bus' field (e.g., 'SPI1').")
             if p.get('type') == 'SPI_Sensor_MPU6500' and 'cs_pin' not in p:
                 errors.append(f"[ERROR] SPI sensor '{p.get('name', 'unknown')}' is missing 'cs_pin' field (e.g., 'PC4').")
+            if p.get('type') == 'NTC_TempSensor' and not (p.get('extra', {}) or {}).get('adc'):
+                errors.append(f"[ERROR] NTC sensor '{p.get('name', 'unknown')}' is missing required extra.adc field (name of the Internal_ADC peripheral).")
 
             if p.get('type') in ['Protocol_MQTT']:
                 extra = p.get('extra', {})

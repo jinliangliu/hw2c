@@ -1,0 +1,124 @@
+# ============================================================
+# hw2c thermo_pid_ctrl_demo - NTC temperature control with the
+# generic PID middleware
+#
+#   MCU           STM32G0B1VET6 @ 16 MHz (HSI)
+#   NTC           ADC1 IN1 (PA1): 1% 100K / B=3950, voltage divider
+#   Heater        TIM2 CH1 (PA0) PWM @ 10 Hz, duty = heater power
+#   Shell         USART2 (PA2/PA3) - CLI + log @ 115200
+#   LED           PC0, BUTTON PC13
+#
+# Divider: VCC(3.3V) - NTC(100K@25C) - R_fixed(100K) - GND, ADC at midpoint.
+# Adjust extra.r_fixed_ohm / r0_ohm / b_value / vref_mv / ntc_high to the
+# actual board topology (all in hardware.yaml).
+# ============================================================
+
+mcu:
+  part: STM32G0B1VET6
+  clock_source: HSI
+  clock_freq_hz: 16000000
+  core_clock_mhz: 16
+  hse_freq: 8000000
+
+pins:
+  # Indicator LED - pattern driver
+  - id: PC0
+    function: GPIO_Output
+    label: "LED"
+    active_level: low
+
+  # Button - EXTI both-edge input (press + release)
+  - id: PC13
+    function: GPIO_Input
+    label: "BUTTON"
+    pull: up
+    exti:
+      enable: true
+      trigger: both
+
+  # Heater PWM (10 Hz, TIM2 CH1) - duty = heating power
+  - id: PA0
+    function: TIM2_CH1
+    label: "HEATER_PWM"
+    af: 1
+
+  # NTC voltage divider midpoint -> ADC1 IN1
+  - id: PA1
+    function: ADC_IN1
+    label: "NTC_ADC"
+
+  # Shell UART - debug CLI + log output
+  - id: PA2
+    function: USART2_TX
+    af: 1
+  - id: PA3
+    function: USART2_RX
+    af: 1
+
+peripherals:
+  # Serial transport for the shell
+  - name: usart2
+    type: UART_Serial
+    instance: USART2
+    interface: uart
+    extra:
+      baudrate: 115200
+
+  # CLI interactive shell
+  - name: shell
+    type: Internal_CLI
+    uart: usart2
+    extra:
+      prompt: "hw2c> "
+
+  # Heater PWM: 10 Hz, duty = power (0..100%)
+  - name: heater_pwm
+    type: Internal_PWM
+    timer: TIM2
+    extra:
+      default_freq: 10
+      channels:
+        - channel: 1
+          default_duty: 0
+
+  # ADC used by the NTC divider
+  - name: adc1
+    type: Internal_ADC
+    extra:
+      resolution: "12bit"
+
+  # NTC thermistor: 1% 100K / B=3950, divider on ADC1 IN1
+  - name: ntc_temp
+    type: NTC_TempSensor
+    extra:
+      adc: adc1
+      channel: 1
+      r_fixed_ohm: 100000.0
+      r0_ohm: 100000.0
+      t0_c: 25.0
+      b_value: 3950.0
+      vref_mv: 3300.0
+      ntc_high: true
+
+  # RTC (LSE) - 1 s heartbeat + 30 s telemetry alarm
+  - name: rtc
+    type: Internal_RTC
+    bus: RTC
+    extra:
+      clock_source: LSE
+      wakeup_interval_ms: 1000
+      initial_time: "2026-08-19 12:00:00"
+      alarms:
+        - type: periodic_sec
+          period_s: 1
+          event: TICK_1S
+        - type: periodic_sec
+          period_s: 30
+          event: SECONDS_30
+
+log:
+  enable: true
+  ring_buf_size: 1024
+
+sleep:
+  mode: RUN

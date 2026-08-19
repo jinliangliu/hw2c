@@ -1,0 +1,52 @@
+# Component registry configuration
+
+components:
+  - name: shell
+    type: shell_cli
+    driver: usart2
+    period_ms: 50
+    sleep_compat: RUN
+    config:
+      prompt: "hw2c> "
+      history_size: 8
+    priority: 3
+    stack_size: 1024
+
+  - name: led
+    type: led
+    driver: gpio
+    period_ms: 50
+    sleep_compat: RUN
+    config:
+      default_pattern: off
+
+  - name: btn
+    type: btn
+    driver: gpio
+    period_ms: 10
+    sleep_compat: RUN
+    config:
+      long_press_ms: 1000
+      double_click_ms: 500
+      debounce_ms: 50
+
+  # Generic PID middleware: NTC temperature feedback -> PID -> heater PWM.
+  - name: pid_ctrl
+    type: pid_ctrl
+    period_ms: 100
+    sleep_compat: RUN
+    config:
+      description: "NTC thermistor temperature PID control"
+      feedback:
+        source: ntc_temp
+        unit: "degC"
+        topic: temperature
+      actuator:
+        mode: pwm_single
+        pwm: heater_pwm
+        channel: 1
+      control:
+        period_ms: 100
+        hysteresis: 0.5
+        stuck_reads: 8
+        target_min: -40

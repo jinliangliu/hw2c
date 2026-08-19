@@ -356,6 +356,70 @@ def test_pid_ctrl_template_renders_thermo_dual_config():
     assert "PID_STAGE_VENT" not in rendered
 
 
+def test_pid_ctrl_template_renders_ntc_single_config():
+    """pid_ctrl with NTC (ADC) feedback + single PWM heater must render the
+    NTC read adapter and keep the pressure/I2C specifics out."""
+    env = _make_env()
+    template = env.get_template("app/pid_ctrl_component.c.j2")
+    context = _minimal_context()
+    context.update({
+        "has_components": True,
+        "has_pid_ctrl": True,
+        "has_adc": True,
+        "comp_config": {
+            "description": "ntc thermo PID",
+            "feedback": {"source": "ntc_temp", "unit": "degC",
+                         "topic": "temperature"},
+            "actuator": {"mode": "pwm_single", "pwm": "heater",
+                         "channel": 1},
+            "control": {"period_ms": 100, "target_min": -40},
+        },
+        "components": [{
+            "name": "pid_ctrl", "type": "pid_ctrl", "config": {},
+        }],
+        "peripherals": [
+            {"name": "ntc_temp", "type": "NTC_TempSensor",
+             "extra": {"adc": "adc1", "channel": 1,
+                       "r_fixed_ohm": 100000.0, "r0_ohm": 100000.0,
+                       "t0_c": 25.0, "b_value": 3950.0,
+                       "vref_mv": 3300.0, "ntc_high": True}},
+            {"name": "adc1", "type": "Internal_ADC",
+             "extra": {"resolution": "12bit"}},
+            {"name": "heater", "type": "Internal_PWM", "timer": "TIM2",
+             "extra": {"default_freq": 10}},
+        ],
+        "params": [
+            {"name": "pid_kp", "type": "float", "default": 5.0},
+            {"name": "pid_ki", "type": "float", "default": 0.2},
+            {"name": "pid_kd", "type": "float", "default": 0.0},
+            {"name": "pid_target", "type": "float", "default": 25.0},
+            {"name": "pid_max_value", "type": "float", "default": 120.0},
+            {"name": "pid_duty_min_pct", "type": "uint32", "default": 0},
+            {"name": "pid_duty_max_pct", "type": "uint32", "default": 100},
+            {"name": "pid_ramp_timeout_ms", "type": "uint32",
+             "default": 60000},
+        ],
+        "events": [
+            {"name": "TARGET_REACHED", "source": "custom",
+             "type": "asynchronous",
+             "payload": {"type": "float", "unit": "degC"}},
+            {"name": "FAULT_TRIPPED", "source": "custom",
+             "type": "asynchronous", "payload": {"type": "uint32"}},
+        ],
+        "topics": [{"name": "temperature",
+                    "value": {"type": "int32", "unit": "0.1 degC"}}],
+    })
+    rendered = template.render(context)
+
+    assert "ntc_temp_read(&s)" in rendered
+    assert "s.temp_c" in rendered
+    assert "heater_set_duty" in rendered
+    assert "param_pid_target_get()" in rendered
+    assert "event_post_target_reached" in rendered
+    assert "pressure_kpa" not in rendered
+    assert "i2c_open" not in rendered
+
+
 if __name__ == "__main__":
     test_main_c_template_basic()
     test_main_c_template_with_rtc()

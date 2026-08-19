@@ -51,6 +51,8 @@ def detect_peripherals(peripherals: list, load_model_func) -> dict:
             has_pwm = True
         if model.get('type') == 'Internal_ADC':
             has_adc = True
+        if model.get('type') == 'NTC_TempSensor':
+            has_adc = True
         if model.get('type') == 'UART_Serial':
             has_uart = True
             uart_name = p['name']

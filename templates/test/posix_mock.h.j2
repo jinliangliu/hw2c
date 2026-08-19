@@ -60,6 +60,11 @@ typedef struct { uint32_t channel; uint32_t vref_mv; } adc_cfg_t;
 
 #define MAX_ADC_DEVS          4
 
+adc_handle_t adc_open(const char *name, const adc_cfg_t *cfg);
+int32_t      adc_read(adc_handle_t h, uint32_t channel, uint32_t *millivolts);
+int32_t      adc_ioctl(adc_handle_t h, uint32_t cmd, void *arg);
+void         adc_close(adc_handle_t h);
+
 /* Set mock ADC reading (mV) */
 void adc_mock_set_reading(const char *name, uint32_t millivolts);
 

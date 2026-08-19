@@ -6,30 +6,31 @@
 #include "drv_{{ peripheral.name }}.h"
 
 #ifndef TEST
-static ADC_HandleTypeDef hadc;
+/* Non-static: adc_api.c references h<peripheral> for the POSIX wrapper. */
+ADC_HandleTypeDef h{{ peripheral.name }};
 #endif
 
 void ADC_Init(void) {
 #ifndef TEST
     __HAL_RCC_ADC_CLK_ENABLE();
-    hadc.Instance = ADC1;
-    hadc.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
-    hadc.Init.Resolution = ADC_RESOLUTION_12B;
-    hadc.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-    hadc.Init.ScanConvMode = ADC_SCAN_DISABLE;
-    hadc.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
-    hadc.Init.LowPowerAutoWait = DISABLE;
-    hadc.Init.LowPowerAutoPowerOff = DISABLE;
-    hadc.Init.ContinuousConvMode = DISABLE;
-    hadc.Init.NbrOfConversion = 1;
-    hadc.Init.DiscontinuousConvMode = DISABLE;
-    hadc.Init.ExternalTrigConv = ADC_SOFTWARE_START;
-    hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-    hadc.Init.DMAContinuousRequests = DISABLE;
-    hadc.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-    if (HAL_ADC_Init(&hadc) != HAL_OK) while(1);
+    h{{ peripheral.name }}.Instance = ADC1;
+    h{{ peripheral.name }}.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+    h{{ peripheral.name }}.Init.Resolution = ADC_RESOLUTION_12B;
+    h{{ peripheral.name }}.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    h{{ peripheral.name }}.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    h{{ peripheral.name }}.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    h{{ peripheral.name }}.Init.LowPowerAutoWait = DISABLE;
+    h{{ peripheral.name }}.Init.LowPowerAutoPowerOff = DISABLE;
+    h{{ peripheral.name }}.Init.ContinuousConvMode = DISABLE;
+    h{{ peripheral.name }}.Init.NbrOfConversion = 1;
+    h{{ peripheral.name }}.Init.DiscontinuousConvMode = DISABLE;
+    h{{ peripheral.name }}.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    h{{ peripheral.name }}.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    h{{ peripheral.name }}.Init.DMAContinuousRequests = DISABLE;
+    h{{ peripheral.name }}.Init.Overrun = ADC_OVR_DATA_PRESERVED;
+    if (HAL_ADC_Init(&h{{ peripheral.name }}) != HAL_OK) while(1);
 #else
-    HAL_ADC_Init(NULL);   /* 测试环境：调用 mock 函数 */
+    HAL_ADC_Init(NULL);   /* æµ‹è¯•çŽ¯å¢ƒï¼šè°ƒç”¨ mock å‡½æ•° */
 #endif
 }
 
@@ -39,10 +40,10 @@ uint32_t ADC_ReadChannel(uint32_t channel) {
     sConfig.Channel = channel;
     sConfig.Rank = ADC_REGULAR_RANK_1;
     sConfig.SamplingTime = ADC_SAMPLETIME_39CYCLES_5;
-    HAL_ADC_ConfigChannel(&hadc, &sConfig);
-    HAL_ADC_Start(&hadc);
-    HAL_ADC_PollForConversion(&hadc, 100);
-    return HAL_ADC_GetValue(&hadc);
+    HAL_ADC_ConfigChannel(&h{{ peripheral.name }}, &sConfig);
+    HAL_ADC_Start(&h{{ peripheral.name }});
+    HAL_ADC_PollForConversion(&h{{ peripheral.name }}, 100);
+    return HAL_ADC_GetValue(&h{{ peripheral.name }});
 #else
     (void)channel;
     return 0;

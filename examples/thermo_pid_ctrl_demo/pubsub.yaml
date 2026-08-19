@@ -1,0 +1,6 @@
+# Pub/Sub topic definitions
+
+topics:
+  - name: temperature
+    description: "Measured temperature, scaled int32, unit=0.1 degC"
+    value: { type: int32, unit: "0.1 degC" }

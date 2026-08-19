@@ -1,0 +1,60 @@
+# ============================================================
+# hw2c thermo_pid_ctrl_demo - software tasks layer
+# ============================================================
+
+project:
+  name: thermo_pid_ctrl_demo
+  version: "1.0.0"
+  heap_size: 16384
+
+event_task:
+  name: events_process_task
+  entry: vEventTask
+  priority: 3
+  stack_size: 512
+  queue_depth: 16
+
+behavior:
+  initial_state: IDLE
+  events:
+    - name: TARGET_REACHED
+      source: custom
+      type: asynchronous
+      payload: { type: float, unit: "degC", range: [-40, 200] }
+    - name: FAULT_TRIPPED
+      source: custom
+      type: asynchronous
+      payload: { type: uint32 }
+  states:
+    - name: IDLE
+      transitions:
+        - event: BUTTON_SHORT_PRESS
+          target: IDLE
+          actions:
+            - led_pattern fast_blink
+            - 'log "button: SHORT_PRESS"'
+        - event: BUTTON_DOUBLE_PRESS
+          target: IDLE
+          actions:
+            - led_pattern slow_blink
+            - 'log "button: DOUBLE_PRESS"'
+        - event: BUTTON_LONG_PRESS
+          target: IDLE
+          actions:
+            - led_pattern fault
+            - 'log "button: LONG_PRESS"'
+        - event: TARGET_REACHED
+          target: IDLE
+          actions:
+            - led_pattern slow_blink
+            - 'log "temperature reached target"'
+        - event: FAULT_TRIPPED
+          target: IDLE
+          actions:
+            - led_pattern fault
+            - 'log "PID fault tripped -> heater off"'
+
+periodic_events:
+  - event: SECONDS_30
+    actions:
+      - telemetry_snapshot

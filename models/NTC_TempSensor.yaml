@@ -1,0 +1,44 @@
+model: "NTC_TempSensor"
+type: "NTC_TempSensor"
+interface: "ADC"
+driver_template: "drivers/drv_ntc.c.j2"
+header_template: "drivers/drv_ntc.h.j2"
+# NTC thermistor temperature sensor read through a voltage-divider on an
+# ADC channel.  Conversion uses the B-parameter equation:
+#   1/T = 1/T0 + ln(R/R0)/B
+# with R derived from the divider topology (R_fixed known, VCC known).
+# Defaults match a 1% 100K / B=3950 thermistor at 25 degC.
+extra_schema:
+  adc:
+    type: str
+    required: true
+    default: ""
+  channel:
+    type: int
+    required: false
+    default: 0
+  r_fixed_ohm:
+    type: float
+    required: false
+    default: 100000.0
+  r0_ohm:
+    type: float
+    required: false
+    default: 100000.0
+  t0_c:
+    type: float
+    required: false
+    default: 25.0
+  b_value:
+    type: float
+    required: false
+    default: 3950.0
+  vref_mv:
+    type: float
+    required: false
+    default: 3300.0
+  ntc_high:
+    type: bool
+    required: false
+    default: true
+    description: "true = VCC-NTC-Rfixed-GND (ADC at divider mid); false = reversed"
