@@ -1,42 +1,82 @@
 {#
-    pid_ctrl_component.c.j2 - Generic PID control component (opt-in middleware)
+    pid_ctrl_component.c.j2 - Generic process-variable PID control component
+    (opt-in middleware)
 
-    Consumes a process-variable feedback (e.g. I2C pressure sensor), runs a
-    position-form PID (pid_math) and drives an on/off solenoid valve through
-    PWM duty-cycle modulation (16 Hz switching typical for gas valves).
-    Stage machine: STANDBY -> RAMP_UP -> HOLD -> VENT (+ FAULT interlocks).
+    Consumes any I2C process-variable feedback (pressure / temperature / ...),
+    runs a position-form PID (pid_math) and drives a PWM actuator:
+      pwm_single: one channel, output 0..100% (solenoid duty / heater power)
+      pwm_dual:   heat + cool channels, output -100..100 with deadband
+    Stage machine: STANDBY -> RAMP_UP -> HOLD (+ FAULT interlocks).
 
     Component config:
-        sensor: <pressure peripheral name>   (default: first I2C_Pressure)
-        actuator: <PWM peripheral name>      (default: first Internal_PWM)
-        pwm_channel: 1                       (solenoid PWM channel)
-        control_period_ms: 62                (~16 Hz)
-        hysteresis_kpa: 0.5                  (HOLD entry band)
-        stuck_reads: 8                       (sensor-failure interlock)
+        feedback.source: <sensor peripheral name>
+        feedback.unit:   "kPa" | "degC" | ...
+        feedback.topic:  optional pub/sub topic for the process value
+        actuator.mode:   pwm_single | pwm_dual
+        actuator.pwm / actuator.channel                 (single mode)
+        actuator.heat_pwm / heat_channel / cool_pwm / cool_channel (dual)
+        control.period_ms / hysteresis / stuck_reads /
+        control.deadband_pct / control.target_min
 
-    Runtime params (params.yaml): pid_kp / pid_ki / pid_kd /
-        target_pressure_kpa / pressure_max_kpa / duty_min_pct /
-        duty_max_pct / ramp_timeout_ms.
+    Runtime params (params.yaml; new names, old pressure names fall back):
+        pid_kp / pid_ki / pid_kd
+        pid_target        (old: target_pressure_kpa)
+        pid_max_value     (old: pressure_max_kpa)
+        pid_duty_min_pct / pid_duty_max_pct / pid_ramp_timeout_ms
 #}
-{% set pressure_peri = peripherals | selectattr('type', 'eq', 'I2C_Pressure') | first %}
+{% set fb_cfg = comp_config.get('feedback', {}) %}
+{% set act_cfg = comp_config.get('actuator', {}) %}
+{% set ctl_cfg = comp_config.get('control', {}) %}
+{% set fb_peri = peripherals | selectattr('name', 'eq', fb_cfg.get('source', '')) | first %}
+{% if not fb_peri %}
+{% set fb_peri = peripherals | selectattr('type', 'eq', 'I2C_Pressure') | first %}
+{% endif %}
 {% set pwm_peri = peripherals | selectattr('type', 'eq', 'Internal_PWM') | first %}
-{% set sensor_name = comp_config.get('sensor', pressure_peri.name if pressure_peri else '') %}
-{% set actuator_name = comp_config.get('actuator', pwm_peri.name if pwm_peri else '') %}
-{% set pwm_channel = comp_config.get('pwm_channel', 1) %}
-{% set control_period_ms = comp_config.get('control_period_ms', 62) %}
-{% set hold_hyst = comp_config.get('hysteresis_kpa', 0.5) %}
-{% set stuck_reads = comp_config.get('stuck_reads', 8) %}
+{% set mode = act_cfg.get('mode', 'pwm_single') %}
+{% set fb_unit = fb_cfg.get('unit', fb_peri.get('extra', {}).get('unit', 'kPa') if fb_peri else '') %}
+{% set pub_topic = fb_cfg.get('topic', '') %}
+{% set heat_pwm = act_cfg.get('heat_pwm', act_cfg.get('pwm', pwm_peri.name if pwm_peri else '')) %}
+{% set cool_pwm = act_cfg.get('cool_pwm', '') %}
+{% set heat_ch = act_cfg.get('heat_channel', act_cfg.get('channel', 1)) %}
+{% set cool_ch = act_cfg.get('cool_channel', 2) %}
+{% set control_period_ms = ctl_cfg.get('period_ms', comp_config.get('control_period_ms', 62)) %}
+{% set hold_hyst = ctl_cfg.get('hysteresis', comp_config.get('hysteresis_kpa', 0.5)) %}
+{% set stuck_reads = ctl_cfg.get('stuck_reads', comp_config.get('stuck_reads', 8)) %}
+{% set deadband_pct = ctl_cfg.get('deadband_pct', 5) %}
+{% set target_min = ctl_cfg.get('target_min', 0) %}
+{% set reached_evt = events | selectattr('name', 'eq', 'TARGET_REACHED') | first %}
+{% if not reached_evt %}
 {% set reached_evt = events | selectattr('name', 'eq', 'PRESSURE_REACHED') | first %}
+{% endif %}
 {% set fault_evt = events | selectattr('name', 'eq', 'FAULT_TRIPPED') | first %}
-{% set has_pressure_topic = topics | selectattr('name', 'eq', 'pressure') | list | length > 0 %}
-{% set pressure_topic_typed = topics | selectattr('name', 'eq', 'pressure') | selectattr('value.type', 'defined') | list | length > 0 %}
+{% set has_pub_topic = pub_topic and (topics | selectattr('name', 'eq', pub_topic) | list | length > 0) %}
+{% set pub_topic_typed = pub_topic and (topics | selectattr('name', 'eq', pub_topic) | selectattr('value.type', 'defined') | list | length > 0) %}
+{% set p_target = params | selectattr('name', 'eq', 'pid_target') | first %}
+{% if not p_target %}
+{% set p_target = params | selectattr('name', 'eq', 'target_pressure_kpa') | first %}
+{% endif %}
+{% set p_max = params | selectattr('name', 'eq', 'pid_max_value') | first %}
+{% if not p_max %}
+{% set p_max = params | selectattr('name', 'eq', 'pressure_max_kpa') | first %}
+{% endif %}
+{% set p_ramp = params | selectattr('name', 'eq', 'pid_ramp_timeout_ms') | first %}
+{% if not p_ramp %}
+{% set p_ramp = params | selectattr('name', 'eq', 'ramp_timeout_ms') | first %}
+{% endif %}
 
 #include "component_registry.h"
 #include "pid_math.h"
 #include "param_registry.h"
-#include "drv_{{ sensor_name }}.h"
-#include "drv_{{ actuator_name }}.h"
-{% if has_pressure_topic %}
+{% if fb_peri %}
+#include "drv_{{ fb_peri.name }}.h"
+{% endif %}
+{% if heat_pwm %}
+#include "drv_{{ heat_pwm }}.h"
+{% endif %}
+{% if cool_pwm %}
+#include "drv_{{ cool_pwm }}.h"
+{% endif %}
+{% if has_pub_topic %}
 #include "component_bus.h"
 {% endif %}
 {% if reached_evt or fault_evt %}
@@ -53,18 +93,17 @@
 #endif
 #include <stddef.h>
 
-/* ---- Solenoid stage machine ---- */
+/* ---- Generic process-control stage machine ---- */
 typedef enum {
     PID_STAGE_STANDBY = 0,
     PID_STAGE_RAMP_UP,
     PID_STAGE_HOLD,
-    PID_STAGE_VENT,
     PID_STAGE_FAULT
 } pid_stage_t;
 
 /* ---- Fault codes (posted via FAULT_TRIPPED when the contract exists) ---- */
 #define PID_FAULT_NONE         0u
-#define PID_FAULT_OVP          1u   /* pressure exceeded pressure_max_kpa   */
+#define PID_FAULT_OVP          1u   /* process value exceeded pid_max_value */
 #define PID_FAULT_SENSOR       2u   /* repeated sensor read failures        */
 #define PID_FAULT_RAMP_TIMEOUT 3u   /* target not reached in ramp_timeout   */
 
@@ -74,9 +113,10 @@ struct {{ comp_name }}_ctx {
     pid_t    pid;
     pid_stage_t stage;
     uint32_t fault;
-    float    pressure_kpa;
-    float    setpoint_kpa;
-    uint32_t duty_pct;
+    float    process_value;
+    float    setpoint;
+    uint32_t heat_duty;
+    uint32_t cool_duty;
     uint32_t ramp_start_ms;
     uint32_t read_failures;
     uint32_t ramp_timeout_ms;
@@ -110,32 +150,46 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
     float kd = 0.0f;
 {% endif %}
 
+{% if mode == 'pwm_dual' %}
+    pid_init(&ctx->pid, kp, ki, kd,
+             (float){{ control_period_ms }} / 1000.0f, -100.0f, 100.0f);
+{% else %}
     pid_init(&ctx->pid, kp, ki, kd,
              (float){{ control_period_ms }} / 1000.0f, 0.0f, 100.0f);
+{% endif %}
     ctx->pid.i_clamp = 60.0f;       /* extra integral clamp (percent) */
     ctx->pid.d_alpha = 0.35f;       /* derivative low-pass (noisy ADC) */
-    ctx->pid.setpoint_rate = 20.0f; /* kPa per second, anti-kick ramp   */
+    ctx->pid.setpoint_rate = 20.0f; /* unit per second, anti-kick ramp   */
 
     ctx->stage           = PID_STAGE_STANDBY;
     ctx->fault           = PID_FAULT_NONE;
-    ctx->pressure_kpa    = 0.0f;
-    ctx->setpoint_kpa    = 0.0f;
-    ctx->duty_pct        = 0;
+    ctx->process_value   = 0.0f;
+    ctx->setpoint        = 0.0f;
+    ctx->heat_duty       = 0;
+    ctx->cool_duty       = 0;
     ctx->ramp_start_ms   = 0;
     ctx->read_failures   = 0;
     ctx->events          = 0;
     ctx->hold_hysteresis = {{ hold_hyst }}f;
-{% if params | selectattr('name', 'eq', 'ramp_timeout_ms') %}
+{% if p_ramp %}
+{% if p_ramp.name == 'pid_ramp_timeout_ms' %}
+    ctx->ramp_timeout_ms = param_pid_ramp_timeout_ms_get();
+{% else %}
     ctx->ramp_timeout_ms = param_ramp_timeout_ms_get();
+{% endif %}
 {% else %}
     ctx->ramp_timeout_ms = 30000U;
 {% endif %}
-{% if params | selectattr('name', 'eq', 'duty_min_pct') %}
+{% if params | selectattr('name', 'eq', 'pid_duty_min_pct') %}
+    ctx->duty_min = param_pid_duty_min_pct_get();
+{% elif params | selectattr('name', 'eq', 'duty_min_pct') %}
     ctx->duty_min = param_duty_min_pct_get();
 {% else %}
     ctx->duty_min = 5U;
 {% endif %}
-{% if params | selectattr('name', 'eq', 'duty_max_pct') %}
+{% if params | selectattr('name', 'eq', 'pid_duty_max_pct') %}
+    ctx->duty_max = param_pid_duty_max_pct_get();
+{% elif params | selectattr('name', 'eq', 'duty_max_pct') %}
     ctx->duty_max = param_duty_max_pct_get();
 {% else %}
     ctx->duty_max = 100U;
@@ -145,21 +199,73 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
     return 0;
 }
 
+/* ---- feedback adapter: read the process variable from the configured
+ *      sensor (generated per peripheral type) ---- */
+static int pid_feedback_read(float *out)
+{
+{% if fb_peri and fb_peri.type in ('I2C_Pressure', 'I2C_TempSensor') %}
+    {{ fb_peri.name }}_data_t s;
+    if ({{ fb_peri.name }}_read(i2c_open("{{ fb_peri.bus }}", NULL),
+                                {{ fb_peri.address }}, &s) != 0) {
+        return -1;
+    }
+    *out = s.process_value;
+    return 0;
+{% else %}
+    (void)out;
+    return -1;   /* pid_ctrl: unsupported feedback source type */
+{% endif %}
+}
+
+/* ---- actuator adapter: map PID output to PWM duty ---- */
+static void pid_apply_output(float u)
+{
+    struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
+{% if mode == 'pwm_dual' %}
+    /* u in [-100,100]: heat = +u, cool = -u, deadband around zero */
+    if (u > (float){{ deadband_pct }}) {
+        ctx->heat_duty = (u > (float)ctx->duty_max) ? ctx->duty_max
+                                                    : (uint32_t)u;
+        ctx->cool_duty = 0;
+    } else if (u < -(float){{ deadband_pct }}) {
+        ctx->heat_duty = 0;
+        ctx->cool_duty = (-u > (float)ctx->duty_max) ? ctx->duty_max
+                                                     : (uint32_t)(-u);
+    } else {
+        ctx->heat_duty = 0;
+        ctx->cool_duty = 0;
+    }
+    (void){{ heat_pwm }}_set_duty((uint8_t){{ heat_ch }}, ctx->heat_duty);
+    (void){{ cool_pwm }}_set_duty((uint8_t){{ cool_ch }}, ctx->cool_duty);
+{% else %}
+    uint32_t duty = (u < (float)ctx->duty_min) ? 0u
+                  : (u > (float)ctx->duty_max) ? ctx->duty_max
+                                               : (uint32_t)u;
+    ctx->heat_duty = duty;
+    ctx->cool_duty = 0;
+    (void){{ heat_pwm }}_set_duty((uint8_t){{ heat_ch }}, duty);
+{% endif %}
+}
+
 /* ---- public control API (used by CLI / state machine) ---- */
-int {{ comp_name }}_set_setpoint(float kpa)
+int {{ comp_name }}_set_setpoint(float value)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized) return -1;
-{% if params | selectattr('name', 'eq', 'pressure_max_kpa') %}
-    if (kpa < 0.0f || kpa > param_pressure_max_kpa_get()) {
+{% if p_max %}
+{% if p_max.name == 'pid_max_value' %}
+    if (value < {{ target_min | float }}f || value > param_pid_max_value_get()) {
+{% else %}
+    if (value < {{ target_min | float }}f || value > param_pressure_max_kpa_get()) {
+{% endif %}
         return -1;                       /* reject out-of-range target */
     }
 {% else %}
-    if (kpa < 0.0f || kpa > 1000.0f) {
+    if (value < {{ target_min | float }}f || value > 1000.0f) {
         return -1;
     }
 {% endif %}
-    ctx->setpoint_kpa = kpa;
+    ctx->setpoint = value;
     pid_reset(&ctx->pid);
     ctx->stage = PID_STAGE_RAMP_UP;
     ctx->ramp_start_ms = HAL_GetTick();
@@ -170,7 +276,9 @@ int {{ comp_name }}_start(void)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized || ctx->fault != PID_FAULT_NONE) return -1;
-{% if params | selectattr('name', 'eq', 'target_pressure_kpa') %}
+{% if p_target and p_target.name == 'pid_target' %}
+    return {{ comp_name }}_set_setpoint(param_pid_target_get());
+{% elif p_target %}
     return {{ comp_name }}_set_setpoint(param_target_pressure_kpa_get());
 {% else %}
     return {{ comp_name }}_set_setpoint(100.0f);
@@ -182,7 +290,8 @@ int {{ comp_name }}_stop(void)
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized) return -1;
     ctx->stage = PID_STAGE_STANDBY;
-    ctx->duty_pct = 0;
+    ctx->heat_duty = 0;
+    ctx->cool_duty = 0;
     return 0;
 }
 
@@ -190,8 +299,10 @@ int {{ comp_name }}_vent(void)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized) return -1;
-    ctx->stage = PID_STAGE_VENT;
-    ctx->duty_pct = 0;
+    /* vent = close the actuator (valve domain naming kept for CLI) */
+    ctx->stage = PID_STAGE_STANDBY;
+    ctx->heat_duty = 0;
+    ctx->cool_duty = 0;
     return 0;
 }
 
@@ -208,15 +319,15 @@ int {{ comp_name }}_reset_fault(void)
 }
 
 /* ---- getters for CLI / telemetry ---- */
-int {{ comp_name }}_get_status(float *pressure, float *setpoint,
+int {{ comp_name }}_get_status(float *process, float *setpoint,
                               uint32_t *duty, uint32_t *stage,
                               uint32_t *fault)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (!ctx->initialized) return -1;
-    if (pressure) *pressure = ctx->pressure_kpa;
-    if (setpoint) *setpoint = ctx->setpoint_kpa;
-    if (duty)     *duty     = ctx->duty_pct;
+    if (process)  *process  = ctx->process_value;
+    if (setpoint) *setpoint = ctx->setpoint;
+    if (duty)     *duty     = ctx->heat_duty;
     if (stage)    *stage    = (uint32_t)ctx->stage;
     if (fault)    *fault    = ctx->fault;
     return 0;
@@ -228,13 +339,12 @@ const char *{{ comp_name }}_stage_name(void)
     case PID_STAGE_STANDBY:   return "STANDBY";
     case PID_STAGE_RAMP_UP:   return "RAMP_UP";
     case PID_STAGE_HOLD:      return "HOLD";
-    case PID_STAGE_VENT:      return "VENT";
     case PID_STAGE_FAULT:     return "FAULT";
     default:                  return "UNKNOWN";
     }
 }
 
-/* ---- interlock: tripped faults force the valve fully closed ---- */
+/* ---- interlock: tripped faults force the actuator fully off ---- */
 static void pid_trip_fault(struct {{ comp_name }}_ctx *ctx, uint32_t code)
 {
     if (ctx->fault != PID_FAULT_NONE) {
@@ -242,7 +352,8 @@ static void pid_trip_fault(struct {{ comp_name }}_ctx *ctx, uint32_t code)
     }
     ctx->fault = code;
     ctx->stage = PID_STAGE_FAULT;
-    ctx->duty_pct = 0;
+    ctx->heat_duty = 0;
+    ctx->cool_duty = 0;
 {% if fault_evt and fault_evt.payload and fault_evt.payload.type == 'uint32' %}
     ctx->events++;
     event_post_fault_tripped(code);
@@ -250,8 +361,8 @@ static void pid_trip_fault(struct {{ comp_name }}_ctx *ctx, uint32_t code)
     ctx->events++;
 {% endif %}
 #ifndef TEST
-    log_error("PID FAULT %lu: pressure=%.1f kPa", (unsigned long)code,
-              (double)ctx->pressure_kpa);
+    log_error("PID FAULT %lu: value=%.1f %s", (unsigned long)code,
+              (double)ctx->process_value, "{{ fb_unit }}");
 #endif
 }
 
@@ -259,7 +370,7 @@ static void pid_trip_fault(struct {{ comp_name }}_ctx *ctx, uint32_t code)
 void {{ comp_name }}_step(component_t *c)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
-    {{ sensor_name }}_data_t sample;
+    float pv;
     uint32_t now;
     (void)c;
 
@@ -268,21 +379,24 @@ void {{ comp_name }}_step(component_t *c)
     }
     now = HAL_GetTick();
 
-    /* 1) sample pressure feedback */
-    if ({{ sensor_name }}_read(i2c_open("{{ pressure_peri.bus }}", NULL),
-                               {{ pressure_peri.address }}, &sample) != 0) {
+    /* 1) sample process feedback */
+    if (pid_feedback_read(&pv) != 0) {
         ctx->read_failures++;
         if (ctx->read_failures >= {{ stuck_reads }}) {
             pid_trip_fault(ctx, PID_FAULT_SENSOR);
         }
-        return;                          /* keep last duty until next sample */
+        return;                      /* keep last duty until next sample */
     }
     ctx->read_failures = 0;
-    ctx->pressure_kpa = sample.pressure_kpa;
+    ctx->process_value = pv;
 
-    /* 2) over-pressure interlock */
-{% if params | selectattr('name', 'eq', 'pressure_max_kpa') %}
-    if (ctx->pressure_kpa > param_pressure_max_kpa_get()) {
+    /* 2) over-limit interlock */
+{% if p_max and p_max.name == 'pid_max_value' %}
+    if (ctx->process_value > param_pid_max_value_get()) {
+        pid_trip_fault(ctx, PID_FAULT_OVP);
+    }
+{% elif p_max %}
+    if (ctx->process_value > param_pressure_max_kpa_get()) {
         pid_trip_fault(ctx, PID_FAULT_OVP);
     }
 {% endif %}
@@ -290,27 +404,30 @@ void {{ comp_name }}_step(component_t *c)
     /* 3) stage machine */
     switch (ctx->stage) {
     case PID_STAGE_STANDBY:
-        ctx->duty_pct = 0;
+        pid_apply_output(0.0f);
         break;
 
     case PID_STAGE_RAMP_UP:
-        if (ctx->pressure_kpa >= ctx->setpoint_kpa - ctx->hold_hysteresis) {
+        if (ctx->process_value >= ctx->setpoint - ctx->hold_hysteresis) {
             ctx->stage = PID_STAGE_HOLD;
 {% if reached_evt and reached_evt.payload and reached_evt.payload.type == 'float' %}
             ctx->events++;
-            event_post_pressure_reached(ctx->pressure_kpa);
+{% if reached_evt.name == 'TARGET_REACHED' %}
+            event_post_target_reached(ctx->process_value);
+{% else %}
+            event_post_pressure_reached(ctx->process_value);
+{% endif %}
 {% else %}
             ctx->events++;
 {% endif %}
 #ifndef TEST
-            log_info("PID HOLD: pressure %.1f kPa", (double)ctx->pressure_kpa);
+            log_info("PID HOLD: value %.1f %s", (double)ctx->process_value,
+                     "{{ fb_unit }}");
 #endif
         } else {
-            uint32_t u = (uint32_t)pid_update(&ctx->pid,
-                                              ctx->setpoint_kpa,
-                                              ctx->pressure_kpa);
-            ctx->duty_pct = (u < ctx->duty_min) ? 0u
-                           : (u > ctx->duty_max) ? ctx->duty_max : u;
+            pid_apply_output(pid_update(&ctx->pid,
+                                        ctx->setpoint,
+                                        ctx->process_value));
         }
         if (now - ctx->ramp_start_ms > ctx->ramp_timeout_ms) {
             pid_trip_fault(ctx, PID_FAULT_RAMP_TIMEOUT);
@@ -318,33 +435,22 @@ void {{ comp_name }}_step(component_t *c)
         break;
 
     case PID_STAGE_HOLD:
-        {
-            uint32_t u = (uint32_t)pid_update(&ctx->pid,
-                                              ctx->setpoint_kpa,
-                                              ctx->pressure_kpa);
-            ctx->duty_pct = (u < ctx->duty_min) ? 0u
-                           : (u > ctx->duty_max) ? ctx->duty_max : u;
-        }
-        break;
-
-    case PID_STAGE_VENT:
-        ctx->duty_pct = 0;
+        pid_apply_output(pid_update(&ctx->pid,
+                                    ctx->setpoint,
+                                    ctx->process_value));
         break;
 
     case PID_STAGE_FAULT:
-        ctx->duty_pct = 0;
+        pid_apply_output(0.0f);
         break;
     }
 
-    /* 4) apply duty to the solenoid PWM channel */
-    (void){{ actuator_name }}_set_duty((uint8_t){{ pwm_channel }}, ctx->duty_pct);
-
-{% if has_pressure_topic %}
-{% if pressure_topic_typed %}
-    bus_publish_pressure((int32_t)(ctx->pressure_kpa * 10.0f));
-{% else %}
-    bus_publish(TOPIC_PRESSURE, (uint32_t)(int32_t)(ctx->pressure_kpa * 10.0f));
-{% endif %}
+    /* 4) publish process value to the configured topic (if any) */
+{% if has_pub_topic and pub_topic_typed %}
+    bus_publish_{{ pub_topic }}((int32_t)(ctx->process_value * 10.0f));
+{% elif has_pub_topic %}
+    bus_publish(TOPIC_{{ pub_topic | upper }},
+                (uint32_t)(int32_t)(ctx->process_value * 10.0f));
 {% endif %}
 }
 
@@ -352,7 +458,8 @@ void {{ comp_name }}_terminate(component_t *c)
 {
     struct {{ comp_name }}_ctx *ctx = &g_pid_ctx;
     if (ctx == NULL) return;
-    ctx->duty_pct = 0;
+    ctx->heat_duty = 0;
+    ctx->cool_duty = 0;
     ctx->initialized = 0;
     (void)c;
 }

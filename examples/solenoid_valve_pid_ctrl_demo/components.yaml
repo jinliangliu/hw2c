@@ -30,17 +30,24 @@ components:
       double_click_ms: 500
       debounce_ms: 50
 
-  # Generic PID middleware component: pressure feedback (I2C) -> PID ->
-  # solenoid PWM duty cycle.  Tunables live in params.yaml.
+  # Generic PID middleware component (process-variable control):
+  # I2C pressure feedback -> PID -> solenoid PWM duty cycle.
   - name: pid_ctrl
     type: pid_ctrl
     period_ms: 62
     sleep_compat: RUN
     config:
       description: "Gas solenoid valve pressure PID control"
-      sensor: pressure
-      actuator: solenoid_pwm
-      pwm_channel: 1
-      control_period_ms: 62
-      hysteresis_kpa: 0.5
-      stuck_reads: 8
+      feedback:
+        source: pressure
+        unit: "kPa"
+        topic: pressure
+      actuator:
+        mode: pwm_single
+        pwm: solenoid_pwm
+        channel: 1
+      control:
+        period_ms: 62
+        hysteresis: 0.5
+        stuck_reads: 8
+        target_min: 0

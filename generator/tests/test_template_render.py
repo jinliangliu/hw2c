@@ -274,6 +274,88 @@ def test_template_environment_has_macros():
     assert "GPIO_PIN_13" in rendered
 
 
+def test_pid_ctrl_template_renders_thermo_dual_config():
+    """pid_ctrl component must render for a temperature + dual actuator
+    (heat/cool) configuration, proving the middleware is domain-agnostic."""
+    env = _make_env()
+    template = env.get_template("app/pid_ctrl_component.c.j2")
+    context = _minimal_context()
+    context.update({
+        "has_components": True,
+        "has_pid_ctrl": True,
+        "comp_config": {
+            "description": "thermo PID",
+            "feedback": {"source": "temp", "unit": "degC",
+                         "topic": "temperature"},
+            "actuator": {"mode": "pwm_dual",
+                         "heat_pwm": "heater", "heat_channel": 1,
+                         "cool_pwm": "cooler", "cool_channel": 2},
+            "control": {"period_ms": 100, "hysteresis": 0.5,
+                        "target_min": -40},
+        },
+        "components": [{
+            "name": "pid_ctrl",
+            "type": "pid_ctrl",
+            "config": {
+                "description": "thermo PID",
+                "feedback": {"source": "temp", "unit": "degC",
+                             "topic": "temperature"},
+                "actuator": {"mode": "pwm_dual",
+                             "heat_pwm": "heater", "heat_channel": 1,
+                             "cool_pwm": "cooler", "cool_channel": 2},
+                "control": {"period_ms": 100, "hysteresis": 0.5,
+                            "target_min": -40},
+            },
+        }],
+        "peripherals": [
+            {"name": "temp", "type": "I2C_TempSensor", "bus": "I2C1",
+             "address": 0x48,
+             "extra": {"scale_per_lsb": 0.01, "offset": 0.0,
+                       "unit": "degC", "data_width": 16}},
+            {"name": "heater", "type": "Internal_PWM", "timer": "TIM2",
+             "extra": {"default_freq": 10}},
+            {"name": "cooler", "type": "Internal_PWM", "timer": "TIM3",
+             "extra": {"default_freq": 10}},
+        ],
+        "params": [
+            {"name": "pid_kp", "type": "float", "default": 5.0},
+            {"name": "pid_ki", "type": "float", "default": 0.2},
+            {"name": "pid_kd", "type": "float", "default": 0.0},
+            {"name": "pid_target", "type": "float", "default": 25.0},
+            {"name": "pid_max_value", "type": "float", "default": 120.0},
+            {"name": "pid_duty_min_pct", "type": "uint32", "default": 0},
+            {"name": "pid_duty_max_pct", "type": "uint32", "default": 100},
+            {"name": "pid_ramp_timeout_ms", "type": "uint32",
+             "default": 60000},
+        ],
+        "events": [
+            {"name": "TARGET_REACHED", "source": "custom",
+             "type": "asynchronous",
+             "payload": {"type": "float", "unit": "degC"}},
+            {"name": "FAULT_TRIPPED", "source": "custom",
+             "type": "asynchronous", "payload": {"type": "uint32"}},
+        ],
+        "topics": [{"name": "temperature",
+                    "value": {"type": "int32", "unit": "0.1 degC"}}],
+    })
+    rendered = template.render(context)
+
+    # generic feedback adapter bound to the temperature sensor
+    assert "pid_feedback_read" in rendered
+    assert "temp_read(i2c_open(\"I2C1\", NULL)" in rendered
+    assert "s.process_value" in rendered
+    # dual actuator: both heat and cool channels driven
+    assert "heater_set_duty((uint8_t)1, ctx->heat_duty)" in rendered
+    assert "cooler_set_duty((uint8_t)2, ctx->cool_duty)" in rendered
+    # domain-agnostic typed accessors and events
+    assert "param_pid_target_get()" in rendered
+    assert "event_post_target_reached" in rendered
+    assert "bus_publish_temperature" in rendered
+    # no pressure-domain leftovers
+    assert "pressure_kpa" not in rendered
+    assert "PID_STAGE_VENT" not in rendered
+
+
 if __name__ == "__main__":
     test_main_c_template_basic()
     test_main_c_template_with_rtc()

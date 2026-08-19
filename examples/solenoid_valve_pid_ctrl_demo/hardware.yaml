@@ -94,8 +94,10 @@ peripherals:
     address: 0x28
     extra:
       reg_start: 0
-      scale_kpa_per_lsb: 0.001
-      offset_kpa: 0.0
+      scale_per_lsb: 0.001
+      offset: 0.0
+      unit: "kPa"
+      data_width: 24
       byte_order: big
 
   # RTC (LSE) - 1 s heartbeat + 30 s telemetry alarm

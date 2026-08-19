@@ -29,6 +29,7 @@ _PERIPHERAL_SIGNALS: Dict[str, List[str]] = {
       "I2C_Sensor_MPU6050": ["SCL", "SDA"],
       "I2C_EEPROM":        ["SCL", "SDA"],
       "I2C_Pressure":      ["SCL", "SDA"],
+      "I2C_TempSensor":    ["SCL", "SDA"],
 "SPI_Flash_W25Q32":  ["SCK", "MISO", "MOSI", "NSS"],
 "SPI_Flash_Generic": ["SCK", "MISO", "MOSI", "NSS"],
 "SPI_Sensor_MPU6500": ["SCK", "MISO", "MOSI", "NSS"],

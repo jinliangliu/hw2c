@@ -10,8 +10,10 @@
  */
 {% set prs = peripheral.get('extra', {}) %}
 {% set reg_start = prs.get('reg_start', model.get('extra_schema', {}).get('reg_start', {}).get('default', 0)) %}
-{% set scale = prs.get('scale_kpa_per_lsb', model.get('extra_schema', {}).get('scale_kpa_per_lsb', {}).get('default', 0.001)) %}
-{% set offset = prs.get('offset_kpa', model.get('extra_schema', {}).get('offset_kpa', {}).get('default', 0.0)) %}
+{% set scale = prs.get('scale_per_lsb', prs.get('scale_kpa_per_lsb', model.get('extra_schema', {}).get('scale_per_lsb', {}).get('default', model.get('extra_schema', {}).get('scale_kpa_per_lsb', {}).get('default', 0.001)))) %}
+{% set offset = prs.get('offset', prs.get('offset_kpa', model.get('extra_schema', {}).get('offset', {}).get('default', model.get('extra_schema', {}).get('offset_kpa', {}).get('default', 0.0)))) %}
+{% set unit = prs.get('unit', model.get('extra_schema', {}).get('unit', {}).get('default', 'kPa')) %}
+{% set width = prs.get('data_width', model.get('extra_schema', {}).get('data_width', {}).get('default', 24)) %}
 
 #ifndef __DRV_{{ peripheral.name | upper }}_H
 #define __DRV_{{ peripheral.name | upper }}_H
@@ -24,14 +26,15 @@ extern "C" {
 #endif
 
 /* ---- Sensor configuration (from hardware.yaml extra) ---- */
-#define {{ peripheral.name | upper }}_REG_START          {{ reg_start }}
-#define {{ peripheral.name | upper }}_SCALE_KPA_PER_LSB {{ scale }}f
-#define {{ peripheral.name | upper }}_OFFSET_KPA        {{ offset }}f
+#define {{ peripheral.name | upper }}_REG_START      {{ reg_start }}
+#define {{ peripheral.name | upper }}_SCALE_PER_LSB {{ scale }}f
+#define {{ peripheral.name | upper }}_OFFSET        {{ offset }}f
+#define {{ peripheral.name | upper }}_UNIT          "{{ unit }}"
 
 /* ---- Data output ---- */
 typedef struct {
     uint32_t raw;           /* raw 24-bit ADC word               */
-    float    pressure_kpa;  /* converted pressure in kPa         */
+    float    process_value; /* converted process variable (unit)   */
     int      last_error;    /* 0 = ok, <0 = read failure         */
 } {{ peripheral.name }}_data_t;
 

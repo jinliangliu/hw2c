@@ -1,13 +1,12 @@
-model: "I2C_Pressure"
-type: "I2C_Pressure"
+model: "I2C_TempSensor"
+type: "I2C_TempSensor"
 interface: "I2C"
-address: 0x28
+address: 0x48
 driver_template: "drivers/drv_pressure.c.j2"
 header_template: "drivers/drv_pressure.h.j2"
-# Generic 24-bit digital pressure sensor model: the driver reads a raw ADC
-# word from reg_start and converts linearly:
-#   process_value = raw * scale_per_lsb + offset
-# Adjust scale/offset/reg_start to the actual sensor on the test rig.
+# Generic I2C digital temperature sensor model, sharing the same linear
+# raw*scale+offset driver as I2C_Pressure (unit = degC).  Adjust
+# reg_start / scale / offset / data_width / byte_order for the actual part.
 registers:
   DATA_START: 0x00
 extra_schema:
@@ -18,7 +17,7 @@ extra_schema:
   scale_per_lsb:
     type: float
     required: false
-    default: 0.001
+    default: 0.01
   offset:
     type: float
     required: false
@@ -26,11 +25,11 @@ extra_schema:
   unit:
     type: str
     required: false
-    default: "kPa"
+    default: "degC"
   data_width:
     type: int
     required: false
-    default: 24
+    default: 16
     values: [8, 16, 24]
   byte_order:
     type: str

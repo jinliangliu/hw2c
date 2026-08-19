@@ -6,8 +6,10 @@
  */
 {% set prs = peripheral.get('extra', {}) %}
 {% set reg_start = prs.get('reg_start', model.get('extra_schema', {}).get('reg_start', {}).get('default', 0)) %}
-{% set scale = prs.get('scale_kpa_per_lsb', model.get('extra_schema', {}).get('scale_kpa_per_lsb', {}).get('default', 0.001)) %}
-{% set offset = prs.get('offset_kpa', model.get('extra_schema', {}).get('offset_kpa', {}).get('default', 0.0)) %}
+{% set scale = prs.get('scale_per_lsb', prs.get('scale_kpa_per_lsb', model.get('extra_schema', {}).get('scale_per_lsb', {}).get('default', model.get('extra_schema', {}).get('scale_kpa_per_lsb', {}).get('default', 0.001)))) %}
+{% set offset = prs.get('offset', prs.get('offset_kpa', model.get('extra_schema', {}).get('offset', {}).get('default', model.get('extra_schema', {}).get('offset_kpa', {}).get('default', 0.0)))) %}
+{% set width = prs.get('data_width', model.get('extra_schema', {}).get('data_width', {}).get('default', 24)) %}
+{% set nbytes = (width // 8) %}
 {% set byte_order = prs.get('byte_order', model.get('extra_schema', {}).get('byte_order', {}).get('default', 'big')) %}
 
 #include "drv_{{ peripheral.name }}.h"
@@ -25,23 +27,28 @@ int {{ peripheral.name }}_init(i2c_handle_t bus, uint8_t dev_addr)
 int {{ peripheral.name }}_read(i2c_handle_t bus, uint8_t dev_addr,
                                {{ peripheral.name }}_data_t *out)
 {
-    uint8_t buf[3];
+    uint8_t buf[{{ nbytes }}];
 
     if (bus == NULL || out == NULL) {
         return -1;
     }
 
-    if (i2c_read_reg(bus, dev_addr, {{ reg_start }}, buf, 3, 0) != 0) {
+    if (i2c_read_reg(bus, dev_addr, {{ reg_start }}, buf, {{ nbytes }}, 0) != 0) {
         out->last_error = -1;
         return -1;
     }
 
+    out->raw = 0;
 {% if byte_order == 'little' %}
-    out->raw = ((uint32_t)buf[2] << 16) | ((uint32_t)buf[1] << 8) | buf[0];
+{% for i in range(nbytes) %}
+    out->raw |= ((uint32_t)buf[{{ i }}] << (8 * {{ i }}));
+{% endfor %}
 {% else %}
-    out->raw = ((uint32_t)buf[0] << 16) | ((uint32_t)buf[1] << 8) | buf[2];
+{% for i in range(nbytes) %}
+    out->raw |= ((uint32_t)buf[{{ nbytes - 1 - i }}] << (8 * {{ i }}));
+{% endfor %}
 {% endif %}
-    out->pressure_kpa = (float)out->raw * {{ scale }}f + {{ offset }}f;
+    out->process_value = (float)out->raw * {{ scale }}f + {{ offset }}f;
     out->last_error = 0;
     return 0;
 }

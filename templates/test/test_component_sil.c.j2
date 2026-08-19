@@ -234,7 +234,7 @@ void test_param_{{ p.name }}_set_within_range(void)
 static void pid_sim_set_pressure(float kpa)
 {
     /* mock I2C pressure sensor: raw = kpa / scale, 24-bit big-endian */
-    uint32_t raw = (uint32_t)(kpa / {{ pid_pressure.get('extra', {}).get('scale_kpa_per_lsb', 0.001) }});
+    uint32_t raw = (uint32_t)(kpa / {{ pid_pressure.get('extra', {}).get('scale_per_lsb', pid_pressure.get('extra', {}).get('scale_kpa_per_lsb', 0.001)) }});
     i2c_mock_set_reg("{{ pid_pressure.bus }}", {{ pid_pressure.address }},
                      {{ pid_pressure.get('extra', {}).get('reg_start', 0) }},
                      (uint8_t)((raw >> 16) & 0xFF));
@@ -296,7 +296,7 @@ void test_pid_ctrl_overpressure_trips_fault(void)
     (void){{ pid_comp.name }}_get_status(&pressure, &setpoint, &duty,
                                         &stage, &fault);
     TEST_ASSERT_EQUAL_UINT32(1, fault);          /* OVP */
-    TEST_ASSERT_EQUAL_UINT32(4, stage);          /* FAULT */
+    TEST_ASSERT_EQUAL_UINT32(3, stage);          /* FAULT */
     TEST_ASSERT_EQUAL_UINT32(0, duty);           /* valve forced closed */
 }
 {% endif %}
