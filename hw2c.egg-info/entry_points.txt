@@ -1,2 +1,0 @@
-[console_scripts]
-hw2c = parser.cli:main
