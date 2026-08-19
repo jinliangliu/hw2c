@@ -1,0 +1,46 @@
+# Component registry configuration
+
+components:
+  - name: shell
+    type: shell_cli
+    driver: usart2
+    period_ms: 50
+    sleep_compat: RUN
+    config:
+      prompt: "hw2c> "
+      history_size: 8
+    priority: 3
+    stack_size: 1024
+
+  - name: led
+    type: led
+    driver: gpio
+    period_ms: 50
+    sleep_compat: RUN
+    config:
+      default_pattern: off
+
+  - name: btn
+    type: btn
+    driver: gpio
+    period_ms: 10
+    sleep_compat: RUN
+    config:
+      long_press_ms: 1000
+      double_click_ms: 500
+      debounce_ms: 50
+
+  # Generic PID middleware component: pressure feedback (I2C) -> PID ->
+  # solenoid PWM duty cycle.  Tunables live in params.yaml.
+  - name: pid_ctrl
+    type: pid_ctrl
+    period_ms: 62
+    sleep_compat: RUN
+    config:
+      description: "Gas solenoid valve pressure PID control"
+      sensor: pressure
+      actuator: solenoid_pwm
+      pwm_channel: 1
+      control_period_ms: 62
+      hysteresis_kpa: 0.5
+      stuck_reads: 8

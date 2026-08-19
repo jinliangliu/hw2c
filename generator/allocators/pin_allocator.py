@@ -26,8 +26,9 @@ _SWD_PINS: Set[str] = {"PA13", "PA14"}
 _PERIPHERAL_SIGNALS: Dict[str, List[str]] = {
     "UART_Serial":       ["TX", "RX"],
     "RS485":             ["TX", "RX", "DE"],
-    "I2C_Sensor_MPU6050": ["SCL", "SDA"],
-    "I2C_EEPROM":        ["SCL", "SDA"],
+      "I2C_Sensor_MPU6050": ["SCL", "SDA"],
+      "I2C_EEPROM":        ["SCL", "SDA"],
+      "I2C_Pressure":      ["SCL", "SDA"],
 "SPI_Flash_W25Q32":  ["SCK", "MISO", "MOSI", "NSS"],
 "SPI_Flash_Generic": ["SCK", "MISO", "MOSI", "NSS"],
 "SPI_Sensor_MPU6500": ["SCK", "MISO", "MOSI", "NSS"],

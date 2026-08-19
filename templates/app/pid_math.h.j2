@@ -1,0 +1,80 @@
+/**
+ * @file  pid_math.h
+ * @brief Position-form PID controller primitives (pure C, host-testable)
+ *
+ * Generic control middleware: temperature, flow and motion loops can all
+ * build on this module.  No HAL/RTOS/hardware dependency — unit tests run
+ * on the host and the same code runs on target (soft-float friendly).
+ *
+ * Engineering features (all opt-in via struct fields):
+ *   - output clamping with conditional integration (anti-windup)
+ *   - integral clamp so windup cannot build beyond the actuator range
+ *   - first-order low-pass on the derivative term (noise filtering)
+ *   - setpoint ramp guard (optional) to avoid derivative kick
+ *
+ * Auto-generated — do not edit manually.
+ */
+
+#ifndef __PID_MATH_H
+#define __PID_MATH_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    float kp;          /* proportional gain                                   */
+    float ki;          /* integral gain (per second)                          */
+    float kd;          /* derivative gain (per second)                        */
+    float dt;          /* control period in seconds (>0)                      */
+    float out_min;     /* output clamp low                                    */
+    float out_max;     /* output clamp high                                   */
+    float i_clamp;     /* integral term clamp (>0; 0 disables extra clamp)    */
+    float d_alpha;     /* derivative low-pass coefficient (0..1]; 1 = no LPF  */
+    float setpoint_rate; /* max setpoint change per update (0 = unlimited)    */
+
+    /* internal state */
+    float integral;
+    float prev_err;
+    float prev_d;
+    float cur_setpoint;
+} pid_t;
+
+/**
+ * @brief  Initialize a PID controller.
+ * @param  p       Controller context.
+ * @param  kp, ki, kd  Gains.  Use 0 for unused terms.
+ * @param  dt      Control period in seconds (must be > 0).
+ * @param  out_min, out_max  Output clamp range.
+ */
+void pid_init(pid_t *p, float kp, float ki, float kd,
+              float dt, float out_min, float out_max);
+
+/** @brief Reset integral/derivative state (setpoint unchanged). */
+void pid_reset(pid_t *p);
+
+/** @brief Change gains at runtime (integral state preserved). */
+void pid_set_gains(pid_t *p, float kp, float ki, float kd);
+
+/**
+ * @brief  Advance one control step: u = pid(setpoint, feedback).
+ * @param  p        Controller context.
+ * @param  setpoint Target value (subject to optional setpoint ramp).
+ * @param  feedback Measured process variable.
+ * @return Control output, clamped to [out_min, out_max].
+ */
+float pid_update(pid_t *p, float setpoint, float feedback);
+
+/** @brief Current accumulated integral term (for diagnostics). */
+float pid_get_integral(const pid_t *p);
+
+/** @brief Clamp helper (also used by callers for actuator mapping). */
+float pid_clampf(float v, float lo, float hi);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* __PID_MATH_H */

@@ -1,0 +1,73 @@
+# ============================================================
+# hw2c solenoid_valve_pid_ctrl_demo - software tasks layer
+#
+# System tasks (FreeRTOS):
+#   events_process_task  Centralized event dispatch via queue
+#   cli_task             CLI interaction + log output via USART2
+#
+# Components:
+#   led / btn            UI components
+#   pid_ctrl             Solenoid pressure PID (pid_math middleware)
+# ============================================================
+
+project:
+  name: solenoid_valve_pid_ctrl_demo
+  version: "1.0.0"
+  heap_size: 16384
+
+event_task:
+  name: events_process_task
+  entry: vEventTask
+  priority: 3
+  stack_size: 512
+  queue_depth: 16
+
+behavior:
+  initial_state: IDLE
+  # Typed event contracts: PRESSURE_REACHED carries the measured pressure
+  # (kPa, float); FAULT_TRIPPED carries a fault code (uint32).
+  events:
+    - name: PRESSURE_REACHED
+      source: custom
+      type: asynchronous
+      payload: { type: float, unit: "kPa", range: [0, 2000] }
+    - name: FAULT_TRIPPED
+      source: custom
+      type: asynchronous
+      payload: { type: uint32 }
+  states:
+    - name: IDLE
+      transitions:
+        - event: BUTTON_SHORT_PRESS
+          target: IDLE
+          actions:
+            - led_pattern fast_blink
+            - 'log "button: SHORT_PRESS"'
+        - event: BUTTON_DOUBLE_PRESS
+          target: IDLE
+          actions:
+            - led_pattern slow_blink
+            - 'log "button: DOUBLE_PRESS"'
+        - event: BUTTON_LONG_PRESS
+          target: IDLE
+          actions:
+            - led_pattern fault
+            - 'log "button: LONG_PRESS"'
+        # Pressure reached target (posted by pid_ctrl component)
+        - event: PRESSURE_REACHED
+          target: IDLE
+          actions:
+            - led_pattern slow_blink
+            - 'log "pressure reached target"'
+        # Safety interlock tripped (OVP / sensor / ramp timeout)
+        - event: FAULT_TRIPPED
+          target: IDLE
+          actions:
+            - led_pattern fault
+            - 'log "PID fault tripped -> valve closed"'
+
+# Periodic RTC alarm events (telemetry report)
+periodic_events:
+  - event: SECONDS_30
+    actions:
+      - telemetry_snapshot

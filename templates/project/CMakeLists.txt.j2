@@ -152,6 +152,9 @@ set(APP_SOURCES
 {% if has_foc %}
     src/foc_math.c
 {% endif %}
+{% if has_pid_ctrl %}
+    src/pid_math.c
+{% endif %}
 {% if has_components %}
     src/component_registry.c
 {% for comp in components %}

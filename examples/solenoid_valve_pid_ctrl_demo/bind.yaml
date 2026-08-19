@@ -1,0 +1,17 @@
+# ============================================================
+# hw2c solenoid_valve_pid_ctrl_demo - binding layer
+# ============================================================
+
+version: 1
+hardware: hardware.yaml
+task: task.yaml
+
+peripheral_assign:
+  - peripheral: solenoid_pwm
+    task: events_process_task
+    role: actuator
+
+interrupt:
+  - pin: PC13
+    component: btn
+    event: EXTI13

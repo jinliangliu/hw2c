@@ -6,6 +6,8 @@
 {% set pwm_peri = peripherals | selectattr('type', 'in', ['Internal_PWM']) | first %}
 {% set pwm_extra = pwm_peri.get('extra', {}) %}
 {% set chans = (pwm_extra.get('channels') if pwm_extra.get('channels') else (pwm_peri.get('model', {}).channels if pwm_peri.get('model', {}).channels else [{'channel': pwm_extra.get('channel', 1), 'default_duty': pwm_extra.get('default_duty', 50)}])) %}
+{% set default_freq = pwm_extra.get('default_freq', 1000) %}
+{% set arr = (1000000 // default_freq) - 1 %}
 #include "../src/drivers/drv_{{ pwm_peri.name }}.c"
 
 void setUp(void)
@@ -30,8 +32,8 @@ void test_init_programs_default_duties(void)
 {
     {{ pwm_peri.name }}_init();
 {% for c in chans %}
-    /* CH{{ c.channel }} default {{ c.get('default_duty', 50) }}% @ 1 kHz -> pulse {{ ((c.get('default_duty', 50)) * 10) | int }} */
-    TEST_ASSERT_EQUAL_UINT32({{ ((c.get('default_duty', 50)) * 10) | int }},
+    /* CH{{ c.channel }} default {{ c.get('default_duty', 50) }}% @ {{ default_freq }} Hz -> pulse {{ ((arr + 1) * (c.get('default_duty', 50))) // 100 }} */
+    TEST_ASSERT_EQUAL_UINT32({{ ((arr + 1) * (c.get('default_duty', 50))) // 100 }},
                              mock_tim_get_compare({{ c.channel }}));
 {% endfor %}
 }
@@ -43,7 +45,7 @@ void test_set_duty_updates_one_channel_only(void)
 
     before = mock_tim_get_compare(2);   /* CH2 default (must stay untouched) */
     TEST_ASSERT_EQUAL_INT(0, {{ pwm_peri.name }}_set_duty(1, 25));
-    TEST_ASSERT_EQUAL_UINT32(250, mock_tim_get_compare(1));   /* (999+1)*25/100 */
+    TEST_ASSERT_EQUAL_UINT32({{ ((arr + 1) * 25) // 100 }}, mock_tim_get_compare(1));
     TEST_ASSERT_EQUAL_UINT32(before, mock_tim_get_compare(2)); /* CH2 untouched */
 }
 
@@ -64,7 +66,8 @@ void test_set_freq_preserves_duty_percent(void)
     TEST_ASSERT_EQUAL_INT(0, {{ pwm_peri.name }}_set_freq(500));
     TEST_ASSERT_EQUAL_UINT32(1999, mock_tim_get_arr());       /* 1e6/500-1 */
 {% for c in chans %}
-    TEST_ASSERT_EQUAL_UINT32({{ ((c.get('default_duty', 50)) * 20) | int }},
+    /* duties were restored to 50/25 above, not the YAML defaults */
+    TEST_ASSERT_EQUAL_UINT32({{ 1000 if loop.index0 == 0 else 500 }},
                              mock_tim_get_compare({{ c.channel }}));  /* (1999+1)*pct/100 */
 {% endfor %}
 }
@@ -72,7 +75,7 @@ void test_set_freq_preserves_duty_percent(void)
 void test_set_freq_rejects_bad_range(void)
 {
     {{ pwm_peri.name }}_init();
-    TEST_ASSERT_EQUAL_INT(-1, {{ pwm_peri.name }}_set_freq(50));
+    TEST_ASSERT_EQUAL_INT(-1, {{ pwm_peri.name }}_set_freq(10));   /* below 16 Hz floor */
     TEST_ASSERT_EQUAL_INT(-1, {{ pwm_peri.name }}_set_freq(200000));
 }
 

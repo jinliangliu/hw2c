@@ -310,6 +310,17 @@ def render_templates(env: Environment, context: dict, output_dir: str,
             rendered = template.render(context)
             _write_file(out_path, rendered, dry_run, show_diff)
 
+    # ---------- PID math module (when a pid_ctrl component exists) ----------
+    if context.get("has_pid_ctrl"):
+        pid_templates = {
+            "app/pid_math.h.j2": os.path.join(output_dir, "src", "pid_math.h"),
+            "app/pid_math.c.j2": os.path.join(output_dir, "src", "pid_math.c"),
+        }
+        for tmpl_name, out_path in pid_templates.items():
+            template = env.get_template(tmpl_name)
+            rendered = template.render(context)
+            _write_file(out_path, rendered, dry_run, show_diff)
+
     # GPIO POSIX API always generated (all boards have GPIO)
     posix_gpio_templates = {
         "drivers/posix/gpio_api.h.j2": os.path.join(output_dir, "src", "drivers", "gpio_api.h"),
@@ -405,6 +416,9 @@ def render_templates(env: Environment, context: dict, output_dir: str,
                 comp_name_out = comp["name"] + "_component"
             elif comp_type == "knob":
                 comp_template = env.get_template("app/knob_component.c.j2")
+                comp_name_out = comp["name"] + "_component"
+            elif comp_type == "pid_ctrl":
+                comp_template = env.get_template("app/pid_ctrl_component.c.j2")
                 comp_name_out = comp["name"] + "_component"
             else:
                 comp_template = env.get_template("app/component.c.j2")
@@ -546,6 +560,8 @@ def render_templates(env: Environment, context: dict, output_dir: str,
         test_templates["test/test_fall_detect.c.j2"] = os.path.join(test_dir, "test_fall_detect.c")
     if context.get("has_foc"):
         test_templates["test/test_foc_math.c.j2"] = os.path.join(test_dir, "test_foc_math.c")
+    if context.get("has_pid_ctrl"):
+        test_templates["test/test_pid_math.c.j2"] = os.path.join(test_dir, "test_pid_math.c")
     if context.get("has_ir"):
         test_templates["test/test_ir.c.j2"] = os.path.join(test_dir, "test_ir.c")
     if context.get("has_cellular"):
@@ -1052,6 +1068,9 @@ def generate_project(
         )
         context["has_modbus_component"] = any(
             c.get("type") == "modbus" for c in context.get("components", [])
+        )
+        context["has_pid_ctrl"] = any(
+            c.get("type") == "pid_ctrl" for c in context.get("components", [])
         )
 
         # Pre-compute LED/BTN pin lists for component templates

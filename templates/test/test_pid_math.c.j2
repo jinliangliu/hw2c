@@ -1,0 +1,113 @@
+/* test_pid_math.c.j2 - PID controller unit tests (pure math, host) */
+#include "unity.h"
+#include <math.h>
+
+#include "../src/pid_math.c"
+
+void setUp(void) {}
+void tearDown(void) {}
+
+/* A first-order plant: p += (u * gain - p) * dt / tau */
+static float plant_step(float p, float u, float dt, float gain, float tau)
+{
+    return p + (u * gain - p) * (dt / tau);
+}
+
+void test_pid_clamp_output_range(void)
+{
+    pid_t p;
+    pid_init(&p, 10.0f, 0.0f, 0.0f, 0.01f, 0.0f, 100.0f);
+    /* huge error -> output must clamp to out_max */
+    float u = pid_update(&p, 1000.0f, 0.0f);
+    TEST_ASSERT_FLOAT_WITHIN(1e-4f, 100.0f, u);
+    u = pid_update(&p, 0.0f, 1000.0f);
+    TEST_ASSERT_FLOAT_WITHIN(1e-4f, 0.0f, u);
+}
+
+void test_pid_step_response_converges(void)
+{
+    pid_t p;
+    float plant = 0.0f;
+    int i;
+    pid_init(&p, 1.2f, 0.4f, 0.0f, 0.01f, 0.0f, 100.0f);
+    p.i_clamp = 200.0f;   /* generous: convergence test must reach setpoint */
+    for (i = 0; i < 3000; i++) {
+        plant = plant_step(plant, pid_update(&p, 100.0f, plant),
+                           0.01f, 1.0f, 0.5f);
+    }
+    TEST_ASSERT_FLOAT_WITHIN(2.0f, 100.0f, plant);
+}
+
+void test_pid_integral_windup_frozen_when_saturated(void)
+{
+    pid_t p;
+    float u;
+    pid_init(&p, 1.0f, 1.0f, 0.0f, 0.01f, 0.0f, 100.0f);
+    /* keep error positive for many steps -> saturated at 100, integral
+     * must not keep growing without bound (conditional anti-windup) */
+    int i;
+    for (i = 0; i < 200; i++) {
+        u = pid_update(&p, 100.0f, 0.0f);
+    }
+    TEST_ASSERT_FLOAT_WITHIN(1e-4f, 100.0f, u);
+    TEST_ASSERT_TRUE(pid_get_integral(&p) <= 100.0f + 1e-3f);
+}
+
+void test_pid_integral_clamp_limits_windup(void)
+{
+    pid_t p;
+    pid_init(&p, 0.1f, 1.0f, 0.0f, 0.01f, 0.0f, 100.0f);
+    p.i_clamp = 5.0f;
+    int i;
+    for (i = 0; i < 1000; i++) {
+        (void)pid_update(&p, 100.0f, 0.0f);
+    }
+    TEST_ASSERT_TRUE(fabsf(pid_get_integral(&p)) <= 5.0f + 1e-3f);
+}
+
+void test_pid_derivative_filter_smooths_noise(void)
+{
+    pid_t p;
+    float d_filt, d_raw;
+    float noisy[4] = {1.0f, 2.0f, 1.0f, 2.0f};
+    int i;
+
+    /* raw derivative (d_alpha = 1) */
+    pid_init(&p, 0.0f, 0.0f, 1.0f, 0.01f, -100.0f, 100.0f);
+    for (i = 0; i < 4; i++) {
+        d_raw = pid_update(&p, noisy[i], 0.0f);
+    }
+
+    /* filtered derivative (d_alpha = 0.2) */
+    pid_init(&p, 0.0f, 0.0f, 1.0f, 0.01f, -100.0f, 100.0f);
+    p.d_alpha = 0.2f;
+    for (i = 0; i < 4; i++) {
+        d_filt = pid_update(&p, noisy[i], 0.0f);
+    }
+
+    /* last alternating step: filtered magnitude must be below raw */
+    TEST_ASSERT_TRUE(fabsf(d_filt) < fabsf(d_raw));
+}
+
+void test_pid_setpoint_ramp_prevents_kick(void)
+{
+    pid_t p;
+    pid_init(&p, 5.0f, 0.0f, 0.0f, 0.01f, -100.0f, 100.0f);
+    p.setpoint_rate = 10.0f;              /* kPa/s -> 0.1 kPa per step */
+    float u1 = pid_update(&p, 100.0f, 0.0f);   /* first step moves 0.1 */
+    float u2 = pid_update(&p, 100.0f, 0.0f);   /* second step moves 0.1 */
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 1.0f, u2);  /* ~0.2 error * kp 5 */
+    TEST_ASSERT_TRUE(u1 <= u2);                /* no kick on first step */
+}
+
+int main(void)
+{
+    UNITY_BEGIN();
+    RUN_TEST(test_pid_clamp_output_range);
+    RUN_TEST(test_pid_step_response_converges);
+    RUN_TEST(test_pid_integral_windup_frozen_when_saturated);
+    RUN_TEST(test_pid_integral_clamp_limits_windup);
+    RUN_TEST(test_pid_derivative_filter_smooths_noise);
+    RUN_TEST(test_pid_setpoint_ramp_prevents_kick);
+    return UNITY_END();
+}

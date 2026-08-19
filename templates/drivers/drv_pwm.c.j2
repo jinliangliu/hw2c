@@ -24,7 +24,9 @@
 #define PWM_TIMER_CLK_HZ     {{ timer_clk }}U
 #define PWM_TICK_HZ          1000000U
 #define PWM_PRESCALER        (PWM_TIMER_CLK_HZ / PWM_TICK_HZ - 1U)
-#define PWM_MIN_FREQ_HZ      100U
+/* 1 MHz tick / 65535 max 16-bit ARR => lowest safe frequency is ~15 Hz.
+ * 16 Hz is the typical switching rate for gas solenoid valves. */
+#define PWM_MIN_FREQ_HZ      16U
 #define PWM_MAX_FREQ_HZ      100000U
 
 /* ---- per-channel state ---- */

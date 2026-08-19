@@ -1,0 +1,122 @@
+# ============================================================
+# hw2c solenoid_valve_pid_ctrl_demo - gas solenoid valve
+# pressure control with PID middleware
+#
+#   MCU           STM32G0B1VET6 @ 16 MHz (HSI)
+#   Solenoid      TIM2 CH1 (PA0) PWM @ 16 Hz, duty = average opening
+#   Pressure      I2C1 (PB6/PB7), generic 24-bit digital sensor
+#   Shell         USART2 (PA2/PA3) - CLI + log @ 115200
+#   LED           PC0, BUTTON PC13
+#
+# The valve is an ON/OFF solenoid (opening/closing <5 ms) modulated by
+# a 16 Hz PWM: the PID output (0..100%) becomes the PWM duty cycle, i.e.
+# the average opening.  Pressure feedback comes over I2C.
+# ============================================================
+
+mcu:
+  part: STM32G0B1VET6
+  clock_source: HSI
+  clock_freq_hz: 16000000
+  core_clock_mhz: 16
+  hse_freq: 8000000
+
+pins:
+  # Indicator LED - pattern driver
+  - id: PC0
+    function: GPIO_Output
+    label: "LED"
+    active_level: low
+
+  # Button - EXTI both-edge input (press + release)
+  - id: PC13
+    function: GPIO_Input
+    label: "BUTTON"
+    pull: up
+    exti:
+      enable: true
+      trigger: both
+
+  # Solenoid valve PWM (16 Hz switching, TIM2 CH1)
+  - id: PA0
+    function: TIM2_CH1
+    label: "SOLENOID_PWM"
+    af: 1
+
+  # I2C1 bus - pressure sensor (generic 24-bit model)
+  - id: PB6
+    function: I2C1_SCL
+    label: "I2C1_SCL"
+    af: 1
+  - id: PB7
+    function: I2C1_SDA
+    label: "I2C1_SDA"
+    af: 1
+
+  # Shell UART - debug CLI + log output
+  - id: PA2
+    function: USART2_TX
+    af: 1
+  - id: PA3
+    function: USART2_RX
+    af: 1
+
+peripherals:
+  # Serial transport for the shell
+  - name: usart2
+    type: UART_Serial
+    instance: USART2
+    interface: uart
+    extra:
+      baudrate: 115200
+
+  # CLI interactive shell
+  - name: shell
+    type: Internal_CLI
+    uart: usart2
+    extra:
+      prompt: "hw2c> "
+
+  # Solenoid valve PWM: 16 Hz switching, duty = average opening
+  - name: solenoid_pwm
+    type: Internal_PWM
+    timer: TIM2
+    extra:
+      default_freq: 16
+      channels:
+        - channel: 1
+          default_duty: 0
+
+  # Pressure sensor on I2C1 (generic model; tune scale/offset for the
+  # actual sensor on the test rig)
+  - name: pressure
+    type: I2C_Pressure
+    bus: I2C1
+    address: 0x28
+    extra:
+      reg_start: 0
+      scale_kpa_per_lsb: 0.001
+      offset_kpa: 0.0
+      byte_order: big
+
+  # RTC (LSE) - 1 s heartbeat + 30 s telemetry alarm
+  - name: rtc
+    type: Internal_RTC
+    bus: RTC
+    extra:
+      clock_source: LSE
+      wakeup_interval_ms: 1000
+      initial_time: "2026-08-19 12:00:00"
+      alarms:
+        - type: periodic_sec
+          period_s: 1
+          event: TICK_1S
+        - type: periodic_sec
+          period_s: 30
+          event: SECONDS_30
+
+log:
+  enable: true
+  ring_buf_size: 1024
+
+sleep:
+  mode: RUN

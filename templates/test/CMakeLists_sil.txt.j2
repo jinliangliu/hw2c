@@ -43,6 +43,13 @@ add_executable(test_component_sil
     ${CMAKE_SOURCE_DIR}/../../src/foc_math.c
     ${CMAKE_SOURCE_DIR}/../../src/drivers/drv_{{ (peripherals | selectattr('type', 'eq', 'FOC_Motor') | first).name }}.c
 {% endif %}
+{% if has_pid_ctrl %}
+{% set pid_pressure = peripherals | selectattr('type', 'eq', 'I2C_Pressure') | first %}
+{% set pid_pwm = peripherals | selectattr('type', 'eq', 'Internal_PWM') | first %}
+    ${CMAKE_SOURCE_DIR}/../../src/pid_math.c
+    ${CMAKE_SOURCE_DIR}/../../src/drivers/drv_{{ pid_pressure.name }}.c
+    ${CMAKE_SOURCE_DIR}/../../src/drivers/drv_{{ pid_pwm.name }}.c
+{% endif %}
 {% if has_modbus_component %}
     ${CMAKE_SOURCE_DIR}/../../src/drivers/drv_modbus.c
 {% endif %}

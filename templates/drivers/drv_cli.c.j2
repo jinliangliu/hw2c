@@ -98,6 +98,12 @@
 #include "drv_{{ p.name }}.h"
 {% endfor %}
 {% endif %}
+{% if has_pid_ctrl %}
+{% set pid_comp = components | selectattr('type', 'eq', 'pid_ctrl') | first %}
+{% for p in peripherals if p.type == 'I2C_Pressure' %}
+#include "drv_{{ p.name }}.h"
+{% endfor %}
+{% endif %}
 
 /* ==================================================================
  *  Static module state
@@ -428,6 +434,71 @@ static void cmd_fall(int argc, char *argv[], cli_output_fn out)
         (unsigned long){{ fd_comp.name }}_get_events(),
         (double){{ fd_comp.name }}_get_last_impact_g(),
         (unsigned long){{ fd_comp.name }}_get_read_failures());
+}
+{% endif %}
+
+{% if has_pid_ctrl %}
+/* ---- Solenoid PID pressure control ---- */
+int {{ pid_comp.name }}_set_setpoint(float kpa);
+int {{ pid_comp.name }}_start(void);
+int {{ pid_comp.name }}_stop(void);
+int {{ pid_comp.name }}_vent(void);
+int {{ pid_comp.name }}_reset_fault(void);
+int {{ pid_comp.name }}_get_status(float *pressure, float *setpoint,
+                                  uint32_t *duty, uint32_t *stage,
+                                  uint32_t *fault);
+const char *{{ pid_comp.name }}_stage_name(void);
+static void cmd_solenoid(int argc, char *argv[], cli_output_fn out)
+{
+    if (argc < 2) {
+        out("Usage: solenoid start [kpa] | stop | vent | set <kpa> | "
+            "reset | status\r\n");
+        return;
+    }
+    if (strcmp(argv[1], "start") == 0) {
+        if (argc >= 3) {
+            float kpa;
+            if (sscanf(argv[2], "%f", &kpa) == 1) {
+                out("solenoid: %s\r\n",
+                    ({{ pid_comp.name }}_set_setpoint(kpa) == 0)
+                        ? "ramp up started" : "rejected (range/fault)");
+                return;
+            }
+        }
+        out("solenoid: %s\r\n",
+            ({{ pid_comp.name }}_start() == 0) ? "started" : "not ready/fault");
+    } else if (strcmp(argv[1], "stop") == 0) {
+        {{ pid_comp.name }}_stop();
+        out("solenoid stopped\r\n");
+    } else if (strcmp(argv[1], "vent") == 0) {
+        {{ pid_comp.name }}_vent();
+        out("solenoid venting\r\n");
+    } else if (strcmp(argv[1], "set") == 0 && argc >= 3) {
+        float kpa;
+        if (sscanf(argv[2], "%f", &kpa) == 1) {
+            out("solenoid: %s\r\n",
+                ({{ pid_comp.name }}_set_setpoint(kpa) == 0)
+                    ? "setpoint updated" : "rejected (range/fault)");
+        } else {
+            out("Usage: solenoid set <kpa>\r\n");
+        }
+    } else if (strcmp(argv[1], "reset") == 0) {
+        {{ pid_comp.name }}_reset_fault();
+        out("solenoid fault cleared\r\n");
+    } else if (strcmp(argv[1], "status") == 0) {
+        float p = 0.0f, sp = 0.0f;
+        uint32_t duty = 0, stage = 0, fault = 0;
+        if ({{ pid_comp.name }}_get_status(&p, &sp, &duty, &stage, &fault) != 0) {
+            out("solenoid not ready\r\n");
+            return;
+        }
+        out("solenoid: stage=%s pressure=%.1fkPa setpoint=%.1fkPa "
+            "duty=%lu%% fault=%lu\r\n",
+            {{ pid_comp.name }}_stage_name(), (double)p, (double)sp,
+            (unsigned long)duty, (unsigned long)fault);
+    } else {
+        out("Unknown solenoid subcommand: %s\r\n", argv[1]);
+    }
 }
 {% endif %}
 
@@ -958,6 +1029,9 @@ void cli_register_builtin_commands(void)
 {% endif %}
 {% if has_fall_detect %}
     cli_register_command("fall",    "Fall detection status",        cmd_fall);
+{% endif %}
+{% if has_pid_ctrl %}
+    cli_register_command("solenoid","Solenoid PID pressure control",cmd_solenoid);
 {% endif %}
 {% if has_foc %}
     cli_register_command("motor",   "FOC motor status",             cmd_motor);

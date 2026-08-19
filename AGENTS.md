@@ -52,6 +52,7 @@ YAML → Pydantic 校验（schemas/hardware.py）
 | spi_flash_demo | W25Q32 SPI NOR Flash |
 | mpu6050_demo | IMU：I2C 默认（MPU6050@0x68），SPI 变体（MPU6500，模型 `SPI_Sensor_MPU6500`）；姿态互补滤波 |
 | pwm_demo | TIM2 双通道 PWM，逐路占空比/频率可调 |
+| solenoid_valve_pid_ctrl_demo | PID 控制中间件（pid_math 纯算法 + pid_ctrl 可选装组件）：电磁阀开关阀 16 Hz PWM 占空比调制加压、I2C 压力反馈、升压/保压/泄压/故障联锁、SIL 压力罐闭环仿真、CLI `solenoid` |
 
 ## 标准工作流（改任何模板/YAML 后）
 

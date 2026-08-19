@@ -1,0 +1,6 @@
+# Pub/Sub topic definitions
+
+topics:
+  - name: pressure
+    description: "Measured pressure, scaled int32, unit=0.1 kPa"
+    value: { type: int32, unit: "0.1 kPa" }

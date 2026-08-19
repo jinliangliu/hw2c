@@ -256,6 +256,7 @@ cmake --build build --target flash-daplink   # DAP-Link（CMSIS-DAP）/ OpenOCD
 | `examples/mpu6050_demo` | I2C1 IMU（MPU6050 @ 0x68，默认；SPI 变体 MPU6500 一键切换）+ imu 组件 + 姿态互补滤波 + **fall_detect 摔倒监测组件**（`fall` CLI）；驱动模板 I2C/SPI 双传输；无传感器时优雅降级不挂死 | 13 套件（含 test_i2c_api/test_mpu6050/test_attitude/test_fall_detect） |
 | `examples/pwm_demo` | TIM2 双通道 PWM（CH1=PA0/CH2=PA1），逐路占空比可调 + 频率可改；CLI `pwm list/set/freq` | 7 套件（含 test_pwm 多通道） |
 | `examples/knob_demo` | TIM1 直驱 FOC 力矩反馈阻尼旋钮：三相互补 PWM + 电流环 + AS5600 编码器 + Knob 阻尼/摩擦力觉；CLI `motor`/`knob` | 9 套件（含 test_foc_math） |
+| `examples/solenoid_valve_pid_ctrl_demo` | **PID 控制中间件**（`pid_math` + `pid_ctrl` 组件，可选装）：燃气电磁阀开关阀 16 Hz PWM 占空比调制加压，I2C 压力反馈，升压/保压/泄压/故障联锁（超压/传感器失效/超时）；CLI `solenoid`；SIL 压力罐闭环仿真 | 8 套件（含 test_pid_math + SIL 闭环） |
 
 每个示例均为六层 YAML 完整配置，可独立生成、编译并通过全部单元测试。各示例的接线、生成与对测方法见 `examples/*/README.md`。
 
@@ -268,6 +269,7 @@ cmake --build build --target flash-daplink   # DAP-Link（CMSIS-DAP）/ OpenOCD
 | 系列 | 型号 | 内核 | Flash | RAM | 状态 |
 |------|------|------|-------|-----|------|
 | STM32G0 | STM32G0B1RE | Cortex-M0+ | 512 KB | 144 KB | 已验证 |
+| STM32G0 | STM32G0B1VE | Cortex-M0+ | 512 KB | 144 KB | 已验证 |
 
 ### EDA 工具兼容性
 

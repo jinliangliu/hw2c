@@ -181,7 +181,7 @@ VALID_PERIPHERAL_TYPES: frozenset[str] = frozenset({
     "Internal_RTC", "Internal_PWM", "Internal_ADC", "Internal_IR",
     "Internal_CLI", "Internal_IWDG", "Internal_TempSensor",
     "UART_Serial",
-    "I2C_Sensor_MPU6050", "I2C_EEPROM",
+    "I2C_Sensor_MPU6050", "I2C_EEPROM", "I2C_Pressure",
     "SPI_Flash_W25Q32", "SPI_Flash_Generic", "SPI_Sensor_MPU6500",
     "FOC_Motor",
     "RS485", "Cellular_4G",

@@ -1,0 +1,30 @@
+model: "I2C_Pressure"
+type: "I2C_Pressure"
+interface: "I2C"
+address: 0x28
+driver_template: "drivers/drv_pressure.c.j2"
+header_template: "drivers/drv_pressure.h.j2"
+# Generic 24-bit digital pressure sensor model: the driver reads a raw ADC
+# word from reg_start and converts linearly:
+#   pressure_kpa = raw * scale_kpa_per_lsb + offset_kpa
+# Adjust scale/offset/reg_start to the actual sensor on the test rig.
+registers:
+  DATA_START: 0x00
+extra_schema:
+  reg_start:
+    type: int
+    required: false
+    default: 0
+  scale_kpa_per_lsb:
+    type: float
+    required: false
+    default: 0.001
+  offset_kpa:
+    type: float
+    required: false
+    default: 0.0
+  byte_order:
+    type: str
+    required: false
+    default: "big"
+    values: ["big", "little"]

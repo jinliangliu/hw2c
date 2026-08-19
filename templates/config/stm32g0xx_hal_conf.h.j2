@@ -89,7 +89,7 @@ extern "C" {
 #define HSI_VALUE    (16000000UL)
 #endif
 
-{% if mcu.part in ['STM32G0B1RET6', 'STM32G0C1xx', 'STM32G0B1xx', 'STM32G0B0xx'] %}
+{% if mcu.part.startswith('STM32G0B1') or mcu.part in ['STM32G0C1xx', 'STM32G0B1xx', 'STM32G0B0xx'] %}
 #if defined(STM32G0C1xx) || defined(STM32G0B1xx) || defined(STM32G0B0xx)
 #if !defined  (HSI48_VALUE)
   #define HSI48_VALUE   48000000U
@@ -113,7 +113,7 @@ extern "C" {
 #define EXTERNAL_I2S1_CLOCK_VALUE    (48000UL)
 #endif
 
-{% if mcu.part in ['STM32G0B1RET6', 'STM32G0C1xx', 'STM32G0B1xx', 'STM32G0B0xx'] %}
+{% if mcu.part.startswith('STM32G0B1') or mcu.part in ['STM32G0C1xx', 'STM32G0B1xx', 'STM32G0B0xx'] %}
 #if defined(STM32G0C1xx) || defined(STM32G0B1xx) || defined(STM32G0B0xx)
 #if !defined  (EXTERNAL_I2S2_CLOCK_VALUE)
   #define EXTERNAL_I2S2_CLOCK_VALUE    48000U
