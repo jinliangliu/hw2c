@@ -146,9 +146,7 @@ flowchart TB
 驱动，事件经 `event_queue` 分发到状态机，组件间通过 `component_bus`
 发布/订阅解耦。
 
-![hw2c 运行时架构](docs/diagrams/hw2c-runtime.svg)
-
-> 交互版（缩放 / 聚焦 / 主题切换 / 导出）：[hw2c-runtime.html](docs/diagrams/hw2c-runtime.html)
+![hw2c 运行时架构](docs/hw2c.svg)
 
 ### 上下文构建流程
 
