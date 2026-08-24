@@ -139,6 +139,17 @@ flowchart TB
 
 每个组件实现三个标准接口：`init()` / `step()` / `terminate()`，由框架按 `period_ms` 周期自动调度。新增组件只需编写模板并注册到 `components.yaml`，无需改动调度器代码。
 
+### 运行时架构 (Runtime Architecture)
+
+生成固件在目标芯片上的运行时分层：中断源 → 事件队列 → FreeRTOS 任务 →
+组件框架 → POSIX 驱动层 → STM32 HAL。组件由调度任务按 `period_ms` 周期
+驱动，事件经 `event_queue` 分发到状态机，组件间通过 `component_bus`
+发布/订阅解耦。
+
+![hw2c 运行时架构](docs/diagrams/hw2c-runtime.svg)
+
+> 交互版（缩放 / 聚焦 / 主题切换 / 导出）：[hw2c-runtime.html](docs/diagrams/hw2c-runtime.html)
+
 ### 上下文构建流程
 
 六份 YAML 通过 `mapper.py` 合并为统一的模板渲染上下文：

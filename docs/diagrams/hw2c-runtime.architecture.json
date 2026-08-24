@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "hw2c 运行时架构",
+    "quality_profile": "showcase",
+    "viewBox": [1280, 650],
+    "repository": {
+      "url": "https://github.com/jinliangliu/hw2c",
+      "revision": "64e6ca74658ce5796eb3bb71fe2645203cf4b795"
+    }
+  },
+  "components": [
+    { "id": "isr", "type": "security", "label": "中断源", "sublabel": "EXTI / USART / RTC ISR", "pos": [560, 30], "size": [150, 62], "sources": [ { "path": "templates/src/stm32g0xx_it.c.j2", "line": 37 }, { "path": "templates/drivers/drv_rtc.c.j2", "line": 93 } ] },
+    { "id": "btnQueue", "type": "messagebus", "label": "按钮队列", "sublabel": "btn_queue（ISR 填充）", "pos": [130, 200], "size": [160, 62], "sources": [ { "path": "templates/src/stm32g0xx_it.c.j2", "line": 44 } ] },
+    { "id": "eventQueue", "type": "messagebus", "label": "事件队列", "sublabel": "event_queue（100 × event_t）", "pos": [340, 200], "size": [160, 62], "sources": [ { "path": "templates/src/event_mgr.c.j2", "line": 117 } ] },
+    { "id": "eventMgr", "type": "backend", "label": "EventMgr 任务", "sublabel": "事件分发 / 周期快照", "pos": [550, 200], "size": [170, 62], "sources": [ { "path": "templates/src/event_mgr.c.j2", "line": 123 } ] },
+    { "id": "stateMachine", "type": "backend", "label": "状态机", "sublabel": "statemachine_process", "pos": [800, 200], "size": [150, 62], "sources": [ { "path": "templates/src/event_mgr.c.j2", "line": 138 } ] },
+    { "id": "cliTask", "type": "backend", "label": "CLI 任务", "sublabel": "drv_shell 命令注册", "pos": [1030, 200], "size": [150, 62], "sources": [ { "path": "templates/src/main.c.j2", "line": 410 }, { "path": "templates/drivers/drv_cli.c.j2", "line": 1044 } ] },
+    { "id": "compStep", "type": "backend", "label": "组件调度任务", "sublabel": "component_step_task @10ms", "pos": [60, 380], "size": [170, 62], "sources": [ { "path": "templates/src/main.c.j2", "line": 557 } ] },
+    { "id": "components", "type": "backend", "label": "业务组件", "sublabel": "led / btn / pid_ctrl / mpu6050 …", "pos": [350, 380], "size": [210, 62], "sources": [ { "path": "templates/src/component_registry.c.j2", "line": 68 } ] },
+    { "id": "componentBus", "type": "messagebus", "label": "组件总线", "sublabel": "publish / subscribe 主题", "pos": [640, 380], "size": [190, 62], "sources": [ { "path": "templates/src/component_bus.c.j2", "line": 51 } ] },
+    { "id": "telemetry", "type": "database", "label": "参数 / 遥测", "sublabel": "param_registry + telemetry", "pos": [1030, 380], "size": [150, 62], "sources": [ { "path": "templates/src/telemetry.c.j2", "line": 219 } ] },
+    { "id": "posixDrivers", "type": "backend", "label": "POSIX 驱动层", "sublabel": "uart / i2c / spi / gpio / adc", "pos": [350, 560], "size": [210, 62], "sources": [ { "path": "templates/drivers/posix/uart_api.c.j2", "line": 1 } ] },
+    { "id": "hal", "type": "external", "label": "STM32 HAL + 外设", "sublabel": "RTC / PWM / ADC / USART", "pos": [640, 560], "size": [190, 62], "sources": [ { "path": "templates/src/main.c.j2", "line": 245 } ] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "FreeRTOS 运行时", "wraps": ["btnQueue", "eventQueue", "eventMgr", "stateMachine", "cliTask"], "pad": 24 },
+    { "kind": "region", "label": "组件框架", "wraps": ["components", "componentBus", "telemetry"], "pad": 24 },
+    { "kind": "region", "label": "硬件抽象", "wraps": ["posixDrivers", "hal"], "pad": 24 }
+  ],
+  "connections": [
+    { "id": "isr-btn", "from": "isr", "to": "btnQueue", "label": "ISR 入队", "variant": "dashed", "fromSide": "bottom", "toSide": "top" },
+    { "id": "isr-evt", "from": "isr", "to": "eventQueue", "label": "RTC 周期事件", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "via": [[635, 150], [420, 150]], "labelAt": [500, 172] },
+    { "id": "btn-comp", "from": "btnQueue", "to": "components", "label": "手势识别" },
+    { "id": "evt-mgr", "from": "eventQueue", "to": "eventMgr", "label": "阻塞接收" },
+    { "id": "mgr-sm", "from": "eventMgr", "to": "stateMachine", "label": "分发" },
+    { "id": "cli-comp", "from": "cliTask", "to": "components", "label": "命令调用 API", "fromSide": "left", "toSide": "top", "via": [[980, 231], [980, 320], [455, 320]], "labelAt": [986, 276] },
+    { "id": "cli-tel", "from": "cliTask", "to": "telemetry", "label": "param / 遥测命令", "fromSide": "bottom", "toSide": "top", "labelAt": [1112, 320] },
+    { "id": "step-comp", "from": "compStep", "to": "components", "label": "周期 step", "labelAt": [280, 416] },
+    { "id": "comp-bus-pub", "from": "components", "to": "componentBus", "label": "publish", "labelAt": [600, 372] },
+    { "id": "bus-comp-sub", "from": "componentBus", "to": "components", "label": "subscribe 通知", "labelAt": [606, 456] },
+    { "id": "comp-drv", "from": "components", "to": "posixDrivers", "label": "POSIX 总线 API", "labelAt": [445, 456] },
+    { "id": "drv-hal", "from": "posixDrivers", "to": "hal", "label": "寄存器访问" }
+  ]
+}
