@@ -26,39 +26,7 @@
 
 ## 核心流程
 
-```mermaid
-flowchart LR
-    subgraph Input["EDA 设计输出"]
-        A1[("Netlist<br>.enet / .xml")]
-        A2[("BOM<br>.csv")]
-    end
-
-    subgraph Parse["硬件感知解析"]
-        B1["引脚-外设映射"]
-        B2["时钟树推断"]
-        B3["外设类型匹配<br>80+ 芯片"]
-    end
-
-    subgraph Config["可视化业务编排"]
-        C1["任务定义"]
-        C2["状态机设计"]
-        C3["硬件-软件绑定"]
-    end
-
-    subgraph Engine["代码生成引擎"]
-        D1["Context Builder"]
-        D2["Pin Allocator"]
-        D3["Jinja2 渲染<br>模板"]
-    end
-
-    subgraph Output["固件输出"]
-        E1[("src/<br>.c .h")]
-        E2[("test/<br>Unity")]
-        E3[("CMakeLists.txt<br>arm-gcc")]
-    end
-
-    Input --> Parse --> Config --> Engine --> Output
-```
+![hw2c ????????](docs/hw2c-core-flow.svg)
 
 > **一句话**：上传网表和 BOM，拖拽编排任务和绑定，下载 arm-none-eabi-gcc 可直接编译的嵌入式工程。
 
@@ -68,74 +36,13 @@ flowchart LR
 
 项目采用 **六层解耦** 设计，从硬件事实到运行时参数逐层抽象，各层可独立编辑、并行协作：
 
-```mermaid
-flowchart TB
-    subgraph HW["hardware.yaml — 硬件物理事实"]
-        direction LR
-        H1["MCU<br>型号/内核/Flash/RAM"] ---
-        H2["Pins<br>GPIO/EXTI/AF"] ---
-        H3["Peripherals<br>I2C/SPI/UART/..."] ---
-        H4["Clock<br>HSI/HSE/LSE/PLL"] ---
-        H5["Sleep<br>STOP/STANDBY"]
-    end
-
-    subgraph SW["task.yaml — 任务与行为"]
-        direction LR
-        S1["app_tasks<br>FreeRTOS 任务"] ---
-        S2["behavior<br>层级状态机"] ---
-        S3["periodic_events<br>定时动作"]
-    end
-
-    subgraph COMP["components.yaml — 组件注册"]
-        direction LR
-        C1["shell / led / btn<br>可插拔组件实例"] ---
-        C2["period_ms<br>调度周期"] ---
-        C3["sleep_compat<br>低功耗兼容"]
-    end
-
-    subgraph BIND["bind.yaml — 硬件-软件绑定"]
-        direction LR
-        D1["interrupt<br>EXTI→Component 绑定"] ---
-        D2["event<br>ISR→事件队列路由"]
-    end
-
-    subgraph PARAMS["params.yaml — 运行时参数"]
-        direction LR
-        P1["组件参数<br>default/min/max"] ---
-        P2["CLI 运行时调参<br>param get/set"]
-    end
-
-    subgraph PUBSUB["pubsub.yaml — 发布/订阅"]
-        direction LR
-        U1["topic 定义<br>组件间解耦通信"] ---
-        U2["温度/按键/LED<br>跨组件事件总线"]
-    end
-
-    HW -.-> BIND
-    SW -.-> BIND
-    COMP -.-> PARAMS
-    COMP -.-> PUBSUB
-```
+![hw2c ?? YAML ??](docs/hw2c-six-layer.svg)
 
 ### 组件框架 (Component Framework)
 
 生成固件内置**组件管理器**，将外设驱动封装为统一生命周期的可插拔组件：
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                 component_registry                │
-│  init_all() → step_all() → 组件生命周期管理       │
-├────────────┬────────────────────┬────────────────┬─────────────────────────┤
-│  shell     │   led              │   btn          │    ...                  │
-│ CLI 交互   │ 模式驱动           │ 手势检测       │  可扩展                 │
-├────────────┼────────────────────┼────────────────┼─────────────────────────┤
-│              component_bus (发布/订阅)            │
-│        Topic 路由 — 组件间解耦事件通信             │
-├────────────┼────────────────────┼────────────────┼─────────────────────────┤
-│             param_registry (参数注册表)            │
-│       运行时参数 — CLI get/set 动态调参            │
-└────────────┴────────────────────┴────────────────┴─────────────────────────┘
-```
+![hw2c ????](docs/hw2c-component-framework.svg)
 
 每个组件实现三个标准接口：`init()` / `step()` / `terminate()`，由框架按 `period_ms` 周期自动调度。新增组件只需编写模板并注册到 `components.yaml`，无需改动调度器代码。
 
@@ -152,44 +59,7 @@ flowchart TB
 
 六份 YAML 通过 `mapper.py` 合并为统一的模板渲染上下文：
 
-```mermaid
-flowchart TB
-    subgraph Inputs["输入：六层 YAML"]
-        HW[("hardware.yaml<br>pins / peripherals / clock")]
-        TASK[("task.yaml<br>app_tasks / behavior")]
-        B[("bind.yaml<br>interrupt / routing")]
-        C[("components.yaml<br>组件注册")]
-        P[("params.yaml<br>运行时参数")]
-        PS[("pubsub.yaml<br>主题路由")]
-    end
-
-    subgraph Merge["mapper.py 合并"]
-        M1["向后兼容检测<br>旧格式自动拆分"] --> M2["合并 app_tasks"]
-        M2 --> M3["合并 behavior"]
-        M3 --> M4["应用 interrupt → notify_task"]
-        M4 --> M5["应用 peripheral_assign → features"]
-        M5 --> M6["注入 routing → bind_routings"]
-    end
-
-    subgraph Validate["校验层"]
-        V1["Pydantic Schema 验证"] --> V2["引脚冲突检测"]
-        V2 --> V3["MCU 数据库交叉校验"]
-    end
-
-    subgraph Context["context_builder 构建"]
-        CB1["pin_context — 引脚/GPIO/EXTI"] --> CB
-        CB2["periph_context — 驱动/总线"] --> CB
-        CB3["app_task_context — RTOS 配置"] --> CB
-        CB4["boot_context — 双槽位布局"] --> CB
-        CB5["hal_context — HAL/时钟外设"] --> CB
-        CB6["flags — 条件编译宏"] --> CB
-        CB[("统一渲染上下文 Dict")]
-    end
-
-    Inputs --> Merge --> Validate --> Context
-
-    Context --> J2["Jinja2 模板引擎<br>123 个 .j2 → .c/.h/CMakeLists.txt"]
-```
+![hw2c ???????](docs/hw2c-build-context.svg)
 
 > 无论旧格式（单体 YAML）还是新格式（六层拆分），`mapper.py` 确保上游零改动。
 
