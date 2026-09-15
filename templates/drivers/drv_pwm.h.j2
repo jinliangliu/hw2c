@@ -25,21 +25,34 @@ extern "C" {
 #define PWM_DEFAULT_FREQ_HZ {{ default_freq }}
 
 /* Initializes the timer, configures and starts every channel with its
- * default duty.  Returns 0 on success. */
+ * default duty.  Returns 0 on success.
+ *
+ * Every other entry point below is safe to call before this one: the driver
+ * refuses to touch the timer until it is bound to its peripheral, because the
+ * fail-safe path (hw2c_safe_state) may run this early.  Calls made before
+ * init() are recorded and applied by init() (set_duty, set_freq), or reported
+ * as "not driven yet" (start). */
 int {{ peripheral.name }}_init(void);
 
 /* Sets one channel's duty cycle (0..100 percent).  Returns 0 on success,
- * -1 if the channel does not exist or percent is out of range. */
+ * -1 if the channel does not exist or percent is out of range.  Before init()
+ * the value is stored and applied by init(). */
 int {{ peripheral.name }}_set_duty(uint8_t channel, uint32_t percent);
 
 /* Returns the current duty of a channel, or UINT32_MAX if unknown. */
 uint32_t {{ peripheral.name }}_get_duty(uint8_t channel);
 
 /* Reconfigures the PWM frequency (100 Hz .. 100 kHz), preserving every
- * channel's duty in percent.  Returns 0 on success. */
+ * channel's duty in percent.  Returns 0 on success, -1 if out of range.
+ * Before init() the value is stored and applied by init(). */
 int {{ peripheral.name }}_set_freq(uint32_t freq_hz);
 
-/* Starts/stops a single channel (channel 1..N). */
+/* Starts/stops a single channel (channel 1..N).
+ *
+ * Returns 0 on success, -1 for an unknown channel, -2 if the HAL call failed,
+ * -3 if start() was called before init().  stop() additionally returns 0 when
+ * the driver was never initialised - the channel is not driven, which is
+ * exactly the state the caller asked for. */
 int {{ peripheral.name }}_start(uint8_t channel);
 int {{ peripheral.name }}_stop(uint8_t channel);
 

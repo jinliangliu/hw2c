@@ -69,7 +69,7 @@ uint32_t power_sleep_now(power_mode_t mode)
     uint32_t t0, elapsed, reload, ctrl;
 
     if (mode == POWER_MODE_RUN) {
-        return 0;
+        return POWER_SLEEP_SKIPPED;   /* nothing to do, and nothing was slept */
     }
 
     /* Drain pending log/CLI ring bytes and let the last TX byte finish
@@ -105,8 +105,10 @@ uint32_t power_sleep_now(power_mode_t mode)
         HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
         break;
     default:
+        /* Mode not implemented on this MCU: restore the timebase and let the
+         * caller report that no sleep happened. */
         hal_tick_enable();
-        return 0;
+        return POWER_SLEEP_SKIPPED;
     }
 
     /* -------- Wakeup path -------- */

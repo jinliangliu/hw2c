@@ -3,6 +3,11 @@
 #include <string.h>
 
 QueueHandle_t event_queue = NULL; /* 与 test_rtc 相同 */
+
+/* drv_rtc.c 初始化失败时走失效安全路径；真实实现会牵连执行器驱动，
+ * 故此处用测试侧的记录桩提供该符号。 */
+#include "fault_trap_stub.c"
+
 #include "../src/drivers/drv_rtc.c"
 
 static int callback_count = 0;

@@ -52,6 +52,35 @@ static struct i2c_dev g_i2c_buses[1];
 static const uint32_t g_i2c_bus_count = 0;
 {% endif %}
 
+/* ---- bus name comparison ----
+ * Names are normalised to lower case at registration, but callers may pass the
+ * original hardware spelling from the configuration (e.g. "I2C1").  Compare
+ * case-insensitively so a bus can never be "missing" merely because of the
+ * letter case used at the call site.  Avoids <ctype.h>/tolower() on purpose:
+ * those are locale dependent and MISRA Rule 21.13 flagged. */
+static int i2c_bus_name_eq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if ((ca >= (unsigned char)'A') && (ca <= (unsigned char)'Z')) {
+            ca = (unsigned char)(ca + 32U);
+        }
+        if ((cb >= (unsigned char)'A') && (cb <= (unsigned char)'Z')) {
+            cb = (unsigned char)(cb + 32U);
+        }
+        if (ca != cb) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return (*a == *b) ? 1 : 0;
+}
+
 /* ---- i2c_open (idempotent: a bus is a shared resource) ---- */
 i2c_handle_t i2c_open(const char *bus_name, const i2c_cfg_t *cfg)
 {
@@ -60,7 +89,7 @@ i2c_handle_t i2c_open(const char *bus_name, const i2c_cfg_t *cfg)
     }
 
     for (uint32_t i = 0; i < g_i2c_bus_count; i++) {
-        if (strcmp(g_i2c_buses[i].name, bus_name) == 0) {
+        if (i2c_bus_name_eq(g_i2c_buses[i].name, bus_name) != 0) {
             if (!g_i2c_buses[i].is_open) {
                 if (cfg != NULL && cfg->timeout_ms > 0) {
                     g_i2c_buses[i].default_timeout_ms = cfg->timeout_ms;
@@ -81,6 +110,14 @@ const char *i2c_name(i2c_handle_t h)
     return h->name;
 }
 
+/* ---- transfer length limit ----
+ * This API takes a uint32_t length, but the HAL "Size" parameter of every
+ * HAL_I2C_* transfer is uint16_t.  Passing a longer buffer used to be
+ * truncated silently to its low 16 bits (65536 -> 0), i.e. the caller got a
+ * success code for a transfer that moved the wrong number of bytes.  Reject
+ * an over-long request instead of pretending it worked. */
+#define I2C_API_MAX_XFER_BYTES  0xFFFFU
+
 /* ---- helpers ---- */
 static uint32_t i2c_timeout(i2c_handle_t h, uint32_t timeout_ms)
 {
@@ -97,18 +134,36 @@ static int32_t i2c_status(int32_t rc)
  * STM32 HAL's polling I2C error path can spin forever on a stuck/floating
  * bus (STOPF never sets).  Before any transaction we bound the BUSY wait
  * and cycle the peripheral if it is stuck, so a missing device can never
- * hang the system. */
+ * hang the system.
+ *
+ * The bound is expressed in *milliseconds*, not loop iterations: an iteration
+ * count has no defined duration (it changes with -O level, clock frequency and
+ * flash wait states), so it cannot be reasoned about against a control-loop
+ * period or a watchdog timeout.  HAL_GetTick() is the same time base the
+ * caller's own timeouts use.
+ *
+ * The iteration cap is a secondary guard for the pre-scheduler window, where
+ * the tick may legitimately not advance yet; it is far longer than the
+ * millisecond bound would ever need. */
+#define I2C_BUS_READY_TIMEOUT_MS  5U
+#define I2C_BUS_READY_SPIN_CAP    20000U
+
 #ifndef TEST
 static int32_t i2c_bus_ensure_ready(struct i2c_dev *h)
 {
-    /* Bounded by loop count, not HAL_GetTick: if the system tick is
-     * temporarily unavailable (early boot / critical section), a stuck
-     * bus must still not hang the caller. */
-    for (volatile uint32_t i = 0; i < 20000U; i++) {
-        if (__HAL_I2C_GET_FLAG(h->hi2c, I2C_FLAG_BUSY) == RESET) {
-            return 0;
+    uint32_t start = HAL_GetTick();
+    uint32_t spin  = 0U;
+
+    while (__HAL_I2C_GET_FLAG(h->hi2c, I2C_FLAG_BUSY) != RESET) {
+        if ((HAL_GetTick() - start) >= I2C_BUS_READY_TIMEOUT_MS) {
+            break;
+        }
+        spin++;
+        if (spin >= I2C_BUS_READY_SPIN_CAP) {
+            break;      /* tick frozen (early boot): fall back to the spin cap */
         }
     }
+
     if (__HAL_I2C_GET_FLAG(h->hi2c, I2C_FLAG_BUSY) != RESET) {
         /* Stuck bus: cycle PE to reset the peripheral state machine. */
         __HAL_I2C_DISABLE(h->hi2c);
@@ -144,6 +199,9 @@ int32_t i2c_mem_read(i2c_handle_t h, uint8_t dev_addr, uint16_t mem_addr,
     if (h == NULL || buf == NULL || len == 0) {
         return -5;
     }
+    if (len > I2C_API_MAX_XFER_BYTES) {
+        return -7;   /* would be truncated by the HAL uint16_t Size */
+    }
 #ifndef TEST
     if (i2c_bus_ensure_ready(h) != 0) {
         return -6;
@@ -164,6 +222,9 @@ int32_t i2c_mem_write(i2c_handle_t h, uint8_t dev_addr, uint16_t mem_addr,
 {
     if (h == NULL || buf == NULL || len == 0) {
         return -5;
+    }
+    if (len > I2C_API_MAX_XFER_BYTES) {
+        return -7;   /* would be truncated by the HAL uint16_t Size */
     }
 #ifndef TEST
     if (i2c_bus_ensure_ready(h) != 0) {
@@ -187,6 +248,9 @@ int32_t i2c_transmit(i2c_handle_t h, uint8_t dev_addr,
     if (h == NULL || buf == NULL || len == 0) {
         return -5;
     }
+    if (len > I2C_API_MAX_XFER_BYTES) {
+        return -7;   /* would be truncated by the HAL uint16_t Size */
+    }
 #ifndef TEST
     if (i2c_bus_ensure_ready(h) != 0) {
         return -6;
@@ -203,6 +267,9 @@ int32_t i2c_receive(i2c_handle_t h, uint8_t dev_addr,
 {
     if (h == NULL || buf == NULL || len == 0) {
         return -5;
+    }
+    if (len > I2C_API_MAX_XFER_BYTES) {
+        return -7;   /* would be truncated by the HAL uint16_t Size */
     }
 #ifndef TEST
     if (i2c_bus_ensure_ready(h) != 0) {

@@ -44,11 +44,27 @@ static struct gpio_dev g_gpio_devs[1];
 static const uint32_t g_gpio_count = 0;
 {% endif %}
 
+/* Pin name comparison (case-insensitive, see i2c_api.c) */
+static int gpio_name_eq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) return 0;
+    while (*a != '\0' && *b != '\0') {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if ((ca >= (unsigned char)'A') && (ca <= (unsigned char)'Z')) ca = (unsigned char)(ca + 32U);
+        if ((cb >= (unsigned char)'A') && (cb <= (unsigned char)'Z')) cb = (unsigned char)(cb + 32U);
+        if (ca != cb) return 0;
+        a++;
+        b++;
+    }
+    return (*a == *b) ? 1 : 0;
+}
+
 gpio_handle_t gpio_open(const char *name, const gpio_cfg_t *cfg)
 {
     if (name == NULL) return NULL;
     for (uint32_t i = 0; i < g_gpio_count; i++) {
-        if (strcmp(g_gpio_devs[i].name, name) == 0) {
+        if (gpio_name_eq(g_gpio_devs[i].name, name) != 0) {
             /* Idempotent: a GPIO is a shared resource (same semantics as
              * i2c_open/spi_open).  Returning the existing handle lets
              * bus layers (e.g. spi_api CS) open the same pin repeatedly. */

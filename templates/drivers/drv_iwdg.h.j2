@@ -1,3 +1,8 @@
+{# wdg_timeout_ms may be declared at peripheral top level (bootloader injection)
+   or nested under extra (hand-written hardware.yaml). #}
+{% set _wdg_ms = (peripheral.get('wdg_timeout_ms',
+                    peripheral.get('extra', {}).get('wdg_timeout_ms', 5000)) | int) %}
+{% set _reload = [1, [(_wdg_ms // 8), 4095] | min] | max %}
 #ifndef __DRV_IWDG_H
 #define __DRV_IWDG_H
 
@@ -7,8 +12,12 @@
 #include <stdint.h>
 #endif
 
-/* IWDG timeout in milliseconds (derived from peripheral.wdg_timeout_ms, default 5000) */
-#define IWDG_TIMEOUT_MS     {{ peripheral.get('wdg_timeout_ms', 5000) }}U
+/* IWDG timeout in milliseconds, derived from the configured timeout.
+ * This macro and the reload value in drv_iwdg.c are generated from the same
+ * source, so header and implementation cannot drift apart. */
+#define IWDG_TIMEOUT_MS     {{ _wdg_ms }}U
+/* Reload value actually programmed: LSI ~32 kHz / prescaler 256 = 8 ms/tick. */
+#define IWDG_RELOAD_VALUE   {{ _reload }}U
 
 /**
  * @brief   Initialize the Independent Watchdog (IWDG)

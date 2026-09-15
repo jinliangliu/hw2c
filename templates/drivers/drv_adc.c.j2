@@ -4,6 +4,7 @@
 #include "stm32g0xx_hal.h"
 #endif
 #include "drv_{{ peripheral.name }}.h"
+#include "hw2c_fault.h"
 
 #ifndef TEST
 /* Non-static: adc_api.c references h<peripheral> for the POSIX wrapper. */
@@ -28,9 +29,12 @@ void ADC_Init(void) {
     h{{ peripheral.name }}.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
     h{{ peripheral.name }}.Init.DMAContinuousRequests = DISABLE;
     h{{ peripheral.name }}.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-    if (HAL_ADC_Init(&h{{ peripheral.name }}) != HAL_OK) while(1);
+    if (HAL_ADC_Init(&h{{ peripheral.name }}) != HAL_OK) {
+        /* ADC init failure: conversions would silently return stale data. */
+        hw2c_fault_trap(HW2C_FAULT_PERIPH_INIT);
+    }
 #else
-    HAL_ADC_Init(NULL);   /* æµ‹è¯•çŽ¯å¢ƒï¼šè°ƒç”¨ mock å‡½æ•° */
+    HAL_ADC_Init(NULL);   /* test environment: calls the mock function */
 #endif
 }
 

@@ -4,9 +4,14 @@
 
 {# adc driver file is named after the peripheral instance #}
 {% set adc_peri = peripherals | selectattr('type', 'in', ['Internal_ADC']) | first %}
+/* The ADC driver takes the fail-safe path on init failure; the real primitive
+ * lives in hw2c_fault.c and pulls in the actuator drivers, so use the host
+ * stand-in for the symbol (P1-3). */
+#include "fault_trap_stub.c"
+
 #include "../src/drivers/drv_{{ adc_peri.name }}.c"
 
-void setUp(void) {}
+void setUp(void) { host_fault_trap_reset(); }
 void tearDown(void) {}
 
 void test_ADC_Init_calls_HAL_ADC_Init(void) {

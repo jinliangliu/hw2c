@@ -450,6 +450,9 @@ int {{ pid_comp.name }}_get_autotune(int *active, const char **stage,
 int {{ pid_comp.name }}_start_steptune(float duty, float stop_pressure);
 int {{ pid_comp.name }}_get_steptune(int *active, const char **stage,
                                     float *duty, float *stop);
+/* Manual/automatic output arbitration (see pid_ctrl_component.c) */
+int {{ pid_comp.name }}_manual_output_allowed(void);
+const uint8_t *{{ pid_comp.name }}_owned_channels(void);
 int {{ pid_comp.name }}_get_status(float *pressure, float *setpoint,
                                   uint32_t *duty, uint32_t *stage,
                                   uint32_t *fault);
@@ -581,6 +584,28 @@ static void cmd_knob(int argc, char *argv[], cli_output_fn out)
 {% if has_pwm %}
 /* ---- PWM: per-channel duty + frequency ---- */
 {% set pwm_peri = peripherals | selectattr('type', 'eq', 'Internal_PWM') | first %}
+{% if has_pid_ctrl %}
+/*
+ * Is this channel driven by the PID control loop?
+ *
+ * "pwm set" and the PID component write the same PWM channel, so without this
+ * check the command would report success and then be overwritten by the loop
+ * on its next step (or forced back to 0 in the FAULT stage).  The channel list
+ * comes from the component itself, so the actuator wiring in components.yaml
+ * stays the single source of truth.
+ */
+static int pwm_channel_owned_by_pid(unsigned ch)
+{
+    const uint8_t *owned = {{ pid_comp.name }}_owned_channels();
+    while (*owned != 0U) {
+        if ((unsigned)*owned == ch) {
+            return 1;
+        }
+        owned++;
+    }
+    return 0;
+}
+{% endif %}
 static void cmd_pwm(int argc, char *argv[], cli_output_fn out)
 {
     if (argc < 2) {
@@ -600,6 +625,19 @@ static void cmd_pwm(int argc, char *argv[], cli_output_fn out)
             out("Usage: pwm set <ch> <0-100>\r\n");
             return;
         }
+{% if has_pid_ctrl %}
+        /*
+         * The PID loop writes this channel on every step().  Accepting the
+         * command would report success and then be silently overwritten (or
+         * forced to 0 in the FAULT stage), so reject it instead of lying.
+         */
+        if (pwm_channel_owned_by_pid(ch) &&
+            !{{ pid_comp.name }}_manual_output_allowed()) {
+            out("pwm set rejected: CH%u is driven by the PID loop; "
+                "run 'solenoid stop' first\r\n", ch);
+            return;
+        }
+{% endif %}
         if ({{ pwm_peri.name }}_set_duty((uint8_t)ch, pct) == 0) {
             out("CH%u duty -> %u%%\r\n", ch, pct);
         } else {
@@ -611,6 +649,15 @@ static void cmd_pwm(int argc, char *argv[], cli_output_fn out)
             out("Usage: pwm freq <hz>\r\n");
             return;
         }
+{% if has_pid_ctrl %}
+        /* Frequency is global to the timer: refuse while the loop owns the
+         * actuator, otherwise a valve drive characteristic changes mid-loop. */
+        if (!{{ pid_comp.name }}_manual_output_allowed()) {
+            out("pwm freq rejected: PID loop owns the actuator; "
+                "stop it first\r\n");
+            return;
+        }
+{% endif %}
         if ({{ pwm_peri.name }}_set_freq(hz) == 0) {
             out("PWM frequency -> %u Hz (duty preserved)\r\n", hz);
         } else {
@@ -794,17 +841,58 @@ static void cmd_power(int argc, char *argv[], cli_output_fn out)
         }
         power_mgr_set_default(m);
         out("Power mode set to %s\r\n", power_mode_name(m));
+        /*
+         * Setting the default does not mean the depth can actually be
+         * entered: the sleep_compat limits of the running components decide
+         * that.  Report it here instead of failing silently at sleep time.
+         */
+        if (!power_mgr_is_mode_allowed(m)) {
+            out("Note: blocked by %lu active component(s); allowed depth is %s.\r\n",
+                (unsigned long)power_mgr_blocking_count(m),
+                power_mode_name(power_mgr_allowed_depth()));
+        }
     } else if (strcmp(argv[1], "sleep") == 0) {
-        /* Explicit debug path: enter the mode selected with "power mode".
-         * (The automatic tickless path uses power_mgr_allowed_depth().) */
+        /*
+         * Explicit debug path: enter the mode selected with "power mode".
+         * (The automatic tickless path uses power_mgr_allowed_depth().)
+         *
+         * Three checks, because this command used to report a successful
+         * STOP1 entry even when the core never left RUN:
+         *   1. the requested depth must be one this build can enter at all;
+         *   2. it must be permitted by the sleep_compat limits of the active
+         *      components — this is the consumer of that interlock, which was
+         *      otherwise declared in components.yaml and never enforced;
+         *   3. power_sleep_now() must report a non-skipped result.
+         */
         power_mode_t m = power_mgr_get_default();
         if (m == POWER_MODE_RUN) {
             out("Allowed depth is RUN - nothing to sleep into.\r\n");
             return;
         }
+        if (m > POWER_MODE_STOP1) {
+            out("%s is not implemented on this MCU (use RUN/SLEEP/STOP0/STOP1).\r\n",
+                power_mode_name(m));
+            return;
+        }
+        if (!power_mgr_is_mode_allowed(m)) {
+            out("Refused: %s is blocked by %lu active component(s).\r\n",
+                power_mode_name(m),
+                (unsigned long)power_mgr_blocking_count(m));
+            out("Allowed depth is %s (see: power info).\r\n",
+                power_mode_name(power_mgr_allowed_depth()));
+            return;
+        }
+
         out("Entering %s (wake by RTC 1s / UART RX / button)...\r\n",
             power_mode_name(m));
         uint32_t elapsed = power_sleep_now(m);
+        if (elapsed == POWER_SLEEP_SKIPPED) {
+            /* No low-power entry path in this build (it was generated without
+             * tickless idle).  Claiming a wake-up time here would be false. */
+            out("Not entered: this build has no low-power path "
+                "(generated without tickless idle).\r\n");
+            return;
+        }
         /* Note: the RTC calendar (authoritative system time) and the HAL
          * tick are compensated inside power_sleep_now(). The FreeRTOS tick
          * is intentionally not stepped here (vTaskStepTick() is only valid

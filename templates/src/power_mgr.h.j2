@@ -85,15 +85,25 @@ power_mode_t power_mgr_get_default(void);
 power_mode_t power_mgr_allowed_depth(void);
 
 /**
- * @brief  Enter one low-power mode immediately and return after wakeup.
+ * @brief Enter one low-power mode immediately and return after wakeup.
  * @param  mode  POWER_MODE_SLEEP / STOP0 / STOP1
- * @return Elapsed ms spent sleeping (RTC-measured), 0 if skipped
+ * @return Elapsed ms spent sleeping (RTC-measured), or POWER_SLEEP_SKIPPED
+ *         when the core did NOT sleep at all.
+ *
+ * The two outcomes must be distinguishable: a build compiled without tickless
+ * idle has only a stub, and reporting "slept 0 ms" from it is a lie that hides
+ * the missing implementation.  Callers must therefore test for
+ * POWER_SLEEP_SKIPPED before reporting a sleep (see the CLI "power sleep"
+ * command).
  *
  * RTC keeps counting on LSE; USART2 start-bit and EXTI wake the core from
  * STOP. HAL tick and FreeRTOS tick are compensated so time stays exact.
  * Implemented in tickless_idle.c (or sleep.c stub).
  */
 uint32_t power_sleep_now(power_mode_t mode);
+
+/** @brief Return value of power_sleep_now() when no sleep was entered. */
+#define POWER_SLEEP_SKIPPED  0xFFFFFFFFUL
 
 /**
  * @brief  Check if a target sleep mode is compatible with active components

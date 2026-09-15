@@ -1,6 +1,11 @@
 #ifndef __DRV_{{ peripheral.name | upper }}_H
 #define __DRV_{{ peripheral.name | upper }}_H
 
+/* <stdbool.h> must be included explicitly: this module exposes and uses
+ * "bool".  Relying on another header to pull it in only worked by accident
+ * under C23 (where "bool" is a keyword) and broke under -std=c99. */
+#include <stdbool.h>
+
 #ifndef TEST
 #include "stm32g0xx_hal.h"
 #endif

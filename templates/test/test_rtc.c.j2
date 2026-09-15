@@ -5,11 +5,17 @@
 /* Provide event_queue symbol used by drv_rtc.c callbacks */
 QueueHandle_t event_queue = NULL;
 
+/* drv_rtc.c takes the fail-safe path when the RTC cannot be brought up; the
+ * real primitive lives in hw2c_fault.c and pulls in the actuator drivers, so
+ * the host stand-in provides the symbol (P1-3). */
+#include "fault_trap_stub.c"
+
 /* Include the RTC driver source directly */
 #include "../src/drivers/drv_rtc.c"
 
 void setUp(void) {
     mock_HAL_RTC_Init_reset();
+    host_fault_trap_reset();
 }
 
 void tearDown(void) {}

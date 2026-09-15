@@ -44,6 +44,13 @@ static pwm_channel_t g_pwm_channels[PWM_CHANNEL_COUNT] = {
 {% endfor %}
 };
 
+/*
+ * Requested switching frequency.  Kept as state rather than applied
+ * immediately, so a set_freq() issued before init() is not silently dropped:
+ * init() programmes the timer from this value.
+ */
+static uint32_t g_freq_hz = PWM_DEFAULT_FREQ_HZ;
+
 /* ---- helpers ---- */
 static uint32_t pwm_channel_mask(uint8_t channel)
 {
@@ -72,8 +79,32 @@ static uint32_t pwm_pulse_from_percent(uint32_t percent)
     return (uint32_t)(((uint64_t)(htim_{{ peripheral.name }}.Init.Period + 1U) * percent) / 100U);
 }
 
+/*
+ * Is the timer bound to its peripheral yet?
+ *
+ * hw2c_safe_state() runs from the fail-safe path, which can be entered before
+ * this driver is initialised - a clock or peripheral bring-up fault, or a
+ * HardFault raised during start-up.  The __HAL_TIM_* macros dereference
+ * htim.Instance, so without this guard the "de-energise the outputs" step would
+ * itself fault inside the fault handler: the system would lock up with the
+ * actuator still driven, i.e. worse than not attempting the safe state at all.
+ *
+ * Instance is assigned before HAL_TIM_PWM_Init(), so a failure *during* init
+ * leaves the driver "ready" on purpose: the timer clock is already enabled and
+ * de-energising a half-initialised channel is exactly what we want.
+ */
+static int pwm_ready(void)
+{
+    return (htim_{{ peripheral.name }}.Instance != NULL) ? 1 : 0;
+}
+
 static void pwm_reprogram(pwm_channel_t *c)
 {
+    if (pwm_ready() == 0) {
+        /* Nothing is being driven, so there is no compare value to write. */
+        c->pulse = 0U;
+        return;
+    }
     c->pulse = pwm_pulse_from_percent(c->percent);
     __HAL_TIM_SET_COMPARE(&htim_{{ peripheral.name }},
                           pwm_channel_mask(c->channel), c->pulse);
@@ -89,7 +120,7 @@ int {{ peripheral.name }}_init(void)
 
     htim_{{ peripheral.name }}.Instance = {{ timer }};
     htim_{{ peripheral.name }}.Init.Prescaler = PWM_PRESCALER;
-    htim_{{ peripheral.name }}.Init.Period = PWM_TICK_HZ / PWM_DEFAULT_FREQ_HZ - 1U;
+    htim_{{ peripheral.name }}.Init.Period = PWM_TICK_HZ / g_freq_hz - 1U;
     htim_{{ peripheral.name }}.Init.CounterMode = TIM_COUNTERMODE_UP;
     htim_{{ peripheral.name }}.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     htim_{{ peripheral.name }}.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -150,6 +181,11 @@ int {{ peripheral.name }}_set_freq(uint32_t freq_hz)
     if (freq_hz < PWM_MIN_FREQ_HZ || freq_hz > PWM_MAX_FREQ_HZ) {
         return -1;
     }
+    g_freq_hz = freq_hz;
+    if (pwm_ready() == 0) {
+        /* Recorded; init() programmes the timer from g_freq_hz. */
+        return 0;
+    }
     htim_{{ peripheral.name }}.Init.Period = PWM_TICK_HZ / freq_hz - 1U;
     __HAL_TIM_SET_AUTORELOAD(&htim_{{ peripheral.name }},
                              htim_{{ peripheral.name }}.Init.Period);
@@ -167,6 +203,9 @@ int {{ peripheral.name }}_start(uint8_t channel)
     if (c == NULL) {
         return -1;
     }
+    if (pwm_ready() == 0) {
+        return -3;   /* driver not initialised: cannot drive the pin */
+    }
     mask = pwm_channel_mask(c->channel);
     if (HAL_TIM_PWM_Start(&htim_{{ peripheral.name }}, mask) != HAL_OK) {
         return -2;
@@ -181,6 +220,12 @@ int {{ peripheral.name }}_stop(uint8_t channel)
     uint32_t mask;
     if (c == NULL) {
         return -1;
+    }
+    if (pwm_ready() == 0) {
+        /* The channel was never driven, so it is already inactive - reporting
+         * a failure here would make the fail-safe path look unsuccessful. */
+        c->running = 0U;
+        return 0;
     }
     mask = pwm_channel_mask(c->channel);
     if (HAL_TIM_PWM_Stop(&htim_{{ peripheral.name }}, mask) != HAL_OK) {

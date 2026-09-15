@@ -251,6 +251,13 @@ void adc_mock_reset_all(void)
 }
 
 {% if has_i2c %}
+{% set i2c_buses = [] %}
+{% for p in peripherals if 'I2C' in p.model.interface %}
+{% if p.bus not in i2c_buses %}
+{% set _ = i2c_buses.append(p.bus) %}
+{% endif %}
+{% endfor %}
+
 /* ---- I2C mock ----
  * In-memory replacement for i2c_api.  One bus handle per physical bus;
  * several slave devices (by 7-bit address) can live on the same bus.
@@ -258,7 +265,7 @@ void adc_mock_reset_all(void)
  * mpu6050 component's init() succeeds out of the box.
  * =================================================================== */
 
-#define MOCK_I2C_MAX_BUSES   2
+#define MOCK_I2C_MAX_BUSES   {{ [2, i2c_buses | length] | max }}
 #define MOCK_I2C_MAX_DEVICES 8
 #define MOCK_I2C_MEM_SIZE    128
 
@@ -276,23 +283,55 @@ static struct i2c_dev g_i2c_buses[MOCK_I2C_MAX_BUSES];
 static uint32_t g_i2c_read_calls  = 0;
 static uint32_t g_i2c_write_calls = 0;
 
+/* Buses that actually exist in this build — mirrors the registry generated in
+ * src/drivers/i2c_api.c.  i2c_open() resolves against these only, so an
+ * undeclared or misspelled bus name fails here exactly as it does on target.
+ * (The mock used to create a bus on demand, which silently swallowed bus-name
+ *  mismatches — see docs/reviews/code-review-2026-09-15-misra-c99.md P0-1.) */
+static const char *const g_i2c_bus_names[] = {
+{% for bus in i2c_buses %}
+    "{{ bus | lower }}",
+{% endfor %}
+};
+static const uint32_t g_i2c_bus_name_count = {{ i2c_buses | length }};
+
+/* Case-insensitive, matching i2c_open() on target. */
+static int i2c_mock_name_eq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if ((ca >= (unsigned char)'A') && (ca <= (unsigned char)'Z')) ca = (unsigned char)(ca + 32U);
+        if ((cb >= (unsigned char)'A') && (cb <= (unsigned char)'Z')) cb = (unsigned char)(cb + 32U);
+        if (ca != cb) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return (*a == *b) ? 1 : 0;
+}
+
 static struct i2c_dev *i2c_mock_find_bus(const char *name)
 {
+    if (name == NULL) {
+        return NULL;
+    }
     for (int i = 0; i < MOCK_I2C_MAX_BUSES; i++) {
         if (g_i2c_buses[i].name[0] != '\0' &&
-            strcmp(g_i2c_buses[i].name, name) == 0) {
+            i2c_mock_name_eq(g_i2c_buses[i].name, name) != 0) {
             return &g_i2c_buses[i];
         }
     }
     return NULL;
 }
 
-static struct i2c_dev *i2c_mock_alloc_bus(const char *name)
+/* Only ever used to materialise the static registry above. */
+static struct i2c_dev *i2c_mock_create_bus(const char *name)
 {
-    struct i2c_dev *b = i2c_mock_find_bus(name);
-    if (b != NULL) {
-        return b;
-    }
     for (int i = 0; i < MOCK_I2C_MAX_BUSES; i++) {
         if (g_i2c_buses[i].name[0] == '\0') {
             strncpy(g_i2c_buses[i].name, name, sizeof(g_i2c_buses[i].name) - 1);
@@ -301,6 +340,15 @@ static struct i2c_dev *i2c_mock_alloc_bus(const char *name)
         }
     }
     return NULL;
+}
+
+static void i2c_mock_seed_buses(void)
+{
+    for (uint32_t i = 0; i < g_i2c_bus_name_count; i++) {
+        if (i2c_mock_find_bus(g_i2c_bus_names[i]) == NULL) {
+            (void)i2c_mock_create_bus(g_i2c_bus_names[i]);
+        }
+    }
 }
 
 static uint8_t *i2c_mock_find_mem(struct i2c_dev *b, uint8_t addr)
@@ -320,7 +368,9 @@ i2c_handle_t i2c_open(const char *bus_name, const i2c_cfg_t *cfg)
     if (bus_name == NULL) {
         return NULL;
     }
-    b = i2c_mock_alloc_bus(bus_name);
+    /* Registry lookup only — no on-demand creation, so this behaves exactly
+     * like the target implementation in src/drivers/i2c_api.c. */
+    b = i2c_mock_find_bus(bus_name);
     if (b == NULL) {
         return NULL;
     }
@@ -433,7 +483,9 @@ int32_t i2c_scan(i2c_handle_t h, uint8_t *found, uint32_t max_count, uint32_t tr
 void i2c_mock_add_device(const char *bus_name, uint8_t addr,
                          const uint8_t *init, uint32_t len)
 {
-    struct i2c_dev *b = i2c_mock_alloc_bus(bus_name);
+    /* Attach to an existing bus only.  Adding a device must not conjure up a
+     * bus that the firmware itself cannot open (see P0-1). */
+    struct i2c_dev *b = i2c_mock_find_bus(bus_name);
     if (b == NULL) {
         return;
     }
@@ -480,6 +532,8 @@ void i2c_mock_reset_all(void)
     memset(g_i2c_buses, 0, sizeof(g_i2c_buses));
     g_i2c_read_calls  = 0;
     g_i2c_write_calls = 0;
+    /* Re-seed the buses that exist in this build (mirrors i2c_api.c) */
+    i2c_mock_seed_buses();
     /* Preload a default MPU6050 so component init() succeeds */
     i2c_mock_add_device("i2c1", 0x68, NULL, 0);
     i2c_mock_set_reg("i2c1", 0x68, 0x75, 0x68);
@@ -489,6 +543,13 @@ void i2c_mock_reset_all(void)
 {% endif %}
 
 {% if has_spi %}
+{% set spi_buses = [] %}
+{% for p in peripherals if 'SPI' in p.model.interface %}
+{% if p.bus not in spi_buses %}
+{% set _ = spi_buses.append(p.bus) %}
+{% endif %}
+{% endfor %}
+
 /* ---- SPI mock ----
  * In-memory replacement for spi_api.  Single-device register model
  * (MPU6500-style): first TX byte is the register address with R/W in
@@ -496,7 +557,7 @@ void i2c_mock_reset_all(void)
  * component's init() succeeds out of the box.
  * =================================================================== */
 
-#define MOCK_SPI_MAX_BUSES 2
+#define MOCK_SPI_MAX_BUSES {{ [2, spi_buses | length] | max }}
 #define MOCK_SPI_MEM_SIZE 128
 
 struct spi_dev {
@@ -509,23 +570,49 @@ static struct spi_dev g_spi_buses[MOCK_SPI_MAX_BUSES];
 static uint32_t g_spi_read_calls  = 0;
 static uint32_t g_spi_write_calls = 0;
 
+/* Buses that exist in this build — mirrors spi_api.c (see the I2C note above). */
+static const char *const g_spi_bus_names[] = {
+{% for bus in spi_buses %}
+    "{{ bus | lower }}",
+{% endfor %}
+};
+static const uint32_t g_spi_bus_name_count = {{ spi_buses | length }};
+
+static int spi_mock_name_eq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if ((ca >= (unsigned char)'A') && (ca <= (unsigned char)'Z')) ca = (unsigned char)(ca + 32U);
+        if ((cb >= (unsigned char)'A') && (cb <= (unsigned char)'Z')) cb = (unsigned char)(cb + 32U);
+        if (ca != cb) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return (*a == *b) ? 1 : 0;
+}
+
 static struct spi_dev *spi_mock_find_bus(const char *name)
 {
+    if (name == NULL) {
+        return NULL;
+    }
     for (int i = 0; i < MOCK_SPI_MAX_BUSES; i++) {
         if (g_spi_buses[i].name[0] != '\0' &&
-            strcmp(g_spi_buses[i].name, name) == 0) {
+            spi_mock_name_eq(g_spi_buses[i].name, name) != 0) {
             return &g_spi_buses[i];
         }
     }
     return NULL;
 }
 
-static struct spi_dev *spi_mock_alloc_bus(const char *name)
+static struct spi_dev *spi_mock_create_bus(const char *name)
 {
-    struct spi_dev *b = spi_mock_find_bus(name);
-    if (b != NULL) {
-        return b;
-    }
     for (int i = 0; i < MOCK_SPI_MAX_BUSES; i++) {
         if (g_spi_buses[i].name[0] == '\0') {
             strncpy(g_spi_buses[i].name, name,
@@ -537,6 +624,15 @@ static struct spi_dev *spi_mock_alloc_bus(const char *name)
     return NULL;
 }
 
+static void spi_mock_seed_buses(void)
+{
+    for (uint32_t i = 0; i < g_spi_bus_name_count; i++) {
+        if (spi_mock_find_bus(g_spi_bus_names[i]) == NULL) {
+            (void)spi_mock_create_bus(g_spi_bus_names[i]);
+        }
+    }
+}
+
 spi_handle_t spi_open(const char *bus_name, const spi_cfg_t *cfg)
 {
     struct spi_dev *b;
@@ -544,7 +640,8 @@ spi_handle_t spi_open(const char *bus_name, const spi_cfg_t *cfg)
     if (bus_name == NULL) {
         return NULL;
     }
-    b = spi_mock_alloc_bus(bus_name);
+    /* Registry lookup only — same semantics as spi_api.c on target. */
+    b = spi_mock_find_bus(bus_name);
     if (b == NULL) {
         return NULL;
     }
@@ -658,10 +755,16 @@ uint32_t spi_mock_write_count(void) { return g_spi_write_calls; }
 
 void spi_mock_reset_all(void)
 {
+    struct spi_dev *b;
     memset(g_spi_buses, 0, sizeof(g_spi_buses));
     g_spi_read_calls  = 0;
     g_spi_write_calls = 0;
+    /* Re-seed the buses that exist in this build (mirrors spi_api.c) */
+    spi_mock_seed_buses();
     /* Preload a default MPU6500 so the imu component init() succeeds */
-    spi_mock_alloc_bus("spi1")->mem[0x75] = 0x70;
+    b = spi_mock_find_bus("spi1");
+    if (b != NULL) {
+        b->mem[0x75] = 0x70;
+    }
 }
 {% endif %}

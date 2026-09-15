@@ -79,7 +79,7 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
     (void)cfg;
 
 {% if is_spi %}
-    ctx->bus = spi_open("{{ bus_name }}", NULL);
+    ctx->bus = spi_open("{{ bus_name | lower }}", NULL);
     if (ctx->bus == NULL) {
         return -1;
     }
@@ -89,7 +89,7 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
         return -1;
     }
 {% else %}
-    ctx->bus = i2c_open("{{ bus_name }}", NULL);
+    ctx->bus = i2c_open("{{ bus_name | lower }}", NULL);
     if (ctx->bus == NULL) {
         return -1;
     }

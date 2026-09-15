@@ -1,0 +1,172 @@
+{#
+    test_hw2c_fault.c.j2 - host tests for the fail-safe fault primitive
+
+    These tests pin the behaviour that replaced the old "while (1) {}" error
+    paths (P1-3 of docs/reviews/code-review-2026-09-15-misra-c99.md):
+      - the outputs are actually forced inactive, not just left as they were;
+      - the reason is recorded;
+      - a reset is requested so recovery is possible.
+#}
+#include "unity.h"
+#include "mock_hal.h"
+
+/* The PWM drivers are included first: hw2c_safe_state() calls into them, and
+ * the test translation unit must provide those symbols. */
+{% set pwm_peris = peripherals | selectattr('type', 'eq', 'Internal_PWM') | list %}
+{% for p in pwm_peris %}
+#include "../src/drivers/drv_{{ p.name }}.c"
+{% endfor %}
+#include "../src/hw2c_fault.c"
+
+/*
+ * g_fault_record is file-static in the included hw2c_fault.c, so this test is
+ * part of the same translation unit and can reset the record for isolation.
+ */
+static void fault_record_reset(void)
+{
+    g_fault_record.magic = 0U;
+    g_fault_record.code = HW2C_FAULT_NONE;
+    g_fault_record.reset_count = 0U;
+}
+
+void setUp(void)
+{
+    fault_record_reset();
+    mock_NVIC_SystemReset_reset();
+{% if pwm_peris | length > 0 %}
+    mock_tim_reset();
+{% endif %}
+}
+
+void tearDown(void)
+{
+}
+
+/* A fresh device must not report a fault. */
+void test_fault_initially_none(void)
+{
+    TEST_ASSERT_EQUAL_UINT32(HW2C_FAULT_NONE, hw2c_fault_last());
+    TEST_ASSERT_EQUAL_UINT32(0U, hw2c_fault_reset_count());
+}
+
+/* Trapping must request a reset, not spin forever with live outputs. */
+void test_fault_trap_requests_reset(void)
+{
+    hw2c_fault_trap(HW2C_FAULT_HARDFAULT);
+    TEST_ASSERT_TRUE(mock_NVIC_SystemReset_called());
+}
+
+/* The reason must be recorded so the next boot can report it. */
+void test_fault_trap_records_reason(void)
+{
+    hw2c_fault_trap(HW2C_FAULT_PERIPH_INIT);
+    TEST_ASSERT_EQUAL_UINT32(HW2C_FAULT_PERIPH_INIT, hw2c_fault_last());
+    TEST_ASSERT_EQUAL_UINT32(1U, hw2c_fault_reset_count());
+}
+
+/* Repeated faults must keep counting, which is what exposes a reset loop. */
+void test_fault_trap_counts_occurrences(void)
+{
+    hw2c_fault_trap(HW2C_FAULT_SCHEDULER);
+    hw2c_fault_trap(HW2C_FAULT_SCHEDULER);
+    hw2c_fault_trap(HW2C_FAULT_SCHEDULER);
+    TEST_ASSERT_EQUAL_UINT32(3U, hw2c_fault_reset_count());
+    TEST_ASSERT_EQUAL_UINT32(HW2C_FAULT_SCHEDULER, hw2c_fault_last());
+}
+
+/* Acknowledging the reason must not erase the reset-loop evidence. */
+void test_fault_clear_keeps_counter(void)
+{
+    hw2c_fault_trap(HW2C_FAULT_NMI);
+    hw2c_fault_clear();
+    TEST_ASSERT_EQUAL_UINT32(HW2C_FAULT_NONE, hw2c_fault_last());
+    TEST_ASSERT_EQUAL_UINT32(1U, hw2c_fault_reset_count());
+}
+
+{% if pwm_peris | length > 0 %}
+/*
+ * The whole point of the safe state: every actuator output is driven to 0 %
+ * and stopped.  The previous revision left the PWM running at its last duty
+ * while spinning, so a solenoid valve stayed energised.
+ */
+void test_safe_state_zeroes_and_stops_pwm(void)
+{
+{% for p in pwm_peris %}
+{%- set _pe = p.get('extra', {}) %}
+{%- set _model = p.get('model', {}) %}
+{%- set _chans = _pe.get('channels')
+        if _pe.get('channels')
+        else (_model.get('channels')
+              if _model.get('channels')
+              else [{'channel': _pe.get('channel', _model.get('channel', 1))}]) %}
+{% for ch in _chans %}
+    {{ p.name }}_init();
+    TEST_ASSERT_EQUAL_INT(0, {{ p.name }}_set_duty({{ ch.get('channel', 1) }}, 60U));
+    TEST_ASSERT_EQUAL_UINT32(60U, {{ p.name }}_get_duty({{ ch.get('channel', 1) }}));
+{% endfor %}
+{% endfor %}
+
+    hw2c_safe_state();
+
+{% for p in pwm_peris %}
+{%- set _pe = p.get('extra', {}) %}
+{%- set _model = p.get('model', {}) %}
+{%- set _chans = _pe.get('channels')
+        if _pe.get('channels')
+        else (_model.get('channels')
+              if _model.get('channels')
+              else [{'channel': _pe.get('channel', _model.get('channel', 1))}]) %}
+{% for ch in _chans %}
+    TEST_ASSERT_EQUAL_UINT32(0U, {{ p.name }}_get_duty({{ ch.get('channel', 1) }}));
+{% endfor %}
+{% endfor %}
+}
+
+/* The trap must apply the safe state before requesting the reset. */
+void test_fault_trap_forces_safe_state(void)
+{
+{% for p in pwm_peris %}
+{%- set _pe = p.get('extra', {}) %}
+{%- set _chans = _pe.get('channels') if _pe.get('channels') else [{'channel': _pe.get('channel', 1)}] %}
+{% for ch in _chans %}
+    {{ p.name }}_init();
+    (void){{ p.name }}_set_duty({{ ch.get('channel', 1) }}, 80U);
+{% endfor %}
+{% endfor %}
+
+    hw2c_fault_trap(HW2C_FAULT_HARDFAULT);
+
+{% for p in pwm_peris %}
+{%- set _pe = p.get('extra', {}) %}
+{%- set _chans = _pe.get('channels') if _pe.get('channels') else [{'channel': _pe.get('channel', 1)}] %}
+{% for ch in _chans %}
+    TEST_ASSERT_EQUAL_UINT32(0U, {{ p.name }}_get_duty({{ ch.get('channel', 1) }}));
+{% endfor %}
+{% endfor %}
+    TEST_ASSERT_TRUE(mock_NVIC_SystemReset_called());
+}
+{% else %}
+/* No PWM actuator in this build: the safe state must still be callable. */
+void test_safe_state_callable_without_actuators(void)
+{
+    hw2c_safe_state();
+    TEST_ASSERT_FALSE(mock_NVIC_SystemReset_called());
+}
+{% endif %}
+
+int main(void)
+{
+    UNITY_BEGIN();
+    RUN_TEST(test_fault_initially_none);
+    RUN_TEST(test_fault_trap_requests_reset);
+    RUN_TEST(test_fault_trap_records_reason);
+    RUN_TEST(test_fault_trap_counts_occurrences);
+    RUN_TEST(test_fault_clear_keeps_counter);
+{% if pwm_peris | length > 0 %}
+    RUN_TEST(test_safe_state_zeroes_and_stops_pwm);
+    RUN_TEST(test_fault_trap_forces_safe_state);
+{% else %}
+    RUN_TEST(test_safe_state_callable_without_actuators);
+{% endif %}
+    return UNITY_END();
+}

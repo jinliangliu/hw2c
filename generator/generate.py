@@ -27,7 +27,7 @@ from .jinja_filters import register_filters
 from .merger import CSTCodeMerger
 from .models import HardwareModel
 from .mcu_database import MCUDatabase
-from .paths import STATIC_UNITY_DIR, STATIC_STM32_DIR, HIL_RUNNER_PATH, RUN_TESTS_PATH, PATCH_CRC_PATH, TIMEBASE_SRC, TEMPLATES_DIR
+from .paths import STATIC_UNITY_DIR, HIL_RUNNER_PATH, RUN_TESTS_PATH, PATCH_CRC_PATH, TIMEBASE_SRC, TEMPLATES_DIR
 from .registry import load_backend, get_default_backend
 from .validators.pin_conflict_validator import validate_pin_conflicts
 from .allocators.pin_allocator import PinAllocator
@@ -175,6 +175,8 @@ def render_templates(env: Environment, context: dict, output_dir: str,
         "src/main.c.j2": os.path.join(output_dir, "src", "main.c"),
         "src/gpio.c.j2": os.path.join(output_dir, "src", "gpio.c"),
         "src/sleep.c.j2": os.path.join(output_dir, "src", "sleep.c"),
+        "src/hw2c_fault.h.j2": os.path.join(output_dir, "src", "hw2c_fault.h"),
+        "src/hw2c_fault.c.j2": os.path.join(output_dir, "src", "hw2c_fault.c"),
         "src/stm32g0xx_it.c.j2": os.path.join(output_dir, "src", "stm32g0xx_it.c"),
         "config/FreeRTOSConfig.h.j2": os.path.join(output_dir, "config", "FreeRTOSConfig.h"),
         "config/stm32g0xx_hal_conf.h.j2": os.path.join(output_dir, "config", "stm32g0xx_hal_conf.h"),
@@ -512,6 +514,9 @@ def render_templates(env: Environment, context: dict, output_dir: str,
     mock_templates = {
         "test/mock_hal.h.j2": os.path.join(test_dir, "mock_hal.h"),
         "test/mock_hal.c.j2": os.path.join(test_dir, "mock_hal.c"),
+        # Host stand-in for hw2c_fault_trap(), #included by test units that
+        # exercise a module taking the fail-safe path (event_mgr, drv_rtc).
+        "test/fault_trap_stub.c.j2": os.path.join(test_dir, "fault_trap_stub.c"),
     }
     for tmpl_name, out_path in mock_templates.items():
         template = env.get_template(tmpl_name)
@@ -521,7 +526,16 @@ def render_templates(env: Environment, context: dict, output_dir: str,
     # 测试用例模板（根据外设动态生成）
     test_templates = {
         "test/test_gpio.c.j2": os.path.join(test_dir, "test_gpio.c"),
+        # hw2c_fault.c is always generated, so its fail-safe contract test is
+        # always generated too (see P1-3 of the 2026-09-15 code review).
+        "test/test_hw2c_fault.c.j2": os.path.join(test_dir, "test_hw2c_fault.c"),
     }
+
+    # test_iwdg exercises the driver file named after the declared peripheral,
+    # so it can only be emitted when Internal_IWDG is declared explicitly.
+    if any(p.get("type") == "Internal_IWDG"
+           for p in context.get("peripherals", [])):
+        test_templates["test/test_iwdg.c.j2"] = os.path.join(test_dir, "test_iwdg.c")
 
     if context.get("has_rtc"):
         test_templates["test/test_rtc.c.j2"] = os.path.join(test_dir, "test_rtc.c")
@@ -1290,9 +1304,6 @@ def main():
 
     _setup_logging(verbose=args.verbose)
 
-    if not args.dry_run:
-        _apply_vendored_patches()
-
     generate(args.input, args.output, args.hil,
              dry_run=args.dry_run, show_diff=args.diff, force=args.force,
              target=args.target, validate_pins=not args.no_validate_pins,
@@ -1301,42 +1312,6 @@ def main():
              components_yaml_path=args.components,
              pubsub_yaml_path=args.pubsub,
              params_yaml_path=args.params)
-
-
-def _apply_vendored_patches() -> None:
-    """Apply hw2c patches to vendored submodules at generation time.
-
-    FreeRTOS ARMv6-M port (V11): ulCriticalNesting is initialized to the
-    poison value 0xAAAAAAAA.  taskENTER_CRITICAL/taskEXIT_CRITICAL used
-    before xPortStartScheduler() (heap_4 malloc from pre-scheduler
-    xQueueCreate/xTaskCreate) can then never reach nesting 0 and leave
-    PRIMASK=1, freezing HAL_GetTick()-based waits (LSE startup, I2C NACK
-    timeout) and hanging boot.  Revert to V10 semantics (0).
-
-    The patch lives in the parent repo (applied on every generation)
-    because the submodule points at the upstream FreeRTOS repository,
-    which cannot accept local commits.  Idempotent.
-    """
-    port_c = os.path.join(STATIC_STM32_DIR, "FreeRTOS-Kernel",
-                          "portable", "GCC", "ARM_CM0", "port.c")
-    if not os.path.exists(port_c):
-        logger.warning("FreeRTOS ARM_CM0 port.c not found at %s; patch skipped", port_c)
-        return
-    with open(port_c, "r", encoding="utf-8") as fh:
-        text = fh.read()
-    poison = "= 0xaaaaaaaaUL;"
-    if poison in text:
-        text = text.replace(
-            poison,
-            "= 0UL;   /* hw2c: V10 semantics (poison value wedges PRIMASK "
-            "in pre-scheduler critical sections) */",
-            1,
-        )
-        with open(port_c, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        logger.info("Applied FreeRTOS ARM_CM0 port.c patch (ulCriticalNesting -> 0)")
-    else:
-        logger.info("FreeRTOS ARM_CM0 port.c already patched")
 
 
 if __name__ == "__main__":

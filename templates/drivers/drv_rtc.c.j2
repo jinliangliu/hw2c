@@ -18,6 +18,7 @@
 
 #include "drv_{{ peripheral.name }}.h"
 #include "event_mgr.h"
+#include "hw2c_fault.h"
 
 #ifdef TEST
 /* Test stubs - internal helpers are target-build only. */
@@ -32,7 +33,13 @@ static uint32_t rtc_calc_next_cyclic(uint32_t period_sec, uint8_t mode)
 /* ---------- private globals ---------- */
 RTC_HandleTypeDef hrtc;
 static bool      rtc_ready            = false;
-uint32_t  rtc_uptime_sec       = 0;      /* monotonic, increment in WakeUp 1s ISR */
+/* volatile: written from the WakeUp 1s ISR, read from task context.  Without
+ * it the compiler may cache the value in a register across a task loop, and
+ * any "did the tick advance?" style check silently stops working (see
+ * docs/reviews/code-review-2026-09-15-misra-c99.md P2-1).  A 32-bit aligned
+ * load/store is a single instruction on Cortex-M0+, so no critical section is
+ * needed for the counter itself. */
+volatile uint32_t rtc_uptime_sec       = 0;      /* monotonic, increment in WakeUp 1s ISR */
 static uint32_t  rtc_init_sec_of_day  = 0;      /* RTC sec-of-day when uptime was 0 */
 
 /* ---------- sorted timer list (ASC by deadline_sec) ---------- */
@@ -126,10 +133,40 @@ static void rtc_arm_alarm_b(void);
  *  硬件实现区域
  * ======================================================================== */
 
+/*
+ * Acknowledge every RTC interrupt flag at once.
+ *
+ * This part's flag register is read-only; a flag is cleared by writing 1
+ * to the matching bit of SCR (SCR itself is not write protected - the HAL
+ * IRQ handlers clear flags without touching WPR).
+ *
+ * Clearing only a subset is a boot-hang trap: while ANY enabled source is
+ * still flagged the RTC interrupt line stays asserted, so the handler is
+ * re-entered immediately and never returns to main().  Measured on target
+ * with the millisecond one-shot timers (they arm Alarm B, which can fire
+ * before the scheduler is up): SR = MISR = 0x02 (ALRBF) with SCR = 0, and
+ * the boot log stopped right after "statemachine_init() OK" - the CPU
+ * spent 100% of its time inside RTC_TAMP_IRQHandler and main() never
+ * reached vTaskStartScheduler().
+ */
+#define RTC_CLEAR_ALL_FLAGS_MASK   (RTC_SCR_CALRAF | RTC_SCR_CALRBF | \
+                                    RTC_SCR_CWUTF  | RTC_SCR_CTSF   | \
+                                    RTC_SCR_CTSOVF | RTC_SCR_CITSF)
+
+static void rtc_clear_all_flags(void)
+{
+    __HAL_RTC_CLEAR_FLAG(&hrtc, RTC_CLEAR_ALL_FLAGS_MASK);
+}
+
 static void Error_Handler(void)
 {
-    __disable_irq();
-    while (1) {}
+    /*
+     * The RTC is this firmware's only monotonic time base: if it cannot be
+     * configured, every control period, timeout and telemetry interval is
+     * meaningless.  De-energise the outputs and reset instead of spinning
+     * with live PWM outputs (see hw2c_fault.h).
+     */
+    hw2c_fault_trap(HW2C_FAULT_PERIPH_INIT);
 }
 
 /*
@@ -363,9 +400,13 @@ void RTC_Init(void)
     }
     __HAL_RTC_WRITEPROTECTION_ENABLE(&hrtc);
 
-    /* clear stale flags from backup-domain-preserved state */
-    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
-    __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);
+    /*
+     * Clear every stale flag left in the backup domain by a previous run.
+     * They survive a system reset, so a partial clear can leave an
+     * unwanted source asserted for the whole boot (see
+     * rtc_clear_all_flags()).
+     */
+    rtc_clear_all_flags();
 
 {% if rtc_init_time %}
     /* set initial RTC calendar time */
@@ -390,14 +431,19 @@ void RTC_Init(void)
     /*
      * Disarm leftover backup-domain wakeup/alarm state BEFORE enabling
      * the RTC interrupt.  The backup domain survives system resets, so a
-     * stale WUTF/ALRAF (or an alarm whose deadline already passed) would
-     * make the priority-0 RTC ISR fire during boot, before the scheduler
-     * is up, and preempt critical init.
+     * stale flag, a still-enabled channel interrupt, or an alarm whose
+     * deadline already passed would make the priority-0 RTC ISR fire
+     * during boot, before the scheduler is up, and preempt critical init.
+     * Every channel disabled here is re-armed further down as the
+     * 1-second heartbeat and the software timers are created.
      */
     __HAL_RTC_WRITEPROTECTION_DISABLE(&hrtc);
     HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
-    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
-    __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);
+    HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
+    HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_B);
+    __HAL_RTC_ALARM_DISABLE_IT(&hrtc, RTC_IT_ALRA | RTC_IT_ALRB);
+    __HAL_RTC_WAKEUPTIMER_DISABLE_IT(&hrtc, RTC_IT_WUT);
+    rtc_clear_all_flags();
     __HAL_RTC_WRITEPROTECTION_ENABLE(&hrtc);
     NVIC_ClearPendingIRQ(RTC_TAMP_IRQn);
 
@@ -493,13 +539,23 @@ void HAL_RTCEx_AlarmAEventCallback(RTC_HandleTypeDef *hrtc)
 void RTC_TAMP_IRQHandler(void)
 {
 #ifndef TEST
-    /* Before the scheduler starts, FreeRTOS APIs must not be touched:
-     * clear the flags and return so a leftover wakeup/alarm cannot
-     * preempt boot init. */
+    /*
+     * Before the scheduler starts, FreeRTOS APIs must not be touched:
+     * acknowledge the interrupt and return so a wakeup/alarm that fires
+     * during boot init cannot preempt it.
+     *
+     * ALL flags must be cleared, not just the wakeup/alarm A pair.  The
+     * flag register is read-only, so a flag that is left set keeps the
+     * RTC interrupt line asserted; the handler is then re-entered the
+     * instant it returns and main() never reaches vTaskStartScheduler().
+     * The millisecond one-shot timers arm Alarm B, which fires well
+     * inside this window (they are created during RTC_Init(), and
+     * component/CLI/telemetry init still takes hundreds of ms), so
+     * leaving ALRBF unacknowledged used to wedge the boot on target.
+     */
     if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED) {
         __HAL_RTC_WRITEPROTECTION_DISABLE(&hrtc);
-        __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
-        __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);
+        rtc_clear_all_flags();
         __HAL_RTC_WRITEPROTECTION_ENABLE(&hrtc);
         return;
     }

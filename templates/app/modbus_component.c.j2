@@ -165,7 +165,7 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
 {
     (void)cfg;
 #ifndef TEST
-    g_uart_handle = uart_open("{{ mb_uart }}", NULL);
+    g_uart_handle = uart_open("{{ mb_uart | lower }}", NULL);
     if (g_uart_handle == NULL) {
         return -1;
     }

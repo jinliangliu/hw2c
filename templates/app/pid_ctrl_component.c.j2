@@ -125,6 +125,7 @@ struct {{ comp_name }}_ctx {
     uint32_t ramp_timeout_ms;
     uint32_t duty_min;
     uint32_t duty_max;
+    uint32_t last_ctrl_ms;   /* tick of the previous control update (dt measurement) */
     float    hold_hysteresis;
     uint32_t events;
     pid_autotune_t autotune;
@@ -158,6 +159,8 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
 {% endif %}
 
 {% if mode == 'pwm_dual' %}
+    /* dt below is only the *nominal* period; the real control interval is
+     * re-measured from hal ticks on every update (see pid_measured_dt). */
     pid_init(&ctx->pid, kp, ki, kd,
              (float){{ control_period_ms }} / 1000.0f, -100.0f, 100.0f);
 {% else %}
@@ -176,6 +179,7 @@ int {{ comp_name }}_init(component_t *c, void *cfg)
     ctx->cool_duty       = 0;
     ctx->ramp_start_ms   = 0;
     ctx->read_failures   = 0;
+    ctx->last_ctrl_ms    = 0;
     ctx->events          = 0;
     ctx->hold_hysteresis = {{ hold_hyst }}f;
     ctx->autotune_active = 0;
@@ -214,7 +218,7 @@ static int pid_feedback_read(float *out)
 {
 {% if fb_peri and fb_peri.type in ('I2C_Pressure', 'I2C_TempSensor') %}
     {{ fb_peri.name }}_data_t s;
-    if ({{ fb_peri.name }}_read(i2c_open("{{ fb_peri.bus }}", NULL),
+    if ({{ fb_peri.name }}_read(i2c_open("{{ fb_peri.bus | lower }}", NULL),
                                 {{ fb_peri.address }}, &s) != 0) {
         return -1;
     }
@@ -310,6 +314,8 @@ int {{ comp_name }}_stop(void)
     ctx->stage = PID_STAGE_STANDBY;
     ctx->heat_duty = 0;
     ctx->cool_duty = 0;
+    /* De-energise now, not on the next step: "stop" must be immediate. */
+    pid_apply_output(0.0f);
     return 0;
 }
 
@@ -321,7 +327,42 @@ int {{ comp_name }}_vent(void)
     ctx->stage = PID_STAGE_STANDBY;
     ctx->heat_duty = 0;
     ctx->cool_duty = 0;
+    pid_apply_output(0.0f);
     return 0;
+}
+
+/*
+ * ---- Manual / automatic output arbitration ----
+ *
+ * The actuator PWM channel is written from two places: this control loop on
+ * every step(), and the CLI "pwm set" command.  Without an explicit policy the
+ * two fight — the CLI reports success and the loop overwrites the value on its
+ * next pass (or forces it back to 0 in the FAULT stage), so the operator sees
+ * an actuator that does not follow commands.
+ *
+ * Policy: manual writes are allowed only while the loop is in STANDBY, i.e.
+ * after "solenoid stop"/"vent".  Any other stage owns the channel.
+ */
+int {{ comp_name }}_manual_output_allowed(void)
+{
+    return (g_pid_ctx.stage == PID_STAGE_STANDBY) ? 1 : 0;
+}
+
+/*
+ * @brief  PWM channels driven by this component, 0-terminated.
+ *
+ * Exposed so the CLI can detect the ownership conflict above instead of
+ * duplicating the actuator wiring from components.yaml.  Channel numbers are
+ * 1-based (TIM_CHANNEL_1..4), so 0 is a safe terminator.
+ */
+const uint8_t *{{ comp_name }}_owned_channels(void)
+{
+    static const uint8_t owned[] = { {{ heat_ch }}U,
+{% if mode == 'pwm_dual' %}
+                                     {{ cool_ch }}U,
+{% endif %}
+                                     0U };
+    return owned;
 }
 
 /* ---- PID autotune (relay oscillation, Ziegler-Nichols) ---- */
@@ -458,8 +499,19 @@ static void pid_trip_fault(struct {{ comp_name }}_ctx *ctx, uint32_t code)
     }
     ctx->fault = code;
     ctx->stage = PID_STAGE_FAULT;
-    ctx->heat_duty = 0;
-    ctx->cool_duty = 0;
+
+    /*
+     * De-energise immediately, in this call.
+     *
+     * The stage machine would drop the output on its next pass, but a tripped
+     * fault must not wait a full control period: the sensor-failure path
+     * returns early (to keep the last duty until the next sample), so the
+     * actuator used to stay energised for up to stuck_reads periods (~0.56 s
+     * with the default 8 reads at 70 ms) after the loop was already known to
+     * be blind.  Writing the safe duty here removes that window.
+     */
+    pid_apply_output(0.0f);
+
 {% if fault_evt and fault_evt.payload and fault_evt.payload.type == 'uint32' %}
     ctx->events++;
     event_post_fault_tripped(code);
@@ -470,6 +522,34 @@ static void pid_trip_fault(struct {{ comp_name }}_ctx *ctx, uint32_t code)
     log_error("PID FAULT %lu: value=%.1f %s", (unsigned long)code,
               (double)ctx->process_value, "{{ fb_unit }}");
 #endif
+}
+
+/*
+ * Control interval, measured from hal ticks instead of assumed.
+ *
+ * control.period_ms ({{ control_period_ms }} ms) is only a *lower bound*: the step task polls at
+ * a coarser rate, so consecutive control updates land quantised upward
+ * ({{ control_period_ms }} ms declared -> ~{{ (control_period_ms | int) + 8 }} ms actual, Ki/Kd biased by ~+13 %).
+ * Deriving dt from the actual delta keeps the integral and derivative terms
+ * correct under both that quantisation and scheduling jitter.
+ *
+ * A delta outside [1, {{ (control_period_ms | int) * 10 }}] ms is not a believable control interval (first
+ * update, debugger halt, long stall) and falls back to the nominal period.
+ */
+#define PID_CTRL_MAX_DT_MS  {{ (control_period_ms | int) * 10 }}U
+
+static float pid_measured_dt(struct {{ comp_name }}_ctx *ctx, uint32_t now)
+{
+    float dt = (float){{ control_period_ms }} / 1000.0f;   /* nominal fallback */
+
+    if (ctx->last_ctrl_ms != 0U) {
+        uint32_t delta = now - ctx->last_ctrl_ms;
+        if (delta >= 1U && delta <= PID_CTRL_MAX_DT_MS) {
+            dt = (float)delta / 1000.0f;
+        }
+    }
+    ctx->last_ctrl_ms = now;
+    return dt;
 }
 
 /* ---- step: sample, interlock, stage machine, apply PWM duty ---- */
@@ -573,6 +653,8 @@ void {{ comp_name }}_step(component_t *c)
             pid_apply_output(power);
         }
     } else {
+    /* re-measure the control interval before every closed-loop update */
+    ctx->pid.dt = pid_measured_dt(ctx, now);
     switch (ctx->stage) {
     case PID_STAGE_STANDBY:
         pid_apply_output(0.0f);

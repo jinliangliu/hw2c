@@ -466,11 +466,14 @@ void mock_HAL_UART_Receive_reset(void) { uart_receive_called = false; }
 /* ========== IWDG mock ========== */
 static bool iwdg_init_called = false;
 static bool iwdg_refresh_called = false;
+/* Lets a test drive HAL_IWDG_Init into its failure path, which must trigger
+ * the driver's fail-safe reset instead of silently continuing. */
+static bool iwdg_init_fail = false;
 
 HAL_StatusTypeDef HAL_IWDG_Init(IWDG_HandleTypeDef *hiwdg) {
     (void)hiwdg;
     iwdg_init_called = true;
-    return HAL_OK;
+    return iwdg_init_fail ? HAL_ERROR : HAL_OK;
 }
 HAL_StatusTypeDef HAL_IWDG_Refresh(IWDG_HandleTypeDef *hiwdg) {
     (void)hiwdg;
@@ -480,9 +483,12 @@ HAL_StatusTypeDef HAL_IWDG_Refresh(IWDG_HandleTypeDef *hiwdg) {
 bool mock_HAL_IWDG_Init_called(void) { return iwdg_init_called; }
 bool mock_HAL_IWDG_Refresh_called(void) { return iwdg_refresh_called; }
 
+void mock_HAL_IWDG_set_init_fail(bool fail) { iwdg_init_fail = fail; }
+
 void mock_HAL_IWDG_reset(void) {
     iwdg_init_called = false;
     iwdg_refresh_called = false;
+    iwdg_init_fail = false;
 }
 
 /* ========== Flash mock (FOTA) ========== */
@@ -524,8 +530,30 @@ bool mock_flash_get_erase_called(void) { return flash_erase_called; }
 uint32_t mock_flash_get_program_count(void) { return flash_program_count; }
 
 /* ========== FreeRTOS stubs ========== */
+/*
+ * Queue-allocation failure injection.
+ *
+ * EventMgr_Init() and xTaskCreate() failure paths are only reachable when the
+ * RTOS cannot supply the object, which on the host never happens by default -
+ * so those paths used to be untestable and were in fact missing (P2-3).  This
+ * knob lets a test model heap exhaustion.
+ */
+static int mock_queue_create_fail = 0;
+static int mock_queue_create_calls = 0;
+
+void mock_xQueueCreate_fail_next(int enable) {
+    mock_queue_create_fail = enable ? 1 : 0;
+    mock_queue_create_calls = 0;
+}
+
+int mock_xQueueCreate_call_count(void) { return mock_queue_create_calls; }
+
 QueueHandle_t xQueueCreate(uint32_t length, uint32_t itemSize) {
     (void)length; (void)itemSize;
+    mock_queue_create_calls++;
+    if (mock_queue_create_fail) {
+        return NULL;
+    }
     return (QueueHandle_t)1;
 }
 

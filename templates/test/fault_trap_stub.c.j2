@@ -1,0 +1,49 @@
+{#
+    fault_trap_stub.c.j2 - host-side stand-in for the fail-safe primitive
+
+    hw2c_fault_trap() lives in hw2c_fault.c, which reaches into the generated
+    actuator drivers.  Pulling the whole PWM stack into an unrelated unit test
+    (event manager, RTC) is noise, so those tests #include this file instead and
+    only get the symbol they need.
+
+    The real behaviour - de-energising the outputs, recording the reason,
+    requesting a reset - is pinned by test_hw2c_fault.c, which includes the
+    actual ../src/hw2c_fault.c.
+
+    The stub records rather than resets: a host process cannot model an MCU
+    reset, and turning the call into a silent no-op would let a test keep
+    running past a point where the target would have restarted.  Tests that
+    care can assert on the recorded code.
+
+    NOTE: this file is #include'd by test translation units, never compiled on
+    its own.  It is deliberately not named test_*.c so run_tests.py's test
+    discovery does not pick it up.
+#}
+#include "hw2c_fault.h"
+
+static uint32_t s_host_fault_last_code;
+static unsigned s_host_fault_calls;
+
+void hw2c_fault_trap(uint32_t code)
+{
+    s_host_fault_last_code = code;
+    s_host_fault_calls++;
+}
+
+/* Last HW2C_FAULT_* code passed to hw2c_fault_trap(). */
+uint32_t host_fault_trap_last_code(void)
+{
+    return s_host_fault_last_code;
+}
+
+/* Number of hw2c_fault_trap() calls observed. */
+unsigned host_fault_trap_call_count(void)
+{
+    return s_host_fault_calls;
+}
+
+void host_fault_trap_reset(void)
+{
+    s_host_fault_last_code = HW2C_FAULT_NONE;
+    s_host_fault_calls = 0U;
+}

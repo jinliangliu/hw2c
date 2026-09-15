@@ -18,6 +18,7 @@ Auto-generated — do not edit manually.
 #endif
 
 #include "event_mgr.h"
+#include "hw2c_fault.h"
 
 /* ---- Typed event post functions (from behavior.events contract) ---- */
 {% for evt in events %}
@@ -113,10 +114,22 @@ static void handle_mpu6050_alert(void);
 
 void EventMgr_Init(void)
 {
+    /*
+     * Queue creation is unchecked by FreeRTOS when configASSERT is disabled,
+     * and a NULL queue is then dereferenced from interrupt context
+     * (xQueueSendFromISR in stm32g0xx_it.c), which corrupts the heap rather
+     * than failing cleanly.  Treat an allocation failure as fatal.
+     */
     /* 测试模式和真实模式都创建队列（mock 的 xQueueCreate 会返回非空） */
     event_queue = xQueueCreate(100, sizeof(event_t));
+    if (event_queue == NULL) {
+        hw2c_fault_trap(HW2C_FAULT_RTOS_OBJECT);
+    }
 {% if has_btn_task or has_btn_component %}
     btn_queue = xQueueCreate(16, sizeof(event_t));
+    if (btn_queue == NULL) {
+        hw2c_fault_trap(HW2C_FAULT_RTOS_OBJECT);
+    }
 {% endif %}
 }
 

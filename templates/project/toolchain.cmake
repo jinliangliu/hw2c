@@ -18,8 +18,16 @@ set(CMAKE_ASM_COMPILER_ARGS "-x assembler-with-cpp")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 # Global compile flags
-set(CMAKE_C_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb -fdata-sections -ffunction-sections -Wall -Wextra -Wno-unused-parameter")
+# -std=c99 is REQUIRED, not cosmetic: the project claims C99 / MISRA C:2012
+# compliance, and without it the compiler defaults to a much newer standard
+# (gcc 15 defaults to C23), so C99 conformance was never actually enforced.
+set(CMAKE_C_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb -std=c99 -fdata-sections -ffunction-sections -Wall -Wextra -Wno-unused-parameter")
 set(CMAKE_ASM_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb")
 
 # Global linker flags
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb -specs=nano.specs -specs=nosys.specs -Wl,--gc-sections -Wl,-Map=${CMAKE_PROJECT_NAME}.map")
+# -u _printf_float / -u _scanf_float: newlib-nano omits float support in
+# printf/scanf by default.  Without them "%.1f" prints nothing useful and
+# sscanf("%f") fails on target, while host tests (glibc) pass regardless.
+# Costs roughly 6-10 KB of flash; drop them only if the firmware is known
+# to use integer formatting exclusively.
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb -specs=nano.specs -specs=nosys.specs -Wl,--gc-sections -u _printf_float -u _scanf_float -Wl,-Map=${CMAKE_PROJECT_NAME}.map")

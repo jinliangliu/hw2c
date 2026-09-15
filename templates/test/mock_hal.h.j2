@@ -481,6 +481,10 @@ typedef enum {
 
 /* FreeRTOS functions */
 QueueHandle_t xQueueCreate(uint32_t length, uint32_t itemSize);
+/* Failure injection: make the next xQueueCreate() return NULL (heap
+ * exhaustion).  Also resets the call counter. */
+void mock_xQueueCreate_fail_next(int enable);
+int mock_xQueueCreate_call_count(void);
 BaseType_t xQueueReceive(QueueHandle_t queue, void *buffer, TickType_t wait);
 BaseType_t xQueueSend(QueueHandle_t queue, const void *item, TickType_t wait);
 BaseType_t xQueueSendFromISR(QueueHandle_t queue, const void *item, BaseType_t *pxWoken);
@@ -687,6 +691,8 @@ uint32_t mock_HAL_GPIO_WritePin_get_count(void);
 /* IWDG mock verification */
 bool mock_HAL_IWDG_Init_called(void);
 bool mock_HAL_IWDG_Refresh_called(void);
+/* Force HAL_IWDG_Init to fail, so the driver's fail-safe reset can be tested */
+void mock_HAL_IWDG_set_init_fail(bool fail);
 void mock_HAL_IWDG_reset(void);
 
 /* Task info mock helpers */

@@ -132,6 +132,21 @@ SECTIONS
   } >RAM AT> FLASH
 
   /* Uninitialized data section into RAM */
+  /*
+   * Reset-surviving variables (hw2c_fault.c).  Deliberately NOT initialised by
+   * the start-up code, so a fault reason stored here survives
+   * NVIC_SystemReset() and a watchdog reset.  Must precede .bss, because the
+   * "*(.bss*)" pattern would otherwise swallow this input section.
+   */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _snoinit = .;
+    KEEP(*(.noinit))
+    . = ALIGN(4);
+    _enoinit = .;
+  } >RAM
+
   . = ALIGN(4);
   .bss :
   {

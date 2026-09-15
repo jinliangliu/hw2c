@@ -92,7 +92,7 @@ int {{ peripheral.name }}_init(void)
     uint32_t ch;
     float angle;
 
-    g_enc_bus = i2c_open("{{ enc_bus }}", NULL);
+    g_enc_bus = i2c_open("{{ enc_bus | lower }}", NULL);
     if (g_enc_bus == NULL) {
         return -1;
     }

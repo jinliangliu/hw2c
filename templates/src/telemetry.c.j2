@@ -80,6 +80,59 @@ int telemetry_register_callback(telemetry_callback_t cb, void *ctx)
     return 0;
 }
 
+#ifndef TEST
+/*
+ * Allocated stack size (in words) per task, captured at generation time.
+ *
+ * FreeRTOS only exposes uxTaskGetStackHighWaterMark() = words *remaining at
+ * the worst point*; it never reports the allocation size.  Without the
+ * denominator "words used" cannot be computed, and the previous revision
+ * silently emitted a constant 0 for peak_usage (plus a "(void)" suppression)
+ * so the NFR-4 stack metric looked implemented while reporting nothing.
+ *
+ * The generator knows every xTaskCreate() depth, so it emits that table here
+ * and peak usage becomes  peak = total - remaining.
+ * Tasks not listed (FreeRTOS IDLE / Tmr Svc) report total_stack = 0 and are
+ * excluded from the peak/minimum computation.
+ */
+static const struct {
+    const char *name;
+    uint16_t    stack_words;
+} g_task_stack_table[] = {
+{% for task in app_tasks %}
+{% if not (has_fota and task.name == 'fota_task') %}
+    { "{{ task.name }}", {{ task.stack_size | default(128) }} },
+{% endif %}
+{% endfor %}
+{% if has_cli %}
+    { "cli", {{ cli_stack_size | default(512) }} },
+{% endif %}
+    { "event_mgr", 512 },
+{% if has_fota %}
+    { "fota", 512 },
+{% endif %}
+{% if has_components %}
+    { "comp_step", 512 },
+{% endif %}
+};
+
+#define TASK_STACK_TABLE_LEN \
+    ((uint32_t)(sizeof(g_task_stack_table) / sizeof(g_task_stack_table[0])))
+
+static uint16_t task_stack_alloc_words(const char *name)
+{
+    if (name == NULL) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < TASK_STACK_TABLE_LEN; i++) {
+        if (strcmp(g_task_stack_table[i].name, name) == 0) {
+            return g_task_stack_table[i].stack_words;
+        }
+    }
+    return 0;
+}
+#endif /* !TEST */
+
 int telemetry_collect(telemetry_snapshot_t *snap)
 {
     if (snap == NULL) return -1;
@@ -131,26 +184,33 @@ int telemetry_collect(telemetry_snapshot_t *snap)
 
         for (uint32_t i = 0; i < task_cnt; i++) {
             snap->tasks[i].name = task_stats[i].pcTaskName;
-            snap->tasks[i].peak_usage = (uint16_t)(
-                task_stats[i].usStackHighWaterMark > 0
-                ? 0  /* usStackHighWaterMark is remaining, not peak */
-                : 0);
-            (void)snap->tasks[i].peak_usage;  /* suppressed: not directly available on all configs */
 
-            /* Get stack high-water mark (remaining words) */
+            /* Words *remaining* at the worst point measured so far. */
             TaskHandle_t handle = xTaskGetHandle(task_stats[i].pcTaskName);
+            uint32_t remaining = 0;
+            uint32_t have_measurement = 0;
             if (handle != NULL) {
-                snap->tasks[i].watermark = (uint16_t)uxTaskGetStackHighWaterMark(handle);
-            } else {
-                snap->tasks[i].watermark = 0;
+                remaining = (uint32_t)uxTaskGetStackHighWaterMark(handle);
+                have_measurement = 1;
             }
 
-            /* Total stack from known allocations */
-            snap->tasks[i].total_stack = task_stats[i].usStackHighWaterMark
-                                        + snap->tasks[i].watermark;
+            uint32_t alloc_words =
+                (uint32_t)task_stack_alloc_words(task_stats[i].pcTaskName);
+            snap->tasks[i].total_stack = (uint16_t)alloc_words;
+            snap->tasks[i].watermark   = (uint16_t)remaining;
 
-            if (snap->tasks[i].watermark < min_watermark && snap->tasks[i].watermark > 0) {
-                min_watermark = snap->tasks[i].watermark;
+            /* Peak usage needs both the measurement and the allocation.
+             * The "remaining <= alloc" guard rejects an impossible reading
+             * rather than underflowing to a huge "used" figure. */
+            if (have_measurement != 0U && alloc_words > 0U &&
+                remaining <= alloc_words) {
+                snap->tasks[i].peak_usage = (uint16_t)(alloc_words - remaining);
+            } else {
+                snap->tasks[i].peak_usage = 0;
+            }
+
+            if (have_measurement != 0U && remaining < min_watermark) {
+                min_watermark = remaining;
             }
 
             snap->tasks[i].cpu_ticks = task_stats[i].ulRunTimeCounter;
@@ -244,10 +304,10 @@ void telemetry_log_snapshot(void)
     for (uint32_t i = 0; i < snap.task_count && i < TELEMETRY_MAX_TASKS; i++) {
         if (len >= (int)sizeof(buf) - 96) break;
         len += snprintf(buf + len, sizeof(buf) - (size_t)len,
-                        "    %-16s stack %u/%u free=%u run=%lu\r\n",
+                        "    %-16s stack %u used=%u free=%u run=%lu\r\n",
                         snap.tasks[i].name,
                         (unsigned int)snap.tasks[i].total_stack,
-                        (unsigned int)(snap.tasks[i].total_stack + snap.tasks[i].watermark),
+                        (unsigned int)snap.tasks[i].peak_usage,
                         (unsigned int)snap.tasks[i].watermark,
                         (unsigned long)snap.tasks[i].cpu_ticks);
     }

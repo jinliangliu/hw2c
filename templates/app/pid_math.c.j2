@@ -7,9 +7,22 @@
 
 #include "pid_math.h"
 #include <stddef.h>
+#include <math.h>   /* isnan(): expands to __aeabi_fcmpun, no libm dependency */
 
+/*
+ * Clamp helper with a NaN guard.
+ *
+ * Every comparison against NaN is false, so a NaN input used to fall through
+ * both clamps and reach the actuator, where the caller converts it to a PWM
+ * duty by casting to an integer — undefined behaviour for NaN (C99 6.3.1.4).
+ * A NaN must therefore never escape this function; it is mapped to the low
+ * end of the range, which is the de-energised output for a duty cycle.
+ */
 float pid_clampf(float v, float lo, float hi)
 {
+    if (isnan(v)) {
+        return lo;
+    }
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
@@ -76,6 +89,19 @@ float pid_update(pid_t *p, float setpoint, float feedback)
     p->cur_setpoint = setpoint;
 
     err = setpoint - feedback;
+
+    /*
+     * Reject a non-finite sample instead of letting it through.
+     *
+     * A NaN error makes every downstream comparison false, so the integral
+     * would be stored as NaN and the controller would stay poisoned even
+     * after the sensor recovers.  Reset the state and return the de-energised
+     * output; the caller's own fault interlocks see the bad sample too.
+     */
+    if (isnan(err)) {
+        pid_reset(p);
+        return pid_clampf(0.0f, p->out_min, p->out_max);
+    }
 
     /* Proportional */
     pterm = p->kp * err;

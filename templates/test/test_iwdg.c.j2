@@ -9,6 +9,7 @@
 void setUp(void)
 {
     mock_HAL_IWDG_reset();
+    mock_NVIC_SystemReset_reset();
 }
 
 void tearDown(void)
@@ -20,6 +21,7 @@ void test_iwdg_init_basic(void)
     /* IWDG_Init should succeed and mark init as called */
     IWDG_Init();
     TEST_ASSERT_TRUE(mock_HAL_IWDG_Init_called());
+    TEST_ASSERT_FALSE(mock_NVIC_SystemReset_called());
 }
 
 void test_iwdg_refresh(void)
@@ -30,10 +32,33 @@ void test_iwdg_refresh(void)
     TEST_ASSERT_TRUE(mock_HAL_IWDG_Refresh_called());
 }
 
+/*
+ * Fail-safe contract: if the watchdog cannot be armed the firmware must reset
+ * rather than keep running unsupervised.  A previous revision spun in
+ * "while (1) {}" here, which left the actuator outputs frozen at whatever
+ * state they happened to be in.
+ */
+void test_iwdg_init_failure_resets(void)
+{
+    mock_HAL_IWDG_set_init_fail(true);
+    IWDG_Init();
+    TEST_ASSERT_TRUE(mock_HAL_IWDG_Init_called());
+    TEST_ASSERT_TRUE(mock_NVIC_SystemReset_called());
+}
+
+void test_iwdg_timeout_matches_reload(void)
+{
+    /* Header and implementation must be generated from the same timeout:
+     * LSI ~32 kHz with /256 prescaler gives 8 ms per tick. */
+    TEST_ASSERT_EQUAL_UINT32(IWDG_RELOAD_VALUE, (IWDG_TIMEOUT_MS + 7U) / 8U);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_iwdg_init_basic);
     RUN_TEST(test_iwdg_refresh);
+    RUN_TEST(test_iwdg_init_failure_resets);
+    RUN_TEST(test_iwdg_timeout_matches_reload);
     return UNITY_END();
 }

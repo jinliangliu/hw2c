@@ -37,6 +37,7 @@
 #endif
 
 #include "drv_{{ peripheral.name }}.h"
+#include "hw2c_fault.h"
 
 #include "stm32g0xx_ll_adc.h"
 
@@ -105,7 +106,7 @@ void temp_sensor_init(void)
     htsens_adc.Init.Overrun               = ADC_OVR_DATA_PRESERVED;
 
     if (HAL_ADC_Init(&htsens_adc) != HAL_OK) {
-        while (1) {}
+        hw2c_fault_trap(HW2C_FAULT_PERIPH_INIT);
     }
 
     /*
@@ -114,7 +115,8 @@ void temp_sensor_init(void)
      * become significant for the temperature sensor's narrow slope.
      */
     if (HAL_ADCEx_Calibration_Start(&htsens_adc) != HAL_OK) {
-        while (1) {}
+        /* An uncalibrated sensor is not a usable feedback path. */
+        hw2c_fault_trap(HW2C_FAULT_PERIPH_INIT);
     }
 
     /*

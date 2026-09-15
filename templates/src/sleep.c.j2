@@ -22,9 +22,21 @@ void vPortSuppressTicksAndSleep( TickType_t xExpectedIdleTime )
     return;
 }
 
+/*
+ * This build has no low-power entry path: it was generated with tickless
+ * idle disabled (or sleep.mode == RUN), so the core never enters WFI/STOP.
+ *
+ * Returning 0 here used to make the CLI print "Woke up after 0 ms", i.e. a
+ * successful STOP1 entry, for a sleep that never happened.  Report
+ * POWER_SLEEP_SKIPPED instead so the caller can say so.
+ *
+ * To get real low power, enable tickless idle for the project (see
+ * templates/rtos/tickless_idle.c.j2) — this stub is the honest signal that
+ * nothing was implemented, not a working sleep path.
+ */
 uint32_t power_sleep_now(power_mode_t mode)
 {
     (void)mode;
-    return 0;
+    return POWER_SLEEP_SKIPPED;
 }
 {% endif %}

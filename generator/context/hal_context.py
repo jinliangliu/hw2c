@@ -55,7 +55,7 @@ def compute_hal_sources(flags: dict, hil_mode: bool = False) -> list[str]:
     if flags.get('has_uart') or hil_mode:
         if 'stm32g0xx_hal_uart.c' not in hal_sources:
             hal_sources.append('stm32g0xx_hal_uart.c')
-    if flags.get('has_bootloader'):
+    if flags.get('has_bootloader') or flags.get('has_iwdg'):
         if 'stm32g0xx_hal_iwdg.c' not in hal_sources:
             hal_sources.append('stm32g0xx_hal_iwdg.c')
 

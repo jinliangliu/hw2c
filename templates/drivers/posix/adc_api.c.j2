@@ -30,7 +30,7 @@ extern ADC_HandleTypeDef h{{ p.name }};
 
 static struct adc_dev g_adc_devs[] = {
 {% for p in adc_peripherals %}
-    { .name = "{{ p.name }}", .hadc = &h{{ p.name }}, .vref_mv = 3300, .is_open = 0 },
+    { .name = "{{ p.name | lower }}", .hadc = &h{{ p.name }}, .vref_mv = 3300, .is_open = 0 },
 {% endfor %}
 };
 
@@ -40,11 +40,27 @@ static struct adc_dev g_adc_devs[1];
 static const uint32_t g_adc_count = 0;
 {% endif %}
 
+/* Device name comparison (case-insensitive, see i2c_api.c) */
+static int adc_name_eq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) return 0;
+    while (*a != '\0' && *b != '\0') {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if ((ca >= (unsigned char)'A') && (ca <= (unsigned char)'Z')) ca = (unsigned char)(ca + 32U);
+        if ((cb >= (unsigned char)'A') && (cb <= (unsigned char)'Z')) cb = (unsigned char)(cb + 32U);
+        if (ca != cb) return 0;
+        a++;
+        b++;
+    }
+    return (*a == *b) ? 1 : 0;
+}
+
 adc_handle_t adc_open(const char *name, const adc_cfg_t *cfg)
 {
     if (name == NULL) return NULL;
     for (uint32_t i = 0; i < g_adc_count; i++) {
-        if (strcmp(g_adc_devs[i].name, name) == 0) {
+        if (adc_name_eq(g_adc_devs[i].name, name) != 0) {
             if (g_adc_devs[i].is_open) return NULL;
             if (cfg != NULL) g_adc_devs[i].vref_mv = cfg->vref_mv;
             g_adc_devs[i].is_open = 1;

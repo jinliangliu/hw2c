@@ -62,6 +62,30 @@ static gpio_handle_t spi_cs_open(const char *cs_name)
     return gpio_open(cs_name, NULL);
 }
 
+/* ---- bus name comparison (case-insensitive, see i2c_api.c) ---- */
+static int spi_bus_name_eq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    while (*a != '\0' && *b != '\0') {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if ((ca >= (unsigned char)'A') && (ca <= (unsigned char)'Z')) {
+            ca = (unsigned char)(ca + 32U);
+        }
+        if ((cb >= (unsigned char)'A') && (cb <= (unsigned char)'Z')) {
+            cb = (unsigned char)(cb + 32U);
+        }
+        if (ca != cb) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return (*a == *b) ? 1 : 0;
+}
+
 /* ---- spi_open (idempotent: a bus is a shared resource) ---- */
 spi_handle_t spi_open(const char *bus_name, const spi_cfg_t *cfg)
 {
@@ -70,7 +94,7 @@ spi_handle_t spi_open(const char *bus_name, const spi_cfg_t *cfg)
     }
 
     for (uint32_t i = 0; i < g_spi_bus_count; i++) {
-        if (strcmp(g_spi_buses[i].name, bus_name) == 0) {
+        if (spi_bus_name_eq(g_spi_buses[i].name, bus_name) != 0) {
             if (!g_spi_buses[i].is_open) {
                 if (cfg != NULL && cfg->timeout_ms > 0) {
                     g_spi_buses[i].default_timeout_ms = cfg->timeout_ms;
@@ -98,6 +122,12 @@ static int32_t spi_status(int32_t rc)
     return (rc == HAL_OK) ? 0 : -rc;
 }
 
+/* ---- transfer length limit ----
+ * This API takes a uint32_t length, but HAL_SPI_* take a uint16_t Size.
+ * Truncating silently would report success for a transfer that moved the
+ * wrong number of bytes. */
+#define SPI_API_MAX_XFER_BYTES  0xFFFFU
+
 /* ---- raw transfer with CS framing ---- */
 int32_t spi_transfer(spi_handle_t h, const char *cs_name,
                      const uint8_t *tx, uint8_t *rx, uint32_t len,
@@ -108,6 +138,9 @@ int32_t spi_transfer(spi_handle_t h, const char *cs_name,
 
     if (h == NULL || tx == NULL || rx == NULL || len == 0) {
         return -5;
+    }
+    if (len > SPI_API_MAX_XFER_BYTES) {
+        return -7;   /* would be truncated by the HAL uint16_t Size */
     }
     cs = spi_cs_open(cs_name);
     if (cs == NULL) {
@@ -131,6 +164,9 @@ int32_t spi_transmit(spi_handle_t h, const char *cs_name,
     if (h == NULL || tx == NULL || len == 0) {
         return -5;
     }
+    if (len > SPI_API_MAX_XFER_BYTES) {
+        return -7;   /* would be truncated by the HAL uint16_t Size */
+    }
     cs = spi_cs_open(cs_name);
     if (cs == NULL) {
         return -5;
@@ -151,6 +187,9 @@ int32_t spi_receive(spi_handle_t h, const char *cs_name,
 
     if (h == NULL || rx == NULL || len == 0) {
         return -5;
+    }
+    if (len > SPI_API_MAX_XFER_BYTES) {
+        return -7;   /* would be truncated by the HAL uint16_t Size */
     }
     cs = spi_cs_open(cs_name);
     if (cs == NULL) {

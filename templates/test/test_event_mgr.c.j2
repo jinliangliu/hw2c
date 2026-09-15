@@ -2,14 +2,39 @@
 #include "mock_hal.h"
 #include <string.h>
 
+/* event_mgr.c takes the fail-safe path on a failed queue allocation.  The real
+ * primitive drags in the actuator drivers, so use the host stand-in and assert
+ * on the code it recorded (P2-3 / P1-3). */
+#include "fault_trap_stub.c"
+
 #include "../src/event_mgr.c"
 
-void setUp(void) {}
+void setUp(void) {
+    /* Keep the failure-injection knob from leaking between tests. */
+    mock_xQueueCreate_fail_next(0);
+    host_fault_trap_reset();
+}
 void tearDown(void) {}
 
 void test_EventMgr_Init_should_create_queue(void) {
     EventMgr_Init();
     TEST_ASSERT_NOT_NULL(event_queue);
+}
+
+/* A failed allocation must take the fail-safe path: a NULL event_queue is
+ * dereferenced from interrupt context (xQueueSendFromISR), which corrupts the
+ * heap instead of failing cleanly (P2-3). */
+void test_EventMgr_Init_should_trap_when_queue_alloc_fails(void)
+{
+    mock_xQueueCreate_fail_next(1);
+
+    EventMgr_Init();
+
+    TEST_ASSERT_EQUAL_UINT32(HW2C_FAULT_RTOS_OBJECT,
+                             host_fault_trap_last_code());
+    /* The trap must be taken at least once; whether the second queue creation
+     * is also attempted depends on the failure mode injected. */
+    TEST_ASSERT_TRUE(host_fault_trap_call_count() >= 1U);
 }
 
 void test_EventMgr_should_receive_sent_event(void) {
@@ -32,6 +57,7 @@ void test_EventMgr_should_dispatch_button_event(void)
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_EventMgr_Init_should_create_queue);
+    RUN_TEST(test_EventMgr_Init_should_trap_when_queue_alloc_fails);
     RUN_TEST(test_EventMgr_should_receive_sent_event);
     RUN_TEST(test_EventMgr_should_dispatch_button_event);
     return UNITY_END();

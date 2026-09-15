@@ -33,7 +33,7 @@ int {{ peripheral.name }}_init(void)
         adc_close((adc_handle_t)g_adc);
         g_adc = NULL;
     }
-    g_adc = (void *)adc_open("{{ adc_name }}", NULL);
+    g_adc = (void *)adc_open("{{ adc_name | lower }}", NULL);
     return (g_adc != NULL) ? 0 : -1;
 }
 

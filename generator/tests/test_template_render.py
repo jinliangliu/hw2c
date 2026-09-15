@@ -1,5 +1,7 @@
 """Snapshot tests for Jinja2 template rendering."""
 
+import re
+
 from jinja2 import Environment, FileSystemLoader
 from generator.paths import TEMPLATES_DIR
 from generator.jinja_filters import register_filters
@@ -138,11 +140,19 @@ def test_main_c_template_with_rtc():
 
 
 def test_main_c_template_with_bootloader():
-    """Main.c renders bootloader-related code when has_bootloader=True."""
+    """Main.c renders bootloader-related code when has_bootloader=True.
+
+    A bootloader-enabled application declares IWDG, but the watchdog is only
+    armed when a designated refresh owner exists (the component step task or
+    the rtc_demo task) — declaring IWDG without one would only guarantee a
+    reset loop, so it must stay disarmed.
+    """
     env = _make_env()
     template = env.get_template("src/main.c.j2")
     context = _minimal_context()
     context["has_bootloader"] = True
+    context["has_iwdg"] = True
+    context["has_components"] = True
     context["boot_config"] = {
         "enabled": True,
         "size_kb": 8,
@@ -155,6 +165,71 @@ def test_main_c_template_with_bootloader():
     assert '#include "boot_app.h"' in rendered
     assert "IWDG_Init()" in rendered
     assert "boot_app_mark_ok()" in rendered
+
+    no_owner = _minimal_context()
+    no_owner["has_bootloader"] = True
+    no_owner["has_iwdg"] = True
+    no_owner["has_components"] = False
+    assert "IWDG_Init()" not in template.render(no_owner)
+
+
+def test_main_c_keeps_rtos_object_creation_after_tick_dependent_init():
+    """Pin the pre-scheduler ordering required by the vendored FreeRTOS port.
+
+    portable/GCC/ARM_CM0/port.c initialises ulCriticalNesting to the poison
+    value 0xAAAAAAAA, so the first pre-scheduler taskEXIT_CRITICAL() leaves
+    PRIMASK set and every HAL_GetTick()-based wait that follows spins forever.
+    hw2c does not patch the vendored FreeRTOS sources, so main.c must keep:
+
+        EventMgr_Init() -> __enable_irq() -> (tick-dependent init)
+                        -> [cli_init / telemetry_init / xTaskCreate]
+                        -> vTaskStartScheduler()
+    """
+    env = _make_env()
+    template = env.get_template("src/main.c.j2")
+    context = _minimal_context()
+    context.update({
+        "has_components": True,
+        "has_cli": True,
+        "cli_uart_name": "usart2",
+        "has_log": True,
+        "has_telemetry": True,
+        "has_iwdg": True,
+    })
+    rendered = template.render(context)
+    # Comments mention the very calls under test, so match code only.
+    code = re.sub(r"/\*.*?\*/", " ", rendered, flags=re.S)
+    code = re.sub(r"//[^\n]*", " ", code)
+
+    def pos(needle, start=0):
+        idx = code.find(needle, start)
+        assert idx >= 0, f"{needle!r} missing from rendered main.c"
+        return idx
+
+    event_mgr = pos("EventMgr_Init();")
+    repair = pos("__enable_irq();", event_mgr)   # the repair, not the early one
+    comp_init = pos("component_init_all();")
+    iwdg = pos("IWDG_Init();")
+    cli = pos("cli_init(")
+    telemetry = pos("telemetry_init();")
+    scheduler = pos("vTaskStartScheduler();")
+
+    # the repair follows the only early RTOS object creation
+    assert event_mgr < repair
+
+    # tick-dependent init runs with interrupts enabled, i.e. before cli_init()
+    assert repair < comp_init < cli
+    assert repair < iwdg < cli
+
+    # every RTOS object creation is confined to the tail block
+    assert cli < scheduler
+    assert telemetry < scheduler
+    for needle in ("xSemaphoreCreate", "xQueueCreate", "telemetry_init();",
+                   "create_task_checked("):
+        assert needle not in code[repair:cli], (
+            f"{needle} must not run between the interrupt repair and the "
+            "tail block — it would mask interrupts for the waits in between"
+        )
 
 
 def test_main_c_template_with_behavior():
@@ -342,7 +417,10 @@ def test_pid_ctrl_template_renders_thermo_dual_config():
 
     # generic feedback adapter bound to the temperature sensor
     assert "pid_feedback_read" in rendered
-    assert "temp_read(i2c_open(\"I2C1\", NULL)" in rendered
+    # Bus handles are opened with the lower-cased bus name: the POSIX bus
+    # registry stores lower-case names, so generating "I2C1" here used to
+    # fail on target only (see the 2026-09-15 review, P0-1).
+    assert "temp_read(i2c_open(\"i2c1\", NULL)" in rendered
     assert "s.process_value" in rendered
     # dual actuator: both heat and cool channels driven
     assert "heater_set_duty((uint8_t)1, ctx->heat_duty)" in rendered
@@ -420,6 +498,59 @@ def test_pid_ctrl_template_renders_ntc_single_config():
     assert "i2c_open" not in rendered
 
 
+def test_rtc_isr_acknowledges_every_flag_before_scheduler():
+    """The pre-scheduler RTC path must clear ALL flags, not a subset.
+
+    Regression guard for a boot deadlock found on target: the millisecond
+    one-shot timers arm Alarm B while RTC_Init() runs, Alarm B then fires
+    before vTaskStartScheduler(), and the early-out path used to clear only
+    WUTF and ALRAF.  The still-asserted ALRBF held the RTC interrupt line
+    high, so RTC_TAMP_IRQHandler was re-entered the instant it returned and
+    main() never reached the scheduler (measured: SR = MISR = 0x02, SCR = 0,
+    100% of samples inside the handler).
+    """
+    env = _make_env()
+    template = env.get_template("drivers/drv_rtc.c.j2")
+    context = _minimal_context()
+    context.update({
+        "has_rtc": True,
+        "has_log": True,
+        "peripheral": {"name": "rtc", "type": "Internal_RTC"},
+        "rtc_async_prediv": 127,
+        "rtc_sync_prediv": 32767,
+        "rtc_alarms": [{"period_s": 1, "period_ms": 1000, "event": "TICK_1S"}],
+        "rtc_init_time": {"year": 26, "month": 7, "day": 29,
+                          "hour": 22, "min": 7, "sec": 0},
+    })
+    rendered = template.render(context)
+
+    # Every flag is acknowledged through the single helper ...
+    assert "static void rtc_clear_all_flags(void)" in rendered
+
+    # ... whose mask covers the alarm B flag that used to be missed.
+    mask_def = re.search(r"#define RTC_CLEAR_ALL_FLAGS_MASK\s*\((.*?)\)\s*\n",
+                         rendered, re.S)
+    assert mask_def, "RTC_CLEAR_ALL_FLAGS_MASK not found"
+    mask = mask_def.group(1)
+    for bit in ("RTC_SCR_CALRAF", "RTC_SCR_CALRBF", "RTC_SCR_CWUTF",
+                "RTC_SCR_CTSF", "RTC_SCR_CTSOVF", "RTC_SCR_CITSF"):
+        assert bit in mask, f"{bit} missing from the clear-all mask"
+
+    # The pre-scheduler early-out must not fall back to a subset clear.
+    # Scope the search to the interrupt handler: rtc_timer_post_event() has
+    # the same guard at the top of the file and would match first.
+    isr_start = rendered.index("void RTC_TAMP_IRQHandler(void)\n{")
+    isr = rendered[isr_start:]
+    early = re.search(
+        r"if \(xTaskGetSchedulerState\(\) == taskSCHEDULER_NOT_STARTED\)"
+        r"\s*\{(.*?)\n    \}", isr, re.S)
+    assert early, "pre-scheduler early-out branch not found in the ISR"
+    body = early.group(1)
+    assert "rtc_clear_all_flags();" in body
+    assert "__HAL_RTC_WAKEUPTIMER_CLEAR_FLAG" not in body
+    assert "__HAL_RTC_ALARM_CLEAR_FLAG" not in body
+
+
 if __name__ == "__main__":
     test_main_c_template_basic()
     test_main_c_template_with_rtc()
@@ -430,4 +561,5 @@ if __name__ == "__main__":
     test_main_c_no_led_no_bootloader_no_flow()
     test_macros_template_available()
     test_template_environment_has_macros()
+    test_rtc_isr_acknowledges_every_flag_before_scheduler()
     print("All template_render tests passed.")

@@ -2,6 +2,7 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "event_mgr.h"
+#include "hw2c_fault.h"
 {% if has_log %}
 #include "drv_log.h"
 {% endif %}
@@ -11,12 +12,23 @@
 extern TaskHandle_t {{ pin.notify_task }}_handle;
 {% endfor %}
 
-void NMI_Handler(void) { while(1); }
-void HardFault_Handler(void) {
-    uint32_t sp;
-    __asm__("mov %0, sp" : "=r"(sp));
-    // 断点打在这里，查看sp指向的栈内存
-    while(1);
+/*
+ * NMI / HardFault
+ *
+ * Both used to spin in "while (1)".  That is not a safe state: interrupts stay
+ * enabled and, more importantly, the PWM peripheral keeps driving whatever
+ * duty was last programmed, so an actuator stays energised forever with no
+ * recovery.  hw2c_fault_trap() de-energises the outputs, records the reason
+ * and resets the MCU instead.
+ */
+void NMI_Handler(void)
+{
+    hw2c_fault_trap(HW2C_FAULT_NMI);
+}
+
+void HardFault_Handler(void)
+{
+    hw2c_fault_trap(HW2C_FAULT_HARDFAULT);
 }
 
 /* EXTI interrupt handlers */
@@ -26,8 +38,6 @@ void {{ handler }}(void)
     {% for pin in pin_list %}
     HAL_GPIO_EXTI_IRQHandler( GPIO_PIN_{{ pin.id[2:] }} );
     {% if pin.label == 'BUTTON' %}
-    /* DEBUG: toggle LED to confirm ISR entry */
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_0);
     if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED)
     {
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;

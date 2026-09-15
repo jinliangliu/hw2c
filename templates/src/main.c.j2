@@ -24,6 +24,9 @@
 /* Include event manager header (always present) */
 #include "event_mgr.h"
 
+/* Fail-safe fault handling (always present) */
+#include "hw2c_fault.h"
+
 {% if has_behavior %}
 #include "statemachine.h"
 {% endif %}
@@ -60,6 +63,24 @@
 {% if has_spi %}
 #include "spi_api.h"
 {% endif %}
+
+{#
+    Watchdog policy (P1-2 of docs/reviews/code-review-2026-09-15-misra-c99.md)
+
+    A watchdog is only worth arming when exactly one place can prove the system
+    is alive.  The component step task is that place: it runs the actual
+    control work, so if a sensor read blocks or a component step hangs the
+    refresh stops and the MCU resets.
+
+    The refresh used to live in the unrelated "rtc_demo" task, which does no
+    real work — it could keep feeding the dog while the control task was hung,
+    so the reset never happened.  The watchdog is therefore armed only when a
+    designated refresh owner exists; declaring IWDG without one would only
+    produce a guaranteed reset loop.
+#}
+{% set iwdg_refresh_owner = has_components or
+       (app_tasks | selectattr('name', 'eq', 'rtc_demo_task') | list | length > 0) %}
+{% set iwdg_enabled = has_iwdg and iwdg_refresh_owner %}
 
 /* GPIO initialization function */
 void MX_GPIO_Init(void);
@@ -145,7 +166,9 @@ void SystemClock_Config(void)
 {% else %}
     RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
 {% endif %}
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) while(1);
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        hw2c_fault_trap(HW2C_FAULT_CLOCK_INIT);
+    }
 
     RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1;
 {% if mcu.clock_freq_hz > mcu.hse_freq %}
@@ -159,7 +182,9 @@ void SystemClock_Config(void)
     RCC_OscInitStruct.HSIState = RCC_HSI_ON;
     RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
     RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) while(1);
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        hw2c_fault_trap(HW2C_FAULT_CLOCK_INIT);
+    }
 
     RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1;
     RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
@@ -167,11 +192,17 @@ void SystemClock_Config(void)
     RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
     RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
 {% if mcu.clock_freq_hz <= 16000000 %}
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) while(1);
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) {
+        hw2c_fault_trap(HW2C_FAULT_CLOCK_INIT);
+    }
 {% elif mcu.clock_freq_hz <= 48000000 %}
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK) while(1);
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK) {
+        hw2c_fault_trap(HW2C_FAULT_CLOCK_INIT);
+    }
 {% else %}
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) while(1);
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+        hw2c_fault_trap(HW2C_FAULT_CLOCK_INIT);
+    }
 {% endif %}
 }
 
@@ -193,7 +224,9 @@ static void MX_I2C{{ bus[-1] }}_Init(void)
     hi2c{{ bus[-1] }}.Init.OwnAddress2 = 0;
     hi2c{{ bus[-1] }}.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
     hi2c{{ bus[-1] }}.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-    if (HAL_I2C_Init(&hi2c{{ bus[-1] }}) != HAL_OK) while(1);
+    if (HAL_I2C_Init(&hi2c{{ bus[-1] }}) != HAL_OK) {
+        hw2c_fault_trap(HW2C_FAULT_PERIPH_INIT);
+    }
 }
 {% endfor %}
 
@@ -218,7 +251,9 @@ static void MX_SPI{{ bus[-1] }}_Init(void)
     hspi{{ bus[-1] }}.Init.FirstBit = SPI_FIRSTBIT_MSB;
     hspi{{ bus[-1] }}.Init.TIMode = SPI_TIMODE_DISABLE;
     hspi{{ bus[-1] }}.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-    if (HAL_SPI_Init(&hspi{{ bus[-1] }}) != HAL_OK) while(1);
+    if (HAL_SPI_Init(&hspi{{ bus[-1] }}) != HAL_OK) {
+        hw2c_fault_trap(HW2C_FAULT_PERIPH_INIT);
+    }
 }
 {% endfor %}
 
@@ -235,11 +270,33 @@ static void MX_{{ p.instance }}_UART_Init(void)
     huart_{{ p.name }}.Init.Mode = UART_MODE_TX_RX;
     huart_{{ p.name }}.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart_{{ p.name }}.Init.OverSampling = UART_OVERSAMPLING_16;
-    if (HAL_UART_Init(&huart_{{ p.name }}) != HAL_OK) while(1);
+    if (HAL_UART_Init(&huart_{{ p.name }}) != HAL_OK) {
+        hw2c_fault_trap(HW2C_FAULT_PERIPH_INIT);
+    }
 }
 {% endfor %}
 
 /* ------- Main ------- */
+/*
+ * Task creation with an explicit failure path.
+ *
+ * xTaskCreate() returns pdFAIL when the heap cannot supply the TCB + stack.
+ * Ignoring that left the firmware "running" without the task that does the
+ * work - e.g. no component step task, so the control loops never execute while
+ * the CLI still answers.  Before the scheduler starts there is no task to
+ * report to, so take the fail-safe path instead.
+ */
+static void create_task_checked(TaskFunction_t fn, const char *name,
+                                configSTACK_DEPTH_TYPE stack_words,
+                                void *params, UBaseType_t priority,
+                                TaskHandle_t *out_handle)
+{
+    if (xTaskCreate(fn, name, stack_words, params, priority,
+                    out_handle) != pdPASS) {
+        hw2c_fault_trap(HW2C_FAULT_RTOS_OBJECT);
+    }
+}
+
 int main(void)
 {
     HAL_Init();
@@ -299,6 +356,24 @@ int main(void)
         "====================================================\r\n"
     );
     log_info("{{ project_name }} v1.0 — Hardware2Code | {{ mcu.part }} @ {{ (mcu.clock_freq_hz / 1000000) | int }} MHz");
+
+    /*
+     * Report a fault trapped before the previous reset.  Without this the
+     * reset reason never leaves the device, because the log itself is lost
+     * on reset (see docs/reviews/code-review-2026-09-15-misra-c99.md P1-3).
+     */
+    {
+        uint32_t prev_fault = hw2c_fault_last();
+        if (prev_fault != HW2C_FAULT_NONE) {
+            log_error("previous reset: fault %lu (occurrence %lu) — outputs were forced safe",
+                      (unsigned long)prev_fault,
+                      (unsigned long)hw2c_fault_reset_count());
+            /* The reason has been reported; keep the counter so a reset loop
+             * stays visible, but drop the latch so it cannot be re-reported
+             * as if it were new. */
+            hw2c_fault_clear();
+        }
+    }
     log_flush();  /* Drain ring buffer completely */
     HAL_Delay(500);  /* Let UART finish all pending transmissions */
 {% endif %}
@@ -338,14 +413,28 @@ int main(void)
 {% endif %}
 {% endif %}
     /*
-     * Pre-scheduler FreeRTOS init (xQueueCreate/xTaskCreate in
-     * EventMgr_Init) may leave PRIMASK set on the ARMv6-M port until
-     * xPortStartScheduler() re-arms it.  Re-enable interrupts here so
-     * HAL_GetTick()-based waits below (LSE startup, I2C NACK timeout,
-     * ...) cannot spin forever during early init.
+     * ------------------------------------------------------------------
+     *  Interrupt-state repair — must stay immediately after EventMgr_Init()
+     * ------------------------------------------------------------------
+     *  EventMgr_Init() calls xQueueCreate(), whose heap path runs a
+     *  pre-scheduler critical section.  On the upstream ARMv6-M port that
+     *  leaves PRIMASK set, because ulCriticalNesting starts at the poison
+     *  value 0xAAAAAAAA and cannot reach 0 (see the block comment above
+     *  cli_init()/xTaskCreate() near the end of main()).
+     *
+     *  The vendored FreeRTOS sources are not modified, so interrupts are
+     *  re-enabled explicitly here.  No critical section is active at this
+     *  point, and every remaining pre-scheduler RTOS object creation is
+     *  deferred to the last block of main(), so this single repair lasts
+     *  until xPortStartScheduler() re-arms the port.
+     *
+     *  Without it every HAL_GetTick()-based wait below (LSE startup, I2C
+     *  registration and probe timeouts, SPI flash busy polls, IWDG init)
+     *  would spin forever because TIM14 never ticks.
+     * ------------------------------------------------------------------
      */
     __enable_irq();
-    
+
     /* Initialize I2C and internal peripherals */
 {% for bus in i2c_buses %}
     MX_I2C{{ bus[-1] }}_Init();
@@ -383,15 +472,6 @@ int main(void)
 {% endif %}
 {% endfor %}
 
-{% if has_cli %}
-{% if has_log and cli_uart_name == 'usart2' %}
-    /* USART2 shared with log — reuse log's initialized handle */
-    cli_init(log_get_huart());
-{% else %}
-    cli_init(&huart_{{ cli_uart_name }});
-{% endif %}
-{% endif %}
-
 {% if has_rtc %}
     RTC_Start();
 {% endif %}
@@ -399,48 +479,33 @@ int main(void)
     log_info("RTC_Init() OK");
 {% endif %}
 
-    /* Create application tasks (user-defined) */
-{% for task in app_tasks %}
-{% if not (has_fota and task.name == 'fota_task') %}
-    xTaskCreate( {{ task.name }}, "{{ task.name }}", {{ task.stack_size | default(128) }}, NULL, {{ task.priority }}, &{{ task.name }}_handle );
-{% endif %}
-{% endfor %}
-
-{% if has_cli %}
-    xTaskCreate(cli_task, "cli", {{ cli_stack_size|default(512) }}, NULL, {{ cli_priority|default(4) }}, NULL);
-{% endif %}
-
-{% if has_log %}
-    log_info("App tasks created");
-{% endif %}
-
-
-
-    /* Create the central event manager task (highest priority) */
-    xTaskCreate(EventMgr_Task, "event_mgr", 512, NULL, configMAX_PRIORITIES - 1, NULL);
-{% if has_log %}
-    log_info("EventMgr task created");
-{% endif %}
-
 {% if has_fota %}
     /* Initialize FOTA subsystem (protocol state machine + bspatch engine) */
     fota_init();
-    xTaskCreate(fota_task, "fota", 512, NULL, 1, NULL);
 {% if has_log %}
-    log_info("FOTA task created");
+    log_info("FOTA subsystem initialized");
 {% endif %}
 {% endif %}
 
 {% if has_components %}
-    /* Initialize all registered components */
+    /*
+     * Initialize all registered components.
+     *
+     * This must run BEFORE any RTOS object is created.  A component probe
+     * drives I2C/SPI transfers whose timeouts are measured with
+     * HAL_GetTick(), and the upstream ARMv6-M FreeRTOS port keeps
+     * interrupts masked across pre-scheduler critical sections (see the
+     * note above cli_init()/xTaskCreate() further down) — a tick-dependent
+     * wait placed after the first xQueueCreate/xTaskCreate would spin
+     * forever.  hw2c does not patch the vendored FreeRTOS sources, so the
+     * ordering carries the guarantee instead.
+     */
     {
         uint32_t comp_ok = component_init_all();
 {% if has_log %}
         log_info("component_init_all: %lu/%lu OK", comp_ok, component_count());
 {% endif %}
     }
-    /* Create component step task */
-    xTaskCreate(component_step_task, "comp_step", 512, NULL, 2, NULL);
 {% endif %}
 
 {% if has_topics %}
@@ -459,14 +524,6 @@ int main(void)
 {% endif %}
 {% endif %}
 
-{% if has_telemetry %}
-    /* Initialize telemetry subsystem (heartbeat, stack, heap monitoring) */
-    telemetry_init();
-{% if has_log %}
-    log_info("telemetry initialized");
-{% endif %}
-{% endif %}
-
 {% if has_power_mgr %}
     /* Initialize power manager (dynamic sleep depth) */
     power_mgr_init(POWER_MODE_{{ sleep.mode | default('STOP1') | upper }});
@@ -475,12 +532,20 @@ int main(void)
 {% endif %}
 {% endif %}
 
-{% if has_bootloader %}
-    /* 初始化 IWDG 看门狗 — App 挂死后硬件复位，Bootloader 检测 boot_ok 缺失 */
+{% if iwdg_enabled %}
+    /*
+     * Arm the independent watchdog.  From this point the MCU is reset unless
+     * the single appointed refresh site (see component_step_task) keeps
+     * running — a hung control loop can no longer leave an actuator energised.
+     */
     IWDG_Init();
 {% if has_log %}
-    log_info("IWDG initialized (timeout %lu ms)", {{ boot_config.wdg_timeout_ms | default(5000) }}UL);
+    log_info("IWDG armed (timeout %lu ms)", (unsigned long)IWDG_TIMEOUT_MS);
+{% endif %}
+{% endif %}
 
+{% if has_bootloader %}
+{% if has_log %}
     /* Flush all pending logs before touching sensitive TAMP registers */
     log_flush();
 {% endif %}
@@ -508,8 +573,86 @@ int main(void)
     HAL_DBGMCU_EnableDBGStopMode();
 {% endif %}
 
+    /*
+     * ==================================================================
+     *  Pre-scheduler RTOS object creation — this block must stay LAST.
+     * ==================================================================
+     *  The upstream FreeRTOS ARMv6-M port
+     *  (portable/GCC/ARM_CM0/port.c) initialises ulCriticalNesting to the
+     *  poison value 0xAAAAAAAA.  Before xPortStartScheduler() runs, the
+     *  first taskEXIT_CRITICAL() therefore decrements 0xAAAAAAAA back to
+     *  0xAAAAAAAA and never takes the "== 0" branch that restores PRIMASK:
+     *  interrupts stay masked until vPortStartFirstTask() executes
+     *  "cpsie i".
+     *
+     *  hw2c does not modify the vendored FreeRTOS / STM32 HAL / CMSIS
+     *  sources, so the generated code is ordered to respect the port
+     *  instead of patching it:
+     *
+     *    - every pre-scheduler FreeRTOS object creation
+     *      (xQueueCreate in EventMgr_Init, xSemaphoreCreateBinary in
+     *      cli_init, xTaskCreate in telemetry_init and the task
+     *      creations below) is confined to this block, and
+     *    - nothing in this block waits on the tick or on an interrupt.
+     *      All HAL_GetTick()-based waits (I2C probes, flash, IWDG) and all
+     *      interrupt-driven logging therefore happen above this block;
+     *      log_flush() is a polling drain and is safe anywhere.
+     *
+     *  EventMgr_Init() above is the only exception: it must run before
+     *  RTC_Start() because the RTC ISR posts to its queue, so it is
+     *  immediately followed by the __enable_irq() repair.
+     *
+     *  xPortStartScheduler() then resets ulCriticalNesting to 0 and
+     *  re-enables interrupts, so the state is well defined from the first
+     *  task onwards.
+     * ==================================================================
+     */
+{% if has_cli %}
+{% if has_log and cli_uart_name == 'usart2' %}
+    /* USART2 shared with log — reuse log's initialized handle */
+    cli_init(log_get_huart());
+{% else %}
+    cli_init(&huart_{{ cli_uart_name }});
+{% endif %}
+{% endif %}
+
+{% if has_telemetry %}
+    /* Initialize telemetry subsystem (heartbeat, stack, heap monitoring) */
+    telemetry_init();
+{% endif %}
+
+    /* Create application tasks (user-defined) */
+{% for task in app_tasks %}
+{% if not (has_fota and task.name == 'fota_task') %}
+    create_task_checked( {{ task.name }}, "{{ task.name }}", {{ task.stack_size | default(128) }}, NULL, {{ task.priority }}, &{{ task.name }}_handle );
+{% endif %}
+{% endfor %}
+
+{% if has_cli %}
+    create_task_checked(cli_task, "cli", {{ cli_stack_size|default(512) }}, NULL, {{ cli_priority|default(4) }}, NULL);
+{% endif %}
+
+    /* Create the central event manager task (highest priority) */
+    create_task_checked(EventMgr_Task, "event_mgr", 512, NULL, configMAX_PRIORITIES - 1, NULL);
+
+{% if has_fota %}
+    create_task_checked(fota_task, "fota", 512, NULL, 1, NULL);
+{% endif %}
+
+{% if has_components %}
+    /* Create component step task (sole IWDG refresh site) */
+    create_task_checked(component_step_task, "comp_step", 512, NULL, 2, NULL);
+{% endif %}
+
     vTaskStartScheduler();
-    while(1);
+
+    /*
+     * vTaskStartScheduler() only returns if the scheduler could not be
+     * started (no heap, idle task creation failed).  There is no system to
+     * fall back on, so take the fail-safe path rather than spin with the
+     * outputs at their last state.
+     */
+    hw2c_fault_trap(HW2C_FAULT_SCHEDULER);
 }
 
 /* ------- Task implementations ------- */
@@ -534,8 +677,8 @@ void {{ task.name }}(void *pvParameters)
      * rtc_demo_task only handles periodic IWDG refresh — do NOT duplicate tick/processing here.
      */
     while(1) {
-{% if has_bootloader %}
-        IWDG_Refresh();      /* Feed watchdog — prevent App deadlock from triggering reset */
+{% if iwdg_enabled and not has_components %}
+        IWDG_Refresh();      /* no component task in this build: this loop owns the refresh */
 {% endif %}
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -559,6 +702,14 @@ void component_step_task(void *arg)
     (void)arg;
     for (;;) {
         component_step_all();
+{% if iwdg_enabled %}
+        /*
+         * THE watchdog refresh site: reached only after every component step
+         * for this cycle has returned.  A step that blocks (stuck I2C bus,
+         * HAL timeout, deadlock) skips the refresh and the MCU resets.
+         */
+        IWDG_Refresh();
+{% endif %}
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }

@@ -30,7 +30,9 @@ void IWDG_Init(void)
      */
     hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
 
-    hiwdg.Init.Reload = {{ iwdg_reload_value if iwdg_reload_value is not none else 625 }};
+    /* IWDG_RELOAD_VALUE is generated in drv_iwdg.h from the same timeout, so
+     * the published IWDG_TIMEOUT_MS and the programmed countdown agree. */
+    hiwdg.Init.Reload = IWDG_RELOAD_VALUE;
 
     /*
      * Window option disabled — the refresh window is the full countdown range,
@@ -39,8 +41,13 @@ void IWDG_Init(void)
     hiwdg.Init.Window = IWDG_WINDOW_DISABLE;
 
     if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
-        /* IWDG init failure is fatal — software should not proceed */
-        while (1) {}
+        /*
+         * The watchdog is the last line of defence: if it cannot be armed the
+         * system must not keep running an actuator with no supervision.
+         * Reset immediately rather than spin here — a spin would hold the
+         * outputs at their current (possibly energised) state forever.
+         */
+        NVIC_SystemReset();
     }
 }
 

@@ -1,0 +1,136 @@
+{#
+    hw2c_fault.c.j2 - fail-safe fault handling (see hw2c_fault.h)
+
+    Context used: `peripherals` (to enumerate PWM actuator outputs).
+#}
+#ifdef TEST
+#include "mock_hal.h"
+#else
+#include "stm32g0xx_hal.h"
+#endif
+
+#include "hw2c_fault.h"
+
+{% set pwm_peris = peripherals | selectattr('type', 'eq', 'Internal_PWM') | list %}
+{% for p in pwm_peris %}
+#include "drv_{{ p.name }}.h"
+{% endfor %}
+
+/* ---------------------------------------------------------------------------
+ * Reset-surviving fault record
+ *
+ * The section is left untouched by the start-up code (see linker script), so
+ * the reason survives NVIC_SystemReset() and a watchdog reset.  A magic word
+ * is required before the contents are trusted, because SRAM values at power-up
+ * are undefined.
+ * ------------------------------------------------------------------------ */
+/*
+ * On the target the section is not initialised by the start-up code, so the
+ * reason survives NVIC_SystemReset() and a watchdog reset.  On the host
+ * (TEST) the default linker script knows nothing about .noinit, so the record
+ * falls back to ordinary zero-initialised storage and the tests stay
+ * deterministic.
+ */
+#if defined(__GNUC__) && !defined(TEST)
+#define HW2C_FAULT_NOINIT __attribute__((section(".noinit")))
+#else
+#define HW2C_FAULT_NOINIT
+#endif
+
+#define HW2C_FAULT_MAGIC   0x48573243UL   /* "HW2C" */
+
+typedef struct {
+    uint32_t magic;         /* HW2C_FAULT_MAGIC when the record is valid      */
+    uint32_t code;          /* last HW2C_FAULT_* code                          */
+    uint32_t reset_count;   /* consecutive trapped faults                      */
+} hw2c_fault_record_t;
+
+static volatile hw2c_fault_record_t g_fault_record HW2C_FAULT_NOINIT;
+
+static hw2c_fault_record_t *fault_rec(void)
+{
+    /* The attribute keeps the object out of .bss; the cast only removes the
+     * volatile qualifier so the fields can be written field by field. */
+    return (hw2c_fault_record_t *)&g_fault_record;
+}
+
+uint32_t hw2c_fault_last(void)
+{
+    const hw2c_fault_record_t *rec = fault_rec();
+    if (rec->magic != HW2C_FAULT_MAGIC) {
+        return HW2C_FAULT_NONE;
+    }
+    return rec->code;
+}
+
+uint32_t hw2c_fault_reset_count(void)
+{
+    const hw2c_fault_record_t *rec = fault_rec();
+    if (rec->magic != HW2C_FAULT_MAGIC) {
+        return 0U;
+    }
+    return rec->reset_count;
+}
+
+void hw2c_fault_clear(void)
+{
+    hw2c_fault_record_t *rec = fault_rec();
+    /* Only the reason is acknowledged; magic and reset_count survive so a
+     * reset loop keeps being counted. */
+    if (rec->magic == HW2C_FAULT_MAGIC) {
+        rec->code = HW2C_FAULT_NONE;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Safe state
+ * ------------------------------------------------------------------------ */
+void hw2c_safe_state(void)
+{
+{% if pwm_peris | length == 0 %}
+    /* No PWM actuator in this build: nothing to force inactive. */
+    ;
+{% endif %}
+{% for p in pwm_peris %}
+{%- set _pe = p.get('extra', {}) %}
+{%- set _model = p.get('model', {}) %}
+{%- set _chans = _pe.get('channels')
+        if _pe.get('channels')
+        else (_model.get('channels')
+              if _model.get('channels')
+              else [{'channel': _pe.get('channel', _model.get('channel', 1))}]) %}
+{% for ch in _chans %}
+    /* {{ p.name }} ch{{ ch.get('channel', 1) }}: duty 0 % then stop, so the
+     * output pin cannot remain driven even for one PWM period. */
+    (void){{ p.name }}_set_duty((uint8_t){{ ch.get('channel', 1) }}, 0U);
+    (void){{ p.name }}_stop((uint8_t){{ ch.get('channel', 1) }});
+{% endfor %}
+{% endfor %}
+}
+
+/* ---------------------------------------------------------------------------
+ * Trap
+ * ------------------------------------------------------------------------ */
+void hw2c_fault_trap(uint32_t code)
+{
+    hw2c_fault_record_t *rec;
+
+    /* 1) Nothing else may act on the system while it is being shut down. */
+    __disable_irq();
+
+    /* 2) De-energise the outputs before anything else — this is the step that
+     *    actually protects the plant. */
+    hw2c_safe_state();
+
+    /* 3) Record why, so the next boot can report it. */
+    rec = fault_rec();
+    if (rec->magic != HW2C_FAULT_MAGIC) {
+        rec->magic = HW2C_FAULT_MAGIC;
+        rec->reset_count = 0U;
+    }
+    rec->code = code;
+    rec->reset_count++;
+
+    /* 4) Restart under supervision rather than hanging with live outputs. */
+    NVIC_SystemReset();
+}
