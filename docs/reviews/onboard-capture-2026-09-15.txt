@@ -1,0 +1,214 @@
+hw2c 上板验证原始记录 — 2026-09-15
+目标：STM32G0B1RET6 @ 16 MHz HSI，DAP-Link (VID_0D28&PID_0204, CMSIS-DAP v2)
+工具：pyOCD 0.45.1 (隔离 venv) + libusb-package，target=stm32g0b1retx
+固件：output/base/build/base.bin（87040 B，含 P0-4 修复）
+串口：COM4 @ 115200（CP210x → USART2 PA2/PA3）
+
+================================================================
+[1] 烧录
+================================================================
+$ pyocd flash output/base/build/base.bin --target stm32g0b1retx -O reset_type=hw
+0001131 W Board ID 4485 is not recognized [mbed_board]
+0001707 I Loading ...\output\base\build\base.bin [load_cmd]
+0001710 I Erasing... [loader]
+0004033 I Programming... [loader]
+0008202 I Erased 86016 bytes (42 sectors), programmed 86016 bytes (84 pages),
+          identical 4096 bytes (4 pages) at 13.56 kB/s [loader]
+pyocd rc=0
+
+================================================================
+[2] 启动日志（复位后完整捕获）
+================================================================
+H   H  W   W  2222  CCCC
+H   H  W   W     2  C
+HHHHH  W W W   22   C
+H   H  WW WW  2     C
+H   H  W   W  2222  CCCC
+====================================================
+
+[2000-00-00 00:00:00.999] [INF] base v1.0 — Hardware2Code | STM32G0B1RET6 @ 16 MHz
+[2000-00-00 00:00:00.999] [INF] MX_GPIO_Init() OK
+[2000-00-00 00:00:00.999] [INF] EventMgr_Init() OK
+[2000-00-00 00:00:00.999] [INF] statemachine_init() OK
+[2000-00-00 00:00:00.999] [INF] RTC clock source: LSE (32.768kHz)
+[2026-07-29 22:07:00.002] [INF] temp_sensor_init() OK
+[2026-07-29 22:07:00.004] [INF] RTC_Init() OK
+[2026-07-29 22:07:00.006] [INF] component_init_all: 3/3 OK
+[2026-07-29 22:07:00.008] [INF] component_bus initialized (4 topics)
+[2026-07-29 22:07:00.011] [INF] param_registry initialized (7 params)
+[2026-07-29 22:07:00.013] [INF] PowerMgr: init, default=STOP1
+[2026-07-29 22:07:00.015] [INF] power_mgr initialized (default: STOP1)
+[2026-07-29 22:07:00.017] [INF] System ready — 3 components, 9288 B heap free, starting scheduler
+
+================================================================
+[3] 遥测快照（30 s 后自动打印）—— 证明调度器在运行
+================================================================
+[2026-07-29 22:07:30.015] [INF] === Telemetry Snapshot ===
+  Uptime: 30 s   Heartbeat: 1
+  Heap:   872 / 11264 bytes (min free 872)
+  Tasks(5):
+    event_mgr        stack 512 used=468 free=44 run=5
+    IDLE             stack 0 used=0 free=85 run=29964
+    comp_step        stack 512 used=59 free=453 run=0
+    cli              stack 512 used=40 free=472 run=0
+    Tmr Svc          stack 0 used=0 free=211 run=0
+  Min stack free: 44 words
+  Components: 3 total, 3 running, 0 error, 0 total-errors
+
+[2026-07-29 22:07:30.029] [INF] === PowerMgr Status ===
+  Allowed depth: STOP1   Default: STOP1
+  Components:
+    shell            state=2 compat=STOP1
+    led              state=2 compat=STOP1
+    btn              state=2 compat=STOP1
+=== End PowerMgr ===
+
+================================================================
+[4] CLI 功能验收（COM4 @115200）
+================================================================
+### help
+Available commands:
+  help             - Show available commands
+  version          - Show firmware version
+  uptime           - Show system uptime
+  free             - Show free heap memory
+  tasks            - List FreeRTOS tasks
+  reset            - Software reset MCU
+  gpio             - Read/write GPIO pins
+  led              - Control LED (on/off/toggle)
+  rtc              - RTC time operations
+  telemetry        - Telemetry snapshot log on/off
+  power            - Power modes (sleep/stop)
+  sysinfo          - System info (temp/RAM/flash)
+>
+
+### uptime
+Uptime: 0:01:03
+>
+
+### tasks
+cli             X       4       242     1
+IDLE            R       0       85      4
+comp_step       B       2       444     3
+Tmr Svc         B       3       211     5
+event_mgr       B       7       ...
+
+### sysinfo
+Temperature : 28.0 C
+Heap        : 10392 / 11264 bytes (used / total)
+Flash       : 82228 / 524288 bytes (used / total)
+>
+
+### rtc time
+RTC Time: 22:08:07  Date: 29/07/2026
+>
+
+### led on
+LED ON
+>
+
+### led off
+LED OFF
+>
+
+### power sleep
+Entering STOP1 (wake by RTC 1s / UART RX / button)...
+Woke up after 276 ms, RTC keeps time, RAM intact.
+>
+
+================================================================
+[5] 修复前：P0-4 中断风暴的硬件证据（同一固件的上一版）
+================================================================
+现象：串口停在 "statemachine_init() OK" 后 25 s 静默，不复位。
+
+PC 连续采样（每次 halt 后读）：
+  pc = 0x08008c20   xpsr = 0x21000012   IPSR = 18  (= IRQ 2 RTC_TAMP)
+  pc = 0x080043f0   xpsr = 0x01000012   IPSR = 18   (在 xTaskGetSchedulerState 内)
+  pc = 0x080043f8   xpsr = 0x21000012   IPSR = 18
+  pc = 0x08008bf8   xpsr = 0x61000012   IPSR = 18
+  pc = 0x08008c20   xpsr = 0x21000012   IPSR = 18
+
+addr2line:
+  0x08008bfc -> RTC_TAMP_IRQHandler        (0x08008be8..0x08008c48)
+  0x08008bf1 -> RTC_TAMP_IRQHandler
+
+反汇编（卡住处）：
+  08008be8 <RTC_TAMP_IRQHandler>:
+    8008bec: bl   80043e8 <xTaskGetSchedulerState>
+    8008bf0: movs r3, r0
+    8008bf2: cmp  r3, #1                 ; taskSCHEDULER_NOT_STARTED == 1?
+    8008bf4: bne.n 8008c30               ; 否 -> 走 HAL 处理路径
+    8008bfa: movs r2, #0xCA
+    8008bfc: str  r2, [r3, #36]          ; RTC->WPR = 0xCA   (停在这附近)
+    ...
+    8008c0a: ldr  r2, [r3, #92]          ; RTC->SCR  (偏移 0x5C)
+    8008c12: orrs r2, r1                 ; | RTC_SCR_CWUTF (bit2)
+    8008c14: str  r2, [r3, #92]
+    ...                                  ; 随后 | RTC_SCR_CALRAF (bit0)
+    8008c2c: str  r2, [r3, #36]          ; RTC->WPR = 0xFF
+
+RTC 寄存器实测：
+  40002800: 00221002 00260729 00007084 00000033   | TR DR SSR ISR
+  40002810: 00007fff 00000000 40007704 00000000   | PRER WUTR CR -
+  4000284c: 07007fdf 00000002 00000002 00000000   | ALRMBSSR SR MISR -
+  4000285c: 00000000 00000000                     | SCR OR
+
+  RTC_SR   = 0x02  → bit1 = RTC_SR_ALRBF（Alarm B 标志）唯一置位
+  RTC_MISR = 0x02  → 该源中断使能
+  RTC_CR   = 0x40007704 → bit8/9/10 = ALRAIE|ALRBIE|WUTIE 全开
+  RTC_SCR  = 0     → 清除寄存器从未被写过  ← 根因所在
+
+中断控制器：
+  NVIC ISER(0xE000E100) = 0x10080084 → 使能 IRQ 2(RTC_TAMP) 7(EXTI4_15) 19(TIM14) 28(USART2)
+  NVIC ISPR(0xE000E200) = 0x10080000 → TIM14 与 USART2 一直 pending 得不到服务
+  NVIC IABR(0xE000E300) = 0
+
+.noinit 故障记录 (0x20000438, 12 B)
+  00000000 00000000 00000000   → 全 0 = 未发生失效安全捕获 / 不是复位循环
+
+机制：RTC_Init() 里 RTC_TimerCreateMs(500, ...) 用 Alarm B 武装 500 ms 期限；
+RTC_Init() 返回后 main() 还有 component/bus/param/power/CLI/telemetry 初始化
+与全部 xTaskCreate()，远超 500 ms ⇒ Alarm B 在 vTaskStartScheduler() 之前到期
+⇒ 进 ISR 的 taskSCHEDULER_NOT_STARTED 早退分支 ⇒ 只清 WUTF/ALRAF，漏 ALRBF
+⇒ 标志寄存器只读、ALRBF 一直为 1 ⇒ 中断线持续拉高 ⇒ 退出即重入 ⇒ 死锁。
+
+修法：templates/drivers/drv_rtc.c.j2 新增 rtc_clear_all_flags()
+（掩码 CALRAF|CALRBF|CWUTF|CTSF|CTSOVF|CITSF，经 __HAL_RTC_CLEAR_FLAG 写 SCR），
+三处调用点（RTC_Init 陈旧标志清理 / 使能中断前的解除残留 / ISR 早退分支）全部改走它；
+初始化时补 HAL_RTC_DeactivateAlarm(A/B) 与 ALRA/ALRB/WUT 的 IT 失能。
+修复后重新烧录 ⇒ 见 [2]，完整启动成功。
+
+================================================================
+[6] 本轮回归汇总
+================================================================
+generate : ok=8 fail=0
+build    : ok=8 fail=0      （0 error；src 侧告警 9–16 条/例）
+hosttests: ok=8 fail=0      （含新增 test_hw2c_fault 6 项、test_iwdg 2 项）
+sil      : ok=8 fail=0
+pytest generator/tests tests: 306 passed
+
+================================================================
+[7] 复验：稳态再采样（烧录后持续运行约 4 分钟后，同一固件）
+================================================================
+$ pyocd cmd -t stm32g0b1retx -c halt -c "reg pc" -c "reg xpsr" \
+    -c "read32 0xE000E100 4" -c "read32 0xE000E200 4" -c "read32 0xE000E300 4" \
+    -c "read32 0x40002850 8"  -c "read32 0x4000281C 4" -c "read32 0x4000285C 4" \
+    -c "read32 0x20000438 12" -c "go"
+
+pc    = 0x0800400a   ->  prvIdleTask  (tasks.c)   ← 调度器在跑，CPU 处于空闲任务
+xpsr  = 0x61000000   ->  IPSR = 0                ← 不在任何异常上下文（对比修复前恒为 18）
+sp    = 0x20002928                               ← 线程栈有效
+
+NVIC ISER(0xE000E100) = 0x10080084  → IRQ 2(RTC_TAMP) 7(EXTI4_15) 19(TIM14) 28(USART2)，与修复前一致
+NVIC ISPR(0xE000E200) = 0x00000000  ← 无 pending（修复前 0x10080000，TIM14/USART2 被饿死）
+NVIC IABR(0xE000E300) = 0x00000000  ← 无 active
+
+RTC_SR (0x40002850)   = 0x00000000  ← ALRBF 已清（修复前 0x00000002，根因消除）
+RTC_MISR(0x40002854)  = 0x00000000  ← 无"使能且挂起"的中断源
+RTC_CR (0x4000281C)   = 0x00000000  ← ALRAIE/ALRBIE/WUTIE 当前均关（500 ms 单次已消费并按需重臂）
+RTC_SCR(0x4000285C)   = 0x00000000  ← 无待清标志
+
+.noinit(0x20000438, 12 B) = 00 00 00 00 00 00 00 00 00 00 00 00
+                            ← 全 0：运行 4 分钟未发生失效安全捕获、非复位循环
+
+结论：P0-4 修复在真机稳态下成立 —— 无中断风暴、无待决中断、CPU 正常进入空闲任务。

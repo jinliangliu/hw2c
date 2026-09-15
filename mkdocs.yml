@@ -85,6 +85,7 @@ nav:
     - Adding New MCU: developer-guide/adding-new-mcu.md
     - Plugin Development: developer-guide/plugin-development.md
   - Roadmap: roadmap/milestones.md
+  - Requirements: requirements.md
   - About:
     - Contributing: about/CONTRIBUTING.md
     - Vision: vision/full-architecture.md
