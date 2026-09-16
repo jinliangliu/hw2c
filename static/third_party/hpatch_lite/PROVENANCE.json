@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "vendored 第三方源码的来源清单。",
+    "'逐字节等于上游'由 generator/tests/test_vendor_integrity.py 依本清单校验；",
+    "校验口径 sha256，另记 blob_sha1（与 GitHub API 的 sha 同口径，便于比对）。",
+    "更新上游时：改 upstream_ref，重跑 tools/vendor_fetch.py，再跑测试。",
+    "⚠️ 本目录只读 —— 见 AGENTS.md 的供应商源码只读清单。"
+  ],
+  "name": "hpatch_lite",
+  "upstream_repo": "sisong/HDiffPatch",
+  "upstream_ref": "505eaa5f0bef2c4f70f02cc1bfe1448cf2bf54dc",
+  "upstream_ref_kind": "commit",
+  "pinned_via": "sisong/HPatchLite v1.0.2 的子模块 HDiffPatch",
+  "upstream_subdir": "libHDiffPatch/HPatchLite",
+  "license": "MIT",
+  "note": "只发布解码器；写侧在 HDiff/Diff 模块，本项目不使用",
+  "readonly": true,
+  "files": {
+    "hpatch_lite.c": {
+      "size": 14449,
+      "blob_sha1": "26aef9c9f3dde260e5e9d7f0ad65f894cbf71aa2",
+      "sha256": "717835029a2696af4c2cccff7d4cc5846cd144670d5b895f746fb9b830757baf"
+    },
+    "hpatch_lite.h": {
+      "size": 4539,
+      "blob_sha1": "65d3d18e8033b151ef94629a210312beb6e234a0",
+      "sha256": "939939df9f21b8533d958eb86ec225ef37da8bf541f03bee1cb5fa6d2ad0ac01"
+    },
+    "hpatch_lite_types.h": {
+      "size": 2810,
+      "blob_sha1": "536a1f8610878ff04de460f5a3eceb948c2e88cf",
+      "sha256": "7f94af399037baa52e5515e384cf78515cb1bdaef5322f9f0a8394a1ca855ffb"
+    },
+    "hpatch_lite_input_cache.h": {
+      "size": 808,
+      "blob_sha1": "aaa382925715e89cc53d5399c0cc81197f42f98c",
+      "sha256": "9c559da70d0034f406ea84c7d477c757c6670032ba1f97c9fd79e83afc8a8d98"
+    },
+    "LICENSE.txt": {
+      "size": 1072,
+      "blob_sha1": "fc818a188f76000825eebc16bca0416795a01444",
+      "sha256": "292fc79b7c542777216849277a8e45d6ab21bb42355f6da9a8f8045842aa2be1",
+      "is_license": true
+    }
+  }
+}

@@ -27,7 +27,8 @@ from .jinja_filters import register_filters
 from .merger import CSTCodeMerger
 from .models import HardwareModel
 from .mcu_database import MCUDatabase
-from .paths import STATIC_UNITY_DIR, HIL_RUNNER_PATH, RUN_TESTS_PATH, PATCH_CRC_PATH, TIMEBASE_SRC, TEMPLATES_DIR
+from .paths import (STATIC_UNITY_DIR, HIL_RUNNER_PATH, RUN_TESTS_PATH, PATCH_CRC_PATH,
+                    FOTA_FORMAT_PATH, TIMEBASE_SRC, TEMPLATES_DIR)
 from .registry import load_backend, get_default_backend
 from .validators.pin_conflict_validator import validate_pin_conflicts
 from .allocators.pin_allocator import PinAllocator
@@ -755,12 +756,18 @@ def render_templates(env: Environment, context: dict, output_dir: str,
             rendered = template.render(context)
             _write_file(out_path, rendered, dry_run, show_diff)
 
-        # 复制 CRC 后处理脚本
+        # 复制 CRC 后处理脚本 + 其格式真源
+        # patch_crc.py 在 output/<demo>/ 下独立运行，所以 fota_format.json 必须同行，
+        # 否则它会退回内置默认值 —— 那就又变成"两侧各写一份头部布局"了。
         crc_script = PATCH_CRC_PATH
         if os.path.exists(crc_script):
             if not dry_run:
                 shutil.copy(crc_script, os.path.join(output_dir, "patch_crc.py"))
             logger.info("Copied patch_crc.py")
+        if os.path.exists(FOTA_FORMAT_PATH):
+            if not dry_run:
+                shutil.copy(FOTA_FORMAT_PATH, os.path.join(output_dir, "fota_format.json"))
+            logger.info("Copied fota_format.json")
 
 
 def _run_compile_check(staging_dir: str, verbose: bool = False) -> tuple[bool, str]:

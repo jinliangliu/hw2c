@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "vendored 第三方源码的来源清单。",
+    "'逐字节等于上游'由 generator/tests/test_vendor_integrity.py 依本清单校验；",
+    "校验口径 sha256，另记 blob_sha1（与 GitHub API 的 sha 同口径，便于比对）。",
+    "更新上游时：改 upstream_ref，重跑 tools/vendor_fetch.py，再跑测试。",
+    "⚠️ 本目录只读 —— 见 AGENTS.md 的供应商源码只读清单。"
+  ],
+  "name": "decompress",
+  "upstream_repo": "sisong/tinyuz",
+  "upstream_ref": "v1.1.1",
+  "upstream_ref_kind": "tag",
+  "pinned_via": "v1.1.1",
+  "upstream_subdir": "decompress",
+  "license": "MIT",
+  "note": "只取 decompress/，不取 compress/（编码器由本项目自研）",
+  "readonly": true,
+  "files": {
+    "tuz_dec.c": {
+      "size": 15415,
+      "blob_sha1": "d8b7f8eeb0087ed457f689c4e7be3b904eae7bb6",
+      "sha256": "5d3ac1f28291a7fb3c3d4677adc91d2777bfb74289d382bf9de6b38530d2203a"
+    },
+    "tuz_dec.h": {
+      "size": 2781,
+      "blob_sha1": "b3c34e36d55416fa9518ca01396791bedf52fffc",
+      "sha256": "a96743aca0617dc3072a931d9d11c2811ef725c912fe7aa46f1c49c1828e6234"
+    },
+    "tuz_types.h": {
+      "size": 5156,
+      "blob_sha1": "e070b9060874df501a329f78a204ae1fd74bd513",
+      "sha256": "6cb5e20ee7bc505a72586c01b07d478465fd37be39b8198835abebcadc41eca9"
+    },
+    "tuz_types_private.h": {
+      "size": 765,
+      "blob_sha1": "d074bc1a33c6177c460f9c8ce9a9814737cb5dd1",
+      "sha256": "ba1590d16e960bc152817f7f789698d1618db2417ddda6287d8c96064944f17c"
+    },
+    "LICENSE.txt": {
+      "size": 1071,
+      "blob_sha1": "9a97a0ce4388e2e03078e6df4bc6dd996e4eaebc",
+      "sha256": "c1a85fe807916e13614a8cf3fbb0f2ad27d0df2d4613a5493d5e4439150c75cb",
+      "is_license": true
+    }
+  }
+}

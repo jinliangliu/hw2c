@@ -40,15 +40,22 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
-  /* 固件镜像头部（紧随向量表，偏移 0xC0, 12 字节）
+  /* 固件镜像头部（紧随向量表，偏移 0xC0，共 16 字节）
      Bootloader 从 slot_start + 0xC0 读取此头部。
-     格式: [image_size(4B) | CRC32(4B) | magic(4B)] */
+     格式（真源 generator/data/fota_format.json）:
+       +0x00 image_size (u32)  payload 字节数
+       +0x04 crc32      (u32)  CRC-32/MPEG-2，覆盖 magic + fw_version + payload
+       +0x08 magic      (u32)  0x4841436B
+       +0x0C fw_version (u32)  24-bit 有效
+     编译后由 patch_crc.py **原位回填**（不插入字节；插入会使镜像位移而
+     向量表/字面量池中的绝对地址失配）。 */
   .app_header :
   {
     . = ALIGN(4);
-    LONG(0xFFFFFFFF);         /* 镜像大小占位，编译后由 patch_crc.py 填充 */
-    LONG(0xFFFFFFFF);         /* CRC32 占位，编译后由 patch_crc.py 填充 */
-    LONG(0x4841436B);         /* magic "H2Ck"，标识有效头部 */
+    LONG(0xFFFFFFFF);         /* image_size 占位，编译后回填 */
+    LONG(0xFFFFFFFF);         /* crc32 占位，编译后回填 */
+    LONG(0x4841436B);         /* magic，标识有效头部 */
+    LONG(0xFFFFFFFF);         /* fw_version 占位，编译后回填 */
   } >FLASH
 
   .text :

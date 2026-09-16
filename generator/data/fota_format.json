@@ -1,0 +1,83 @@
+{
+  "_comment": [
+    "FOTA / 引导镜像格式的唯一真源。",
+    "C 侧（bootloader 模板、链接脚本模板）与 Python 侧（patch_crc.py、delta_tool.py）",
+    "都必须从本文件取值，不得各写一份 —— A3 类缺陷（两侧头部布局不一致）正是这样产生的。",
+    "改动本文件后，generator/tests/test_fota_format.py 会校验模板与实现仍然一致。",
+    "",
+    "⚠️ 关于 magic 的字节序：本文件给出的是「小端 u32 的数值」，而 on_flash_bytes 是",
+    "该数值在 Flash 中实际呈现的字节。注意 H2CK 的数值 0x4841436B 在内存里读出来是",
+    "'kCAH'（历史遗留，注释一度写作 \"H2Ck\"）。两者保持现状以免无谓变更格式，",
+    "但以数值做匹配、不以肉眼认字符串为准。test_fota_format.py 会钉死这一点。"
+  ],
+
+  "image_header": {
+    "_comment": [
+      "App 镜像头部，紧随向量表之后，位于每个 slot 内的固定偏移。",
+      "patch_crc.py 原位回填，绝不插入字节 —— 插入会使镜像整体位移，",
+      "而向量表与字面量池里的绝对地址不会跟着变（B1，已实测证实并修复）。",
+      "",
+      "CRC 覆盖范围刻意包含 magic 与 fw_version：fw_version 是『哪个槽更新』的判据，",
+      "若不被 CRC 覆盖，改版本号即可绕过完整性校验。故 CRC 起点是 magic 而非 payload。"
+    ],
+    "offset_in_slot": 192,
+    "offset_in_slot_hex": "0x000000C0",
+    "size": 16,
+    "fields": {
+      "image_size": {"offset": 0,  "size": 4, "type": "u32", "comment": "payload(=code) 字节数；镜像总占用 = 16 + image_size"},
+      "crc32":      {"offset": 4,  "size": 4, "type": "u32", "comment": "CRC-32/ISO-HDLC（≡ zlib.crc32，多项式 0x04C11DB7 反射形式 0xEDB88320、初值全 1、终值异或全 1）。⚠️ 早期注释写的 CRC-32/MPEG-2 是错的，两者结果不同；配置 STM32 CRC 外设时按 ISO-HDLC 配 REV_IN/REV_OUT，否则引导器会拒绝所有镜像。覆盖下 crc_region"},
+      "magic":      {"offset": 8,  "size": 4, "type": "u32", "value": 1212236651, "value_hex": "0x4841436B",
+                     "on_flash_bytes": "6b434148", "ascii_if_read_as_bytes": "kCAH",
+                     "comment": "历史遗留：数值 0x4841436B，内存中呈现为 'kCAH'。两侧一致即可，勿'顺手修正'。"},
+      "fw_version": {"offset": 12, "size": 4, "type": "u32", "comment": "24-bit 有效，高位保留"}
+    },
+    "payload_offset_in_slot": 208,
+    "payload_offset_in_slot_hex": "0x000000D0",
+    "crc_region": {
+      "start_offset_in_slot": 200,
+      "start_offset_in_slot_hex": "0x000000C8",
+      "start_field": "magic",
+      "length_addend": 8,
+      "comment": "覆盖长度 = image_size + length_addend（即 magic 4B + fw_version 4B + payload）"
+    },
+    "version_mask": 16777215,
+    "search_max": 512,
+    "search_align": 4
+  },
+
+  "delta_envelope": {
+    "_comment": [
+      "差分补丁的信封（外层）。内层是 HPatchLite 的 lite 补丁流。",
+      "信封独立于内层格式，用于在设备擦除任何一页之前判定补丁是否适用于当前固件版本。",
+      "HPatchLite 自身头部不含 old_size/old_crc32/new_crc32/头校验（见规划 §16.4）。",
+      "",
+      "⚠️ 相对规划 §4.2 的两处修订（2026-09-16，实施时定稿）：",
+      "① 32 B → 48 B。规划版没有 fw_version，而设备必须知道给新镜像写什么版本号。",
+      "   把它放进同一条记录，而不是拆到传输层 —— 拆开正是 A3（两侧头部布局不一致）的成因。",
+      "② old_crc32 / new_crc32 明确为 **payload（代码区）的 CRC32**，不是镜像头里的 crc32",
+      "   （后者还覆盖 magic 与 fw_version）。理由是 payload 的 CRC 与头部布局解耦，",
+      "   且老固件的 payload CRC 可随时用同一套算法重算，不依赖历史头部格式。",
+      "   设备侧另有 boot_crc_verify() 覆盖含版本号在内的整段，两者互补。"
+    ],
+    "size": 48,
+    "fields": {
+      "magic":       {"offset": 0,  "size": 4, "type": "u32", "value": 1145254472, "value_hex": "0x44433248",
+                      "on_flash_bytes": "48324344", "ascii_if_read_as_bytes": "H2CD",
+                      "comment": "本次新定的格式，取值以『内存里读出来是 H2CD』为准。"},
+      "format_ver":  {"offset": 4,  "size": 2, "type": "u16", "value": 1},
+      "flags":       {"offset": 6,  "size": 2, "type": "u16", "comment": "bit0=payload 经 tinyuz 压缩；其余保留，必须为 0"},
+      "old_size":    {"offset": 8,  "size": 4, "type": "u32", "comment": "旧镜像 payload 字节数"},
+      "old_crc32":   {"offset": 12, "size": 4, "type": "u32", "comment": "旧镜像 payload 的 CRC32"},
+      "new_size":    {"offset": 16, "size": 4, "type": "u32", "comment": "新镜像 payload 字节数"},
+      "new_crc32":   {"offset": 20, "size": 4, "type": "u32", "comment": "新镜像 payload 的 CRC32，解码完成后设备侧必须复算出相同值"},
+      "patch_size":  {"offset": 24, "size": 4, "type": "u32", "comment": "信封之后的 lite 补丁字节数（已压缩时 = 压缩后长度）"},
+      "fw_version":  {"offset": 28, "size": 4, "type": "u32", "comment": "本次升级后的固件版本号（24-bit 有效），设备据此回填新镜像头部"},
+      "hdr_crc16":   {"offset": 32, "size": 2, "type": "u16", "comment": "CRC-16/CCITT-FALSE 覆盖前 32 字节"},
+      "auth_len":    {"offset": 34, "size": 2, "type": "u16", "comment": "签名字节数，0 = 无签名"},
+      "reserved":    {"offset": 36, "size": 12, "type": "bytes", "comment": "置 0，留给将来（例如签名参数、压缩参数字节）"}
+    },
+    "flags_bits": {
+      "compressed": 1
+    }
+  }
+}

@@ -1,75 +1,114 @@
 /**
  * @file    boot_crc.c
  * @brief   STM32G0 硬件 CRC32 固件完整性校验实现
- *          镜像头部（向量表后 0xC0 偏移处）包含 image_size 和 CRC32。
+ *          镜像头部位于每个 slot 的 0xC0 偏移（紧随向量表）。
  *          依赖 stm32g0xx.h (CMSIS)，不依赖 HAL。
+ *
+ * 头部布局（唯一真源 generator/data/fota_format.json，勿在此另立一份）：
+ *   +0x00 image_size (u32)  payload(=code) 字节数
+ *   +0x04 crc32      (u32)  CRC-32/ISO-HDLC（≡ zlib.crc32，非 MPEG-2）
+ *   +0x08 magic      (u32)  0x4841436B
+ *   +0x0C fw_version (u32)  24-bit 有效
+ *   +0x10 payload
+ *
+ * CRC 覆盖 [+0x08, +0x10 + image_size)，即 magic + fw_version + payload。
+ * fw_version 被刻意纳入覆盖范围：它是「哪个槽更新」的判据，不被 CRC 覆盖
+ * 就可以被改写而仍通过校验。
  */
 
 #include "boot_crc.h"
 #include "stm32g0xx.h"
 
-/* 镜像头部定义 */
-#define APP_HEADER_MAGIC    0x4841436BUL   /* "H2Ck" */
-#define HEADER_SEARCH_MAX   0x200U         /* 在前 512 字节搜索 magic */
+/* ---- 镜像头部定义（与 fota_format.json 对齐，由 test_fota_format.py 校验）---- */
+#define APP_HEADER_MAGIC        0x4841436BUL   /* 数值匹配；内存中呈现为 'kCAH' */
+#define APP_HEADER_OFFSET       0xC0U          /* 向量表 48 项 × 4B 之后 */
+#define APP_HEADER_SIZE         16U
+#define APP_HEADER_MAGIC_OFF    8U             /* 相对头部起点 */
+#define APP_HEADER_VERSION_OFF  12U            /* 相对头部起点 */
+#define APP_HEADER_PAYLOAD_OFF  16U            /* 相对头部起点 */
+#define APP_CRC_REGION_OFF      8U             /* CRC 起点相对头部起点 = magic */
+#define APP_CRC_LENGTH_ADDEND   8U             /* CRC 长度 = image_size + 本值 */
+#define APP_VERSION_MASK        0x00FFFFFFUL
+
+#define HEADER_SEARCH_MAX       0x200U         /* 前 512 字节内搜索 magic */
+
+/**
+ * @brief  定位镜像头部（返回头部在 slot 内的偏移；0 表示未找到）
+ * @note   优先检查规范偏移 0xC0；失败才退化为扫描。之所以保留扫描，是为了
+ *         将来向量表变大（`.app_header` 随之后移）时不至于直接失效；
+ *         之所以先查固定偏移，是为了在代码中偶然出现同值常量时保持确定性。
+ */
+static uint32_t find_header_offset(uint32_t flash_start)
+{
+    uint32_t hdr = APP_HEADER_OFFSET;
+
+    if (((volatile uint32_t *)(flash_start + hdr + APP_HEADER_MAGIC_OFF))[0]
+            == APP_HEADER_MAGIC) {
+        return hdr;
+    }
+
+    for (uint32_t off = 0x40U; off + APP_HEADER_SIZE <= HEADER_SEARCH_MAX; off += 4U) {
+        if (off == APP_HEADER_OFFSET) {
+            continue;                       /* 上面已判过 */
+        }
+        if (((volatile uint32_t *)(flash_start + off + APP_HEADER_MAGIC_OFF))[0]
+                == APP_HEADER_MAGIC) {
+            return off;
+        }
+    }
+
+    return 0U;
+}
 
 /**
  * @brief  硬件 CRC32 固件完整性校验
  * @param  flash_start  固件槽位 Flash 起始地址
- * @param  slot_size    槽位总大小（未使用，保留兼容）
+ * @param  slot_size    槽位总大小（字节），用于 image_size 的上界检查
  * @return true 固件完整，false 校验失败或参数非法
- * @note   搜索 magic "H2Ck" 定位 Header，格式:
- *         [image_size(4B) | CRC32(4B) | magic(4B)] | payload...
- *         CRC 覆盖 payload 区域（magic 之后 image_size 字节）。
  */
 bool boot_crc_verify(uint32_t flash_start, uint32_t slot_size)
 {
-    (void)slot_size;    /* 槽位大小在新方案中不使用 */
-
-    if (flash_start == 0) {
+    if (flash_start == 0U) {
         return false;
     }
 
-    /* 在向量表后的 Flash 区域搜索 magic "H2Ck" 定位头部 */
-    uint32_t magic_offset = 0;
-    bool found = false;
-
-    for (uint32_t off = 0x40; off < HEADER_SEARCH_MAX; off += 4) {
-        if (((volatile uint32_t *)(flash_start + off))[0] == APP_HEADER_MAGIC) {
-            magic_offset = off;
-            found = true;
-            break;
-        }
+    uint32_t hdr = find_header_offset(flash_start);
+    if (hdr == 0U) {
+        return false;                       /* 未找到有效头部魔数 */
     }
 
-    if (!found) {
-        return false;             /* 未找到有效头部魔数 */
-    }
+    uint32_t image_size = ((volatile uint32_t *)(flash_start + hdr))[0];
+    uint32_t stored_crc = ((volatile uint32_t *)(flash_start + hdr + 4U))[0];
 
-    /* 头部位于 magic 之前 8 字节: image_size(4B) + CRC32(4B) */
-    uint32_t header_addr = flash_start + magic_offset - 8;
-
-    uint32_t image_size = ((volatile uint32_t *)header_addr)[0];
-    uint32_t stored_crc = ((volatile uint32_t *)header_addr)[1];
-
-    /* 校验 image_size 合法性（必须足够大，且不超过整个 Bank） */
-    uint32_t max_size = 0x00040000;   /* Bank 大小 256KB */
-    if (image_size == 0 || image_size == 0xFFFFFFFF || image_size > max_size) {
+    /* image_size 合法性：非空、非擦除态、字对齐、且头部 + payload 放得下槽位。
+     * 上界必须用调用方给出的 slot_size —— 硬编码 256KB 对 248KB 的 Slot A 是错的。 */
+    if (image_size == 0U || image_size == 0xFFFFFFFFUL) {
         return false;
     }
-    if ((image_size & 0x3) != 0) {
-        return false;                 /* 非字对齐 */
+    if ((image_size & 0x3U) != 0U) {
+        return false;                       /* 非字对齐 */
+    }
+    if (slot_size != 0U && (image_size + APP_HEADER_SIZE) > slot_size) {
+        return false;                       /* 越界：镜像比槽位还大 */
     }
 
-    /* 有效载荷起始地址: magic 之后（flash_start + magic_offset + 4） */
-    uint32_t payload_addr = flash_start + magic_offset + 4;
+    uint32_t crc_start    = flash_start + hdr + APP_CRC_REGION_OFF;
+    uint32_t crc_len      = image_size + APP_CRC_LENGTH_ADDEND;
 
     /* 使能 CRC 时钟 */
     RCC->AHBENR |= RCC_AHBENR_CRCEN;
 
-    /* 配置 CRC 为 CRC-32/MPEG-2 模式（与 patch_crc.py 一致）：
-     *   REV_IN=01 : 字内字节反转（输入位反转）
-     *   REV_OUT=1 : 输出位反转
-     *   多项式和初值使用默认值（0x04C11DB7 / 0xFFFFFFFF） */
+    /* 配置 CRC 外设以等价于 **CRC-32/ISO-HDLC**（≡ zlib.crc32，与
+     * patch_crc.stm32_crc32 一致）：
+     *   REV_IN=01 : 输入按字节位反转
+     *   REV_OUT=1 : 输出位反转（等价于终值异或 0xFFFFFFFF）
+     *   多项式与初值使用默认值（0x04C11DB7 / 0xFFFFFFFF）
+     *   DATA_WIDTH 默认 32-bit —— 故 crc_len 必须整除 4
+     *
+     * ⚠️ 早期注释把这里写成 "CRC-32/MPEG-2"，**是错的**。MPEG-2 变体不反射、
+     * 终值不异或，结果与 ISO-HDLC 不同；照 MPEG-2 配会让引导器拒绝所有镜像，
+     * 且极易误判为"硬件 CRC 外设有问题"。判据：本配置须算出
+     * crc32(b"123456789") == 0xCBF43926。 */
     CRC->CR |= CRC_CR_REV_IN_0 | CRC_CR_REV_OUT;
 
     /* 复位 CRC 模块 */
@@ -77,8 +116,8 @@ bool boot_crc_verify(uint32_t flash_start, uint32_t slot_size)
     CRC->CR &= ~CRC_CR_RESET;
 
     /* 按 32-bit 字逐字计算 CRC */
-    uint32_t word_count = image_size / 4;
-    uint32_t *pdata = (uint32_t *)payload_addr;
+    uint32_t word_count = crc_len / 4U;
+    volatile uint32_t *pdata = (volatile uint32_t *)crc_start;
 
     for (uint32_t i = 0; i < word_count; i++) {
         CRC->DR = pdata[i];
@@ -92,17 +131,22 @@ bool boot_crc_verify(uint32_t flash_start, uint32_t slot_size)
 /**
  * @brief   从固件头部读取版本号
  * @param   flash_start  固件 Flash 起始地址
- * @return  版本号 (0x00000001~0x00FFFFFF)，0 表示未找到
- * @note    格式: [image_size(4B)] [CRC32(4B)] [magic"H2Ck"(4B)] [fw_version(4B)] [payload...]
- *          fw_version 位于 magic 之后的 4 字节，是 payload 的一部分
+ * @return  版本号 (0x000001~0xFFFFFF)，0 表示未找到或无效
+ * @note    读的是头部里**显式预留**的 fw_version 字段（+0x0C）。
+ *          历史实现读 magic+4，依赖 patch_crc.py 在 payload 前插入 4 字节 ——
+ *          那个插入正是使镜像整体位移、绝对地址失配的 B1 缺陷。
  */
 uint32_t boot_read_fw_version(uint32_t flash_start)
 {
-    for (uint32_t off = 0x40; off < HEADER_SEARCH_MAX; off += 4) {
-        if (((volatile uint32_t *)(flash_start + off))[0] == APP_HEADER_MAGIC) {
-            /* fw_version 紧接在 magic 之后 */
-            return ((volatile uint32_t *)(flash_start + off))[1];
-        }
+    if (flash_start == 0U) {
+        return 0U;
     }
-    return 0;
+
+    uint32_t hdr = find_header_offset(flash_start);
+    if (hdr == 0U) {
+        return 0U;
+    }
+
+    uint32_t ver = ((volatile uint32_t *)(flash_start + hdr + APP_HEADER_VERSION_OFF))[0];
+    return (ver & APP_VERSION_MASK);
 }
