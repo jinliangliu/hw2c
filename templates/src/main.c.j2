@@ -479,7 +479,9 @@ int main(void)
 {% endif %}
 
 {% if has_fota_receive %}
-    /* Initialize FOTA subsystem (protocol state machine + bspatch engine) */
+    /* Initialize FOTA subsystem (receive state machine + staging metadata).
+     * Application of a staged patch is driven by fota_process() from the
+     * dedicated low-priority fota task, never from the CLI or an ISR. */
     fota_init();
 {% if has_log %}
     log_info("FOTA subsystem initialized");

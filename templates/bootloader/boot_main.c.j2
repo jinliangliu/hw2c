@@ -10,6 +10,12 @@
 #include "boot_crc.h"
 #include "boot_jump.h"
 #include "stm32g0xx.h"
+{% if has_fota %}
+/* FOTA 元数据（**与 App 共用同一个 .c**，见 fota_meta.h）。
+ * 引导器用它编译时定义 FOTA_META_READ_ONLY：只编出读路径，
+ * 所以这里不会引入 HAL 的任何依赖。 */
+#include "drv_fota_meta.h"
+{% endif %}
 
 /* ========== App 槽位地址 ========== */
 #define APP_A_START     {{ boot_config._app_a_start }}UL
@@ -157,39 +163,45 @@ int main(void)
     }
 
 {% if has_fota %}
-    /* --- 阶段 4.5: FOTA 补丁检测 ---
-     * 检查 TAMP BKP4R 中是否标记了待应用的固件更新。
-     * 若 Slot B 中有通过 FOTA 写⼊的新固件且版本号更高，自动切换。 */
-    #define FOTA_FLAG_PATCH_READY   0x02U
+    /* --- 阶段 4.5: 差分补丁落地检测 ---------------------------------------
+     *
+     * 读**FOTA 元数据页**里最新的一条记录（`fota_meta_load`），而不是
+     * TAMP 的 `BKP4R` —— 后者所在的方案基于"G0 的 TAMP 有 32 个备份寄存器"
+     * 这个错误前提（实际只有 5 个，且已被 boot_nvm 与旧 FOTA 标志占满），
+     * 详见 fota_meta.h 的开头。
+     *
+     * `state == DONE` 表示"App 已经把补丁应用到了 `slot` 指向的那个槽"。
+     * 引导器**只读**这份记录（`FOTA_META_READ_ONLY`），消费它（写一条 IDLE）
+     * 由 App 在确认自己跑起来之后做 —— 于是引导器完全不需要 HAL、不需要
+     * tick 时基，也不需要在"擦写 Flash 到一半掉电"上做任何设计。
+     *
+     * ⚠️ **只在目标槽通过 CRC 时才切过去**。这一条是"引导器只读"能成立的
+     * 前提：引导器没有清掉记录的能力，若不加这个闸门，"切过去 → CRC 失败
+     * → 退回旧槽 → 再切过去"就是死循环。加了闸门之后最坏情况只是每次复位
+     * 多验一次目标槽的 CRC（几十毫秒），而设备始终跑在能跑的那一版上。
+     */
+    {
+        fota_meta_t rec;
 
-    /* 使能 RTC/TAMP 时钟以读取备份寄存器 */
-    RCC->APBENR1 |= RCC_APBENR1_RTCAPBEN;
-    (void)RCC->APBENR1;  /* 等待总线同步 */
+        if (fota_meta_load(&rec) == 0
+            && rec.state == FOTA_META_STATE_DONE
+            && rec.slot != FOTA_META_SLOT_NONE) {
+            uint32_t target = (rec.slot == FOTA_META_SLOT_B) ? BOOT_SLOT_B
+                                                             : BOOT_SLOT_A;
+            uint32_t taddr  = (target == BOOT_SLOT_B) ? APP_B_START : APP_A_START;
+            uint32_t tsize  = (target == BOOT_SLOT_B) ? APP_B_SIZE  : APP_A_SIZE;
 
-    uint32_t fota_flags = TAMP->BKP4R;
-    if (fota_flags & FOTA_FLAG_PATCH_READY) {
-        /* Slot B 中有通过 FOTA 写入的新固件 */
-        uint32_t current_ver = boot_read_fw_version(
-            (slot == BOOT_SLOT_A) ? APP_A_START : APP_B_START);
-        uint32_t new_ver = boot_read_fw_version(APP_B_START);
+            if (target != slot && boot_crc_verify(taddr, tsize)) {
+                boot_nvm_swap_active_slot();
+                slot = boot_nvm_get_active_slot();
 
-        if (new_ver > 0 && new_ver > current_ver) {
-            /* 校验 Slot B 中的新固件 */
-            if (boot_crc_verify(APP_B_START, APP_B_SIZE)) {
-                /* 新固件有效，切换到 Slot B */
-                if (slot != BOOT_SLOT_B) {
-                    boot_nvm_swap_active_slot();
-                    slot = BOOT_SLOT_B;
-                }
-                /* 快速闪烁 3 次: FOTA 升级成功 */
+                /* 快速闪烁 3 次: 差分补丁落地 */
                 for (int i = 0; i < 3; i++) {
                     BOOT_LED_ON();  delay_ms(50);
                     BOOT_LED_OFF(); delay_ms(50);
                 }
             }
         }
-        /* 清除 FOTA 标志 */
-        TAMP->BKP4R = 0;
     }
 {% endif %}
 

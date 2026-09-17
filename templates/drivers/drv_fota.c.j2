@@ -1,299 +1,1134 @@
-#ifdef TEST
-#include "mock_hal.h"
-#else
-#include "stm32g0xx_hal.h"
-#endif
-#include "drv_{{ peripheral.uart_name }}.h"
+{#
+    drv_fota.c.j2 - FOTA 接收侧状态机（规划 P3）
+
+    职责边界（与 fota_delta 的分工见头文件）：
+      · 收帧、校验、ACK/NAK；
+      · 尾仓暂存（补丁落目标槽尾部，应用期只读 → 掉电免重传）；
+      · 持久元数据（专用 Flash 页，见 fota_meta.{c,h}）；
+      · 置安全态 → fota_delta_apply() → 提交 → 复位。
+
+    ⚠️ 本文件**没有** `#ifdef TEST` 分支（除间接依赖的 mock 寄存器模型外）：
+    主机侧跑的是同一份逻辑，测试只需提供 cli_set_rx_sink / cli_write_raw /
+    hw2c_fault_trap / IWDG_Refresh 这几个外部符号的替身。A9（mock 让测试失效）
+    的根因就是"测试跑的是替身"，这里把替身限制在**外部边界**上。
+#}
 #include "drv_fota.h"
-#include "drv_fota_bspatch.h"
+
+#include "drv_{{ cli_name }}.h"      /* cli_set_rx_sink / cli_write_raw / cli_rx_sink_active */
+#include "drv_iwdg.h"
+#include "hw2c_fault.h"
+
 #include <string.h>
 
-/*
- * Slot addresses — must match bootloader.ld and app_slot_*.ld
- */
-#define SLOT_A_ADDR     {{ boot_config.app_a_offset | default(0x08002000) }}UL
-#define SLOT_B_ADDR     {{ boot_config.app_b_offset | default(0x08040000) }}UL
+/* ===========================================================================
+ * 1. 静态状态
+ * =========================================================================== */
 
-#define CRC16_POLY      0x1021U
-#define ACK_TIMEOUT_MS  2000U
+static fota_state_t g_state = FOTA_STATE_IDLE;
 
-/* ---- Static state ---- */
+/* 接收缓冲：装得下最长的一帧（DATA）。帧是增量解析的，所以缓冲与"帧"等长，
+ * 与补丁大小无关 —— RAM 占用恒定。 */
+static uint8_t  g_rx[FOTA_MAX_FRAME];
+static uint16_t g_rx_len;             /* 已收字节数（含标记） */
+static uint16_t g_rx_need;            /* 本帧总长（含标记） */
+static uint8_t  g_rx_kind;            /* 0 = 等标记；否则 FOTA_FRAME_* */
 
-static fota_state_t   state = FOTA_STATE_IDLE;
-static uint8_t        chunk_buf[FOTA_CHUNK_SIZE + 4];  /* payload + seq/len header */
-static uint32_t       total_size = 0;
-static uint32_t       received_offset = 0;
-static uint16_t       expected_seq = 0;
-static uint32_t       progress_bytes = 0;
+/* 当前传输上下文（START 填，只在内存；复位后由暂存区与元数据重建） */
+static fota_delta_env_t g_env;
+static uint16_t g_expected_seq;
+static uint32_t g_slot;                /* 本次补丁的目标槽（FOTA_META_SLOT_*） */
+static uint32_t g_src_slot;
+static uint32_t g_dst_slot;
+static uint32_t g_dst_size;
+static uint32_t g_staging_base;       /* 暂存区基址（8 字节对齐） */
+static uint32_t g_staging_used;       /* 实际用到的字节数 = 48 + patch_size */
+static uint32_t g_staging_total;      /* 占用区长度 = align_up(used, 8)；擦除与避让按它算 */
+static uint32_t g_staged_bytes;       /* 已提交的**帧边界**字节数（相对 used） */
 
-/* ---- CRC-16/CCITT table ---- */
+/* 暂存写入器：Flash 只支持双字编程，攒满 8 字节再落盘 */
+static uint8_t  g_stage_pend[8];
+static uint8_t  g_stage_pend_len;
 
-static const uint16_t crc16_table[256] = {
-    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
-    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
-    0x1231, 0x0210, 0x3273, 0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6,
-    0x9339, 0x8318, 0xB37B, 0xA35A, 0xD3BD, 0xC39C, 0xF3FF, 0xE3DE,
-    0x2462, 0x3443, 0x0420, 0x1401, 0x64E6, 0x74C7, 0x44A4, 0x5485,
-    0xA56A, 0xB54B, 0x8528, 0x9509, 0xE5EE, 0xF5CF, 0xC5AC, 0xD58D,
-    0x3653, 0x2672, 0x1611, 0x0630, 0x76D7, 0x66F6, 0x5695, 0x46B4,
-    0xB75B, 0xA77A, 0x9719, 0x8738, 0xF7DF, 0xE7FE, 0xD79D, 0xC7BC,
-    0x48C4, 0x58E5, 0x6886, 0x78A7, 0x0840, 0x1861, 0x2802, 0x3823,
-    0xC9CC, 0xD9ED, 0xE98E, 0xF9AF, 0x8948, 0x9969, 0xA90A, 0xB92B,
-    0x5AF5, 0x4AD4, 0x7AB7, 0x6A96, 0x1A71, 0x0A50, 0x3A33, 0x2A12,
-    0xDBFD, 0xCBDC, 0xFBBF, 0xEB9E, 0x9B79, 0x8B58, 0xBB3B, 0xAB1A,
-    0x6CA6, 0x7C87, 0x4CE4, 0x5CC5, 0x2C22, 0x3C03, 0x0C60, 0x1C41,
-    0xEDAE, 0xFD8F, 0xCDEC, 0xDDCD, 0xAD2A, 0xBD0B, 0x8D68, 0x9D49,
-    0x7E97, 0x6EB6, 0x5ED5, 0x4EF4, 0x3E13, 0x2E32, 0x1E51, 0x0E70,
-    0xFF9F, 0xEFBE, 0xDFDD, 0xCFFC, 0xBF1B, 0xAF3A, 0x9F59, 0x8F78,
-    0x9188, 0x81A9, 0xB1CA, 0xA1EB, 0xD10C, 0xC12D, 0xF14E, 0xE16F,
-    0x1080, 0x00A1, 0x30C2, 0x20E3, 0x5004, 0x4025, 0x7046, 0x6067,
-    0x83B9, 0x9398, 0xA3FB, 0xB3DA, 0xC33D, 0xD31C, 0xE37F, 0xF35E,
-    0x02B1, 0x1290, 0x22F3, 0x32D2, 0x4235, 0x5214, 0x6277, 0x7256,
-    0xB5EA, 0xA5CB, 0x95A8, 0x8589, 0xF56E, 0xE54F, 0xD52C, 0xC50D,
-    0x34E2, 0x24C3, 0x14A0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
-    0xA7DB, 0xB7FA, 0x8799, 0x97B8, 0xE75F, 0xF77E, 0xC71D, 0xD73C,
-    0x26D3, 0x36F2, 0x0691, 0x16B0, 0x6657, 0x7676, 0x4615, 0x5634,
-    0xD94C, 0xC96D, 0xF90E, 0xE92F, 0x99C8, 0x89E9, 0xB98A, 0xA9AB,
-    0x5844, 0x4865, 0x7806, 0x6827, 0x18C0, 0x08E1, 0x3882, 0x28A3,
-    0xCB7D, 0xDB5C, 0xEB3F, 0xFB1E, 0x8BF9, 0x9BD8, 0xABBB, 0xBB9A,
-    0x4A75, 0x5A54, 0x6A37, 0x7A16, 0x0AF1, 0x1AD0, 0x2AB3, 0x3A92,
-    0xFD2E, 0xED0F, 0xDD6C, 0xCD4D, 0xBDAA, 0xAD8B, 0x9DE8, 0x8DC9,
-    0x7C26, 0x6C07, 0x5C64, 0x4C45, 0x3CA2, 0x2C83, 0x1CE0, 0x0CC1,
-    0xEF1F, 0xFF3E, 0xCF5D, 0xDF7C, 0xAF9B, 0xBFBA, 0x8FD9, 0x9FF8,
-    0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
-};
+/* 应用阶段 */
+static int      g_last_error = FOTA_E_NONE;
+static uint32_t g_apply_progress;
+static uint8_t  g_apply_requested;
+static uint32_t g_last_activity_ms;
+static uint8_t  g_flash_unlocked;
 
-/* ---- Internal helpers ---- */
+/* ===========================================================================
+ * 2. 元数据（专用 Flash 页，见 fota_meta.h）
+ *
+ * 这一节**原来**是"读写 TAMP 的 BKP5R..BKP9R"。那两个寄存器在
+ * STM32G0B1 上并不存在（TAMP 只有 BKP0R..BKP4R），所以整节被搬到了
+ * `fota_meta.{c,h}` —— 因为**引导器也要读同一份记录**，而两侧对布局的
+ * 理解必须逐字节一致。搬过去之后本文件不再直接碰元数据的字节排布。
+ *
+ * 留在这里的只有 `fota_crc16()`：它现在是共享实现（定义在 fota_meta.c，
+ * 声明在 fota_meta.h）。帧尾校验、信封校验、元数据自校验共用同一份 ——
+ * 三处各写一份时，算法漂移会表现成"所有校验都失败但看不出为什么"。
+ * =========================================================================== */
 
-static uint16_t crc16_compute(const uint8_t *data, uint16_t len)
+
+/* 备份域访问解锁。**只为了读 `TAMP->BKP1R`（boot_nvm 记的活动槽）与写
+ * `TAMP->BKP0R`（启动尝试计数）**，与元数据存储无关 —— 元数据已经搬到
+ * Flash 页里了（原因见 fota_meta.h）。
+ *
+ * 为什么本文件要自己解锁一次：备份域访问默认关闭，读回来的 BKPnR 恒为 0。
+ * 引导器里的 `boot_nvm_init()` 会解锁，但**这是 App 工程，不链接 boot_nvm** ——
+ * 少了这一句，`fota_active_slot()` 会把活动槽读成"槽 A"，于是永远认为目标
+ * 槽是 B —— 补丁会落到**正在运行的那个槽**上，把当前固件擦掉。
+ * 这类"看起来在工作"的错槽缺陷正是本仓库最贵的一类，所以解锁与读活动槽
+ * 之间不放任何别的东西。 */
+static void fota_bkp_unlock(void)
 {
-    uint16_t crc = 0xFFFFU;
-    for (uint16_t i = 0; i < len; i++) {
-        crc = (uint16_t)((crc << 8) ^ crc16_table[((crc >> 8) ^ data[i]) & 0xFF]);
-    }
-    return crc;
-}
-
-/*
- * =====================================================================
- *  TAMP BKP4R persistence (FOTA state survives power cycles)
- * =====================================================================
- */
-
-#ifndef TEST
-#include "stm32g0xx_hal.h"
-#include "stm32g0xx_ll_pwr.h"
-#include "stm32g0xx_ll_rtc.h"
-
-static void bkp_write(uint32_t val)
-{
-    /* Enable backup domain write access */
+    /* 与 boot_nvm_init() 同一套时序：PWR 时钟 → RTC/TAMP 时钟 → DBP 解锁。 */
+    RCC->APBENR1 |= RCC_APBENR1_PWREN;
+    RCC->APBENR1 |= RCC_APBENR1_RTCAPBEN;
+    PWR->CR1     |= PWR_CR1_DBP;
     HAL_PWR_EnableBkUpAccess();
-    /* Wait for DBP sync */
-    {
-        volatile uint32_t timeout = 100000U;
-        while ((PWR->CR1 & PWR_CR1_DBP) == 0U && timeout > 0U) { timeout--; }
+}
+
+/* ===========================================================================
+ * 3. Flash
+ *
+ * 页号语义随**运行期**的 DBANK 选项位变化：
+ *   · DBANK=1（双 bank）：Page 是 bank 内页号，Banks 选 bank；
+ *   · DBANK=0（单 bank）：Page 是全局页号，且只有 Bank1 合法。
+ * 选项字节在运行期可读，读它才能两种布局都对 —— 这不是猜配置。
+ *
+ * 换算本身只有一份实现：`fota_flash_locate()`（fota_meta.c），元数据页的
+ * 擦除也走它。
+ * =========================================================================== */
+
+static int fota_flash_erase_range(uint32_t addr, uint32_t len)
+{
+    uint32_t page = FOTA_FLASH_PAGE_SIZE;   /* 与元数据页同一个"擦除粒度" */
+    uint32_t off;
+    uint32_t end;
+
+    if (len == 0U) {
+        return 0;
     }
-    TAMP->BKP4R = val;
+    off = addr - (uint32_t)FLASH_BASE;
+    end = off + len;
+    off -= (off % page);                  /* 向下取整到页边界 */
+
+    while (off < end) {
+        FLASH_EraseInitTypeDef ei;
+        uint32_t page_error = 0U;
+
+        /* 页号/bank 的换算只有一份实现（`fota_meta.c`）—— 元数据页的擦除
+         * 也走它。这里原来自己算了一遍，而且把 DBANK 的位号写成了 mock
+         * 自己发明的 bit15（真值是 bit21），目标上编不过、主机上恒判单 bank。 */
+        ei.TypeErase = FLASH_TYPEERASE_PAGES;
+        ei.NbPages   = 1U;
+        fota_flash_locate((uint32_t)FLASH_BASE + off, &ei.Page, &ei.Banks);
+
+        if (HAL_FLASHEx_Erase(&ei, &page_error) != HAL_OK) {
+            g_last_error = FOTA_E_FLASH;
+            return -1;
+        }
+        off += page;
+        IWDG_Refresh();                   /* 擦一页喂一次：5 s IWDG 下要留余量 */
+    }
+    return 0;
 }
 
-static uint32_t bkp_read(void)
+typedef struct {
+    uint32_t cursor;                      /* 相对暂存区基址的读游标 */
+} fota_apply_ctx_t;
+
+static fota_apply_ctx_t g_apply_ctx;
+
+/* fota_delta_apply() 的 patch_read：从**暂存区**读，不碰 UART。
+ * 调用方（fota_apply_now）已把 cursor 置到信封之后（lite 流起点）。 */
+static uint32_t fota_be_patch_read(void *ctx, uint8_t *dst, uint32_t len)
 {
-    return TAMP->BKP4R;
+    fota_apply_ctx_t *c = (fota_apply_ctx_t *)ctx;
+    uint32_t avail;
+    uint32_t take;
+
+    if (c->cursor >= g_staging_used) {
+        return 0U;                        /* EOF 不是错误（与 HPatchLite 语义一致） */
+    }
+    avail = g_staging_used - c->cursor;
+    take  = (len < avail) ? len : avail;
+    memcpy(dst, (const void *)(g_staging_base + c->cursor), take);
+    c->cursor += take;
+    return take;
 }
 
-static void bkp_set_flag(uint32_t flag)
+static int fota_be_erase(void *ctx, uint32_t addr, uint32_t len)
 {
-    uint32_t val = bkp_read();
-    val |= flag;
-    bkp_write(val);
+    (void)ctx;
+
+    /* ⚠️ 这条是"边界差一页"缺陷的**运行时**拦网。
+     * 准入公式若少算一页，应用期擦除就会伸进暂存区，把正在读的补丁擦掉。
+     * 症状极其难查：补丁 CRC 在收齐时已经验过、新镜像 CRC 要等解码完才验，
+     * 中间没有任何一处能指出"补丁被擦掉了"这个根因，只会以 E_APPLY/E_CRC
+     * 的形式出现。宁可在擦除前一刻拒绝。
+     *
+     * ⚠️ 地址语义：后端契约里 `addr` 是**绝对 Flash 地址**（见 drv_fota_delta.h），
+     * `g_staging_base` 也是绝对的。这里**不能**再加一次 `FLASH_BASE` ——
+     * 早先写成 `FLASH_BASE + addr` 时，这个比较恒为假，拦网形同不存在；
+     * 而它偏偏只在"准入公式也算错"的边界情况下才该生效，于是永远不会在
+     * 正常测试里暴露。区间按半开 [addr, addr+len) 相交判断即可。 */
+    if ((addr < (g_staging_base + g_staging_total))
+        && ((addr + len) > g_staging_base)) {
+        g_last_error = FOTA_E_STAGING_FULL;
+        return -1;
+    }
+    return fota_flash_erase_range(addr, len);
 }
 
-static void bkp_clear_flags(void)
+static int fota_be_program(void *ctx, uint32_t addr, const uint8_t *src, uint32_t len)
 {
-    bkp_write(0);
+    uint32_t i;
+    uint32_t j;
+
+    (void)ctx;
+    if ((addr & 0x7U) != 0U || len == 0U || (len % 8U) != 0U) {
+        /* STM32G0 只支持双字编程；契约由 fota_delta 的页缓冲保证（补 0xFF）。 */
+        g_last_error = FOTA_E_FLASH;
+        return -1;
+    }
+    for (i = 0U; i < len; i += 8U) {
+        uint64_t word = 0U;
+        for (j = 0U; j < 8U; j++) {
+            word |= ((uint64_t)src[i + j]) << (8U * j);
+        }
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD, addr + i, word) != HAL_OK) {
+            g_last_error = FOTA_E_FLASH;
+            return -1;
+        }
+    }
+    return 0;
 }
-#else
-/* Mock implementations for test builds */
-static uint32_t mock_bkp4r = 0;
 
-static void bkp_write(uint32_t val) { mock_bkp4r = val; }
-static uint32_t bkp_read(void) { return mock_bkp4r; }
-static void bkp_set_flag(uint32_t flag) { mock_bkp4r |= flag; }
-static void bkp_clear_flags(void) { mock_bkp4r = 0; }
-#endif
+static void fota_be_read(void *ctx, uint32_t addr, uint8_t *dst, uint32_t len)
+{
+    (void)ctx;
+    memcpy(dst, (const void *)addr, len);  /* Flash 内存映射，直接取值 */
+}
 
-/* ---- Public API ---- */
+static void fota_be_watchdog(void *ctx)
+{
+    (void)ctx;
+    IWDG_Refresh();
+}
+
+static void fota_be_progress(void *ctx, uint32_t done, uint32_t total)
+{
+    (void)ctx;
+    g_apply_progress = (total == 0U)
+        ? 0U : (uint32_t)(((uint64_t)done * 100U) / (uint64_t)total);
+}
+
+/* ===========================================================================
+ * 4. 尾仓暂存
+ * =========================================================================== */
+
+static void fota_flash_lock(void)
+{
+    if (g_flash_unlocked) {
+        HAL_FLASH_Lock();
+        g_flash_unlocked = 0U;
+    }
+}
+
+static void fota_flash_unlock(void)
+{
+    if (!g_flash_unlocked) {
+        HAL_FLASH_Unlock();
+        g_flash_unlocked = 1U;
+    }
+}
+
+/* 把不足 8 字节的尾巴补 0xFF 后落盘。补 0xFF 而不是丢弃：
+ * 那些字节位置仍是擦除态，下一帧的真实数据可以正常写进去（Flash 只能 1→0）。 */
+static int fota_stage_program_pend(void)
+{
+    uint8_t buf[8];
+    uint8_t i;
+
+    if (g_stage_pend_len == 0U) {
+        return 0;
+    }
+    memcpy(buf, g_stage_pend, g_stage_pend_len);
+    for (i = g_stage_pend_len; i < 8U; i++) {
+        buf[i] = 0xFFU;
+    }
+    if (fota_be_program(NULL, g_staging_base + (g_staged_bytes - g_stage_pend_len),
+                        buf, 8U) != 0) {
+        return -1;
+    }
+    g_stage_pend_len = 0U;
+    return 0;
+}
+
+static int fota_stage_write(const uint8_t *data, uint32_t len)
+{
+    uint32_t i;
+
+    if ((g_staged_bytes + len) > g_staging_used) {
+        return -1;                        /* 越界：防的是实现自身的算术错 */
+    }
+    for (i = 0U; i < len; i++) {
+        g_stage_pend[g_stage_pend_len++] = data[i];
+        g_staged_bytes++;
+        if (g_stage_pend_len == 8U) {
+            if (fota_stage_program_pend() != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static int fota_stage_flush(void)
+{
+    return fota_stage_program_pend();
+}
+
+/* 回读整条记录复算 CRC32。
+ *
+ * 为什么不能只比对"声明值"：声明的 patch_crc32 是主机算的，而设备侧若
+ * 某次编程被硬件拒绝、调用方漏检返回值，暂存区的内容就是错的，但"声明值"
+ * 依然"匹配"（比对的是同一份内存里的数）。所以必须**从 Flash 回读**再算。 */
+static int fota_stage_verify(uint32_t expected_crc32)
+{
+    uint8_t  buf[256];
+    uint32_t crc  = FOTA_CRC32_INIT;
+    uint32_t done = 0U;
+
+    /* 覆盖范围是 **used**（48 + patch_size），不含为了双字对齐补的 0xFF 尾巴 ——
+     * 主机的 patch_crc32 算的就是那条记录本身。 */
+    while (done < g_staging_used) {
+        uint32_t take = g_staging_used - done;
+        if (take > (uint32_t)sizeof(buf)) {
+            take = (uint32_t)sizeof(buf);
+        }
+        memcpy(buf, (const void *)(g_staging_base + done), take);
+        crc = fota_delta_crc32_update(crc, buf, take);
+        done += take;
+        IWDG_Refresh();
+    }
+    crc ^= FOTA_CRC32_FINAL_XOR;
+    return (crc == expected_crc32) ? 0 : -1;
+}
+
+/* ===========================================================================
+ * 5. 应答（主机侧按帧标记在噪声中重新同步 —— 见 drv_cli.h 的 cli_write_raw）
+ * =========================================================================== */
+
+static void fota_send_resp(uint8_t marker, uint16_t seq)
+{
+    uint8_t frame[FOTA_RESP_FRAME_SIZE];
+
+    frame[0] = marker;
+    frame[1] = (uint8_t)(seq & 0xFFU);
+    frame[2] = (uint8_t)((seq >> 8) & 0xFFU);
+    cli_write_raw(frame, FOTA_RESP_FRAME_SIZE);
+}
+
+/* ===========================================================================
+ * 6. 帧解析
+ * =========================================================================== */
+
+static void fota_rx_reset(void)
+{
+    g_rx_len  = 0U;
+    g_rx_need = 0U;
+    g_rx_kind = 0U;
+}
+
+/* 当前**正在运行**的槽。活动槽由 boot_nvm 的 BKP1R 指出（0=A, 1=B）——
+ * 引导器跳转前会把它写好，所以 App 里读它是可信的（前置：fota_bkp_unlock()）。 */
+static uint32_t fota_active_slot(void)
+{
+    /* 刻意不复用 boot_nvm 的 0/1 编号：元数据里的 0 是 SLOT_NONE，
+     * 两套枚举在同一个文件里混用是最容易写错的一处。 */
+    return (TAMP->BKP1R == 0U) ? FOTA_META_SLOT_A : FOTA_META_SLOT_B;
+}
+
+static uint32_t fota_target_slot(void)
+{
+    /* 目标 = **非活动槽**（补丁要落到那个槽里，下次启动才切过去）。 */
+    return (fota_active_slot() == FOTA_META_SLOT_A) ? FOTA_META_SLOT_B
+                                                    : FOTA_META_SLOT_A;
+}
+
+/* 把收到的 48 B 当"流"喂给格式层 —— 复用 fota_delta_parse_env 的**全部**校验，
+ * 而不是在传输层再写一遍（那正是 A3 的成因）。
+ * 注意：parse_env 只读一次、且恰好读 FOTA_ENV_SIZE 字节；下面这个回调
+ * 每次都把请求的长度给足，因此不会出现第二次调用。 */
+static uint32_t fota_env_mem_read(void *ctx, uint8_t *dst, uint32_t len)
+{
+    memcpy(dst, (const uint8_t *)ctx, len);
+    return len;
+}
+
+/*
+ * 从**持久记录 + 暂存区里的信封**重建运行期上下文（只给 `fota_init` 的
+ * READY 分支用，即"收齐了但还没应用就掉电/复位"）。
+ *
+ * 为什么必须重建，而不是退回 IDLE 让主机重发 START ——
+ * READY 这个状态的全部价值就是"**整条补丁已经通过 CRC32 并落在暂存区里**"。
+ * 退回 IDLE 之后，START 重放会因为记录状态不是 RECEIVING 而走**完整重传**
+ * 分支（见 `fota_handle_start` ④），也就是把一份已经校验通过的补丁从暂存区
+ * 里擦掉重收。旧实现（BKP4R 的 `FOTA_FLAG_PATCH_READY`）刻意保存了这个语义，
+ * 元数据搬到 Flash 页的过程中曾一度丢掉它 —— 这里补回来。
+ *
+ * 能从 Flash 重建的前提，是**信封就存在暂存区头部**（`fota_handle_start`
+ * 的 else 分支特意先把它落盘，而不是只留在 RAM 里的 `g_env`）。
+ * 于是"掉电后重启"与"一路收完"共享同一份事实来源 —— 这正是当初把信封
+ * 落盘的理由，而这条路径是它的第一个真实用户。
+ *
+ * 派生关系必须与 `fota_handle_start` ③ 逐字对应（否则 apply 会按错的基址
+ * 去读/擦暂存区）：
+ *     patch_size   = rec->staged - FOTA_ENV_SIZE
+ *     staged_total = align8(rec->staged)
+ *     staging_base = slot_base + (slot_size - staged_total)
+ * ⚠️ `staged_total` 只能**由 rec->staged 反推**，不能先读 g_env：信封自己的
+ * 位置就取决于 staged_total，先要 g_env 是循环依赖。
+ *
+ * 任何一步对不上都返回 -1。调用方**必须**把它当作"这条记录不可信"处理，
+ * 而不是"尽量凑合着用"：下一步是拿这份数据去擦掉整个目标槽。
+ */
+static int fota_stage_restore(const fota_meta_t *rec)
+{
+    uint8_t  env_bytes[FOTA_ENV_SIZE];
+    uint32_t slot_base;
+    uint32_t slot_size;
+    uint32_t staged_total;
+    uint32_t staging_base;
+    uint32_t patch_size;
+    int      rc;
+
+    if (rec->slot != FOTA_META_SLOT_A && rec->slot != FOTA_META_SLOT_B) {
+        return -1;
+    }
+    /* staged 必须落在 (信封, 槽容量] 内：小于等于信封大小说明这条记录
+     * 根本不是 READY 该有的样子（READY 恒有 48 B 信封 + 至少 1 B 补丁）。 */
+    if (rec->staged <= FOTA_ENV_SIZE) {
+        return -1;
+    }
+
+    patch_size   = rec->staged - FOTA_ENV_SIZE;
+    staged_total = (rec->staged + 7U) & ~7U;
+
+    slot_base = (rec->slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_BASE : FOTA_SLOT_B_BASE;
+    slot_size = (rec->slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_SIZE : FOTA_SLOT_B_SIZE;
+    if (staged_total > slot_size) {
+        return -1;
+    }
+    staging_base = slot_base + (slot_size - staged_total);
+
+    /* 信封读回来交给格式层做**完整**校验（魔法 / 版本 / flags / 内部 CRC /
+     * 签名 / 长度），而不是在这里挑几个字段看一眼 —— 校验规则只能有一份，
+     * 挑着看就等于给"悄悄分叉"留了门（A3 的成因）。 */
+    memcpy(env_bytes, (const void *)(uintptr_t)staging_base, FOTA_ENV_SIZE);
+    rc = fota_delta_parse_env(fota_env_mem_read, env_bytes, &g_env);
+    if (rc != FOTA_DELTA_OK) {
+        return -1;
+    }
+
+    /* 交叉核对：记录里的 staged 与信封声明的 patch_size 必须对得上。
+     * 对不上说明这两样**不是同一次传输**（记录残留自上一轮、页被挪过、
+     * 或那截 Flash 已被别的东西覆写），此时按任何一方算出的基址都可能是
+     * 别人的地址 —— 而 apply 会照着它擦一整片。 */
+    if (g_env.patch_size != patch_size) {
+        return -1;
+    }
+
+    g_slot          = rec->slot;
+    g_dst_slot      = slot_base;
+    g_dst_size      = slot_size;
+    g_src_slot      = (rec->slot == FOTA_META_SLOT_A) ? FOTA_SLOT_B_BASE
+                                                      : FOTA_SLOT_A_BASE;
+    g_staging_used  = rec->staged;
+    g_staging_total = staged_total;
+    g_staging_base  = staging_base;
+    return 0;
+}
+
+static int fota_set_offline_error(int code)
+{
+    g_last_error = code;
+    g_state      = FOTA_STATE_ERROR;
+    fota_rx_reset();
+
+    /* ⚠️ 必须**同时交还 UART**。ERROR 是终态：不会再有 DATA/FINISH 能救回来，
+     * 而只要 sink 还装着，`cli_task` 就会把每一个字节都送进 `fota_rx_bytes`，
+     * 行编辑器再也收不到输入 —— 表现是"串口突然没反应了"，只有复位能恢复。
+     *
+     * 从 sink 回调里改 sink 是安全的（`cli_task` 每轮重新读取那个静态指针，
+     * 而且它拿到的是函数指针，不是缓冲区）。`fota_handle_finish` 的成功路径
+     * 早就在做同样的事。 */
+    if (cli_rx_sink_active() != 0U) {
+        cli_set_rx_sink(NULL);
+    }
+    return -1;
+}
+
+/*
+ * START 帧被拒：**留在 RECEIVING**，只记错误码。
+ *
+ * 与 `fota_set_offline_error` 的区别是刻意的，也是这里最容易改错的一处：
+ *
+ *   · START 阶段的一切拒绝（链路噪声导致 CRC16 不符 / 信封不合法 / 容量准入
+ *     不过）都是**可以由主机换一条补丁、或重发一次**来纠正的。若在这里把
+ *     状态置成 ERROR，操作员必须先 `fota erase` 才能重新 `fota recv` ——
+ *     "一次串口误码就要人手介入"是不该有的耦合。
+ *   · 反过来，DATA/FINISH 阶段的失败（暂存区编程被硬件拒绝、回读 CRC32 不符）
+ *     意味着**已经落盘的东西不可信**，必须停下来，不能继续把后面的字节
+ *     追加到一个已知损坏的记录上。那两处走 `fota_set_offline_error`。
+ *
+ * 不应答是同样的道理：ACK 是"我收下了这一条"的承诺。主机等不到 ACK 会
+ * 超时重发或放弃；这比回一个含义可疑的响应更明确。
+ */
+static int fota_reject_start(int code)
+{
+    g_last_error = code;
+    fota_rx_reset();
+    return -1;
+}
+
+static void fota_handle_start(void)
+{
+    uint8_t  env_bytes[FOTA_ENV_SIZE];
+    uint16_t crc_rx;
+    fota_meta_t rec;
+    uint32_t page = {{ fota_delta_page_size }}U;
+    uint32_t image_bytes;
+    uint32_t staged_raw;
+    uint32_t slot;
+    uint32_t slot_base;
+    uint32_t slot_size;
+    uint32_t staged_total;
+    uint32_t frames_est;
+    int      erased;
+    int      resume;
+    int      rc;
+
+    memcpy(env_bytes, &g_rx[1], FOTA_ENV_SIZE);
+    crc_rx = (uint16_t)(g_rx[1 + FOTA_ENV_SIZE]
+                        | ((uint16_t)g_rx[2 + FOTA_ENV_SIZE] << 8));
+
+    /* ① 传输级：整条 48 B 的 CRC16。信封自带的 hdr_crc16 只覆盖前 32 B，
+     * 覆盖不到 auth_len/reserved —— 两者范围不同，都要有。 */
+    if (fota_crc16(env_bytes, FOTA_ENV_SIZE) != crc_rx) {
+        (void)fota_reject_start(FOTA_E_IO);        /* 不应答，让主机超时重发 */
+        return;
+    }
+
+    /* ② 格式级：复用 fota_delta 的信封校验（魔法/版本/flags/内部 CRC/签名/长度） */
+    rc = fota_delta_parse_env(fota_env_mem_read, env_bytes, &g_env);
+    if (rc != FOTA_DELTA_OK) {
+        (void)fota_reject_start(rc);               /* 同上：留着接收态，等另一条 START */
+        return;
+    }
+
+    /* ③ 容量准入。**必须用"实际会擦掉的整页数"**，不能用 new_size：
+     * 擦除按整页做，用声明长度会让边界情况少算一页，从而把暂存区首页擦掉。 */
+    slot      = fota_target_slot();
+    slot_base = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_BASE : FOTA_SLOT_B_BASE;
+    slot_size = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_SIZE : FOTA_SLOT_B_SIZE;
+
+    image_bytes  = ((g_env.new_size + page - 1U) / page) * page;
+    staged_raw   = FOTA_ENV_SIZE + g_env.patch_size;
+    staged_total = (staged_raw + 7U) & ~7U;      /* 双字编程要求 8 字节对齐 */
+
+    if (image_bytes + staged_total > slot_size) {
+        (void)fota_reject_start(FOTA_E_STAGING_FULL);
+        return;
+    }
+
+    g_slot          = slot;
+    g_dst_slot      = slot_base;
+    g_dst_size      = slot_size;
+    g_src_slot      = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_B_BASE : FOTA_SLOT_A_BASE;
+    g_staging_used  = staged_raw;         /* 记录本身 = 48 B 信封 + patch_size */
+    g_staging_total = staged_total;       /* 占位长度 = 补到 8 字节对齐 */
+    g_staging_base  = slot_base + (slot_size - staged_total);
+
+    /* ④ 续传判定。三个条件缺一不可：
+     *    · 记录说"上次正在收同一条补丁"（状态 + 目标槽）；
+     *    · 进度落在 (信封大小, 暂存区长度) 的合法区间内且 8 字节对齐
+     *      —— 对齐是**硬条件**：暂存写入按双字推进，只有落在双字边界上才能
+     *      保证 padding 里的 0xFF 会被真实数据覆盖，而不是被错位写入；
+     *    · **暂存区里那份信封与来帧逐字节相同** —— 这才是"同一条补丁"的判据。
+     *
+     * 为什么不把 new_crc32/patch_size 存在元数据里再比（早期就是这么做的）：
+     * 那两个值本来就在暂存区开头的 48 B 信封里，而 START 阶段无论如何都要
+     * 处理来帧信封 —— 再存一份就是同一个事实两份真源，两侧不一致时只有
+     * "恰好都改了"才不会出错。
+     *
+     * ⚠️ 读的位置用**本次**算出来的 `g_staging_base`。若上次的 patch_size 与
+     * 本次不同，那个位置上放的不是信封（而是补丁正文或擦除态），memcmp 必然
+     * 不等 ⇒ 正确地退回完整重传。反过来，若位置对得上，就一定是同一条补丁。 */
+    resume = 0;
+    if (fota_meta_load(&rec) == 0
+        && rec.state == FOTA_META_STATE_RECEIVING
+        && rec.slot == slot
+        && rec.staged > FOTA_ENV_SIZE
+        && rec.staged < staged_total
+        && (rec.staged % 8U) == 0U
+        && memcmp((const void *)(uintptr_t)g_staging_base, env_bytes,
+                  FOTA_ENV_SIZE) == 0) {
+        resume = 1;
+    }
+
+    /* 让日志给本次传输留够空位。**页擦除必须挪到传输开始之前**：擦一页会让
+     * 整页元数据同时消失，落在传输中途就等于白白丢掉已经收了几百 KB 的断点。
+     * 此刻还没开始收数据，丢掉记录最坏只是让主机多传一遍 START。
+     * 擦过之后下面无论走哪条分支都会重新写一条记录。 */
+    frames_est = (g_env.patch_size + FOTA_CHUNK_SIZE - 1U) / FOTA_CHUNK_SIZE;
+    (void)fota_meta_reserve(frames_est + 4U, &erased);
+
+    fota_flash_unlock();
+
+    if (resume != 0) {
+        g_staged_bytes   = rec.staged;
+        g_stage_pend_len = 0U;
+        g_expected_seq   = (uint16_t)((rec.staged - FOTA_ENV_SIZE) / FOTA_CHUNK_SIZE);
+    } else {
+        if (fota_flash_erase_range(g_staging_base, staged_total) != 0) {
+            /* 擦除失败 ⇒ 暂存区内容未知。**必须**把元数据清掉：否则下一次
+             * START 若身份恰好相同（同一条补丁重发）就会走"续传"，从一片
+             * 半擦除的区域上接着追加 —— 收齐时的 CRC32 会兜住，但那是把
+             * 一个可以立刻避免的失败推迟到最后。清掉之后重传是确定性的。 */
+            /* 暂存区内容已不可知 ⇒ 记一条"这次不算数"，让下次 START 走
+             * 完整重传而不是从半擦除的区域上接着追加。 */
+            (void)fota_meta_consume();
+            (void)fota_reject_start(FOTA_E_FLASH);
+            return;
+        }
+        g_staged_bytes   = 0U;
+        g_stage_pend_len = 0U;
+        g_expected_seq   = 0U;
+        /* 信封先落盘：应用期读的是暂存区，而不是内存里的 g_env。
+         * 这样"掉电后重启进程"与"一路收完"走的是同一段代码。 */
+        if (fota_stage_write(env_bytes, FOTA_ENV_SIZE) != 0) {
+            /* 暂存区内容已不可知 ⇒ 记一条"这次不算数"，让下次 START 走
+             * 完整重传而不是从半擦除的区域上接着追加。 */
+            (void)fota_meta_consume();
+            (void)fota_reject_start(FOTA_E_FLASH);
+            return;
+        }
+    }
+
+    (void)fota_meta_append(FOTA_META_STATE_RECEIVING, slot, g_staged_bytes);
+
+    g_state            = FOTA_STATE_RECEIVING;
+    g_apply_progress   = 0U;
+    g_last_activity_ms = HAL_GetTick();
+    fota_rx_reset();
+
+    /* ACK 携带"我要的下一片序号"：续传时直接告诉主机从哪儿接着发。 */
+    fota_send_resp(FOTA_PROTOCOL_ACK, g_expected_seq);
+}
+
+static void fota_handle_data(void)
+{
+    uint16_t seq  = (uint16_t)(g_rx[1] | ((uint16_t)g_rx[2] << 8));
+    uint16_t dlen = (uint16_t)(g_rx[3] | ((uint16_t)g_rx[4] << 8));
+    uint16_t crc_rx;
+    const uint8_t *payload = &g_rx[5];
+
+    crc_rx = (uint16_t)(g_rx[5 + dlen] | ((uint16_t)g_rx[6 + dlen] << 8));
+
+    /* ① CRC 覆盖 seq|len|data。**刻意包含 seq/len**：只覆盖 data 时，
+     * 被损坏的 seq 会静默改变重传语义、被损坏的 len 会静默改变写入长度。 */
+    if (fota_crc16(&g_rx[1], 4U + (uint32_t)dlen) != crc_rx) {
+        fota_send_resp(FOTA_PROTOCOL_NAK, g_expected_seq);
+        return;
+    }
+    /* ② 乱序 / 重复：重发**上一次**的 ACK（携带当前期望序号）。
+     * 主机据此回退 —— 比丢弃更明确，也避免了"ACK 丢了导致停滞"。 */
+    if (seq != g_expected_seq) {
+        fota_send_resp(FOTA_PROTOCOL_ACK, g_expected_seq);
+        return;
+    }
+
+    if (fota_stage_write(payload, (uint32_t)dlen) != 0) {
+        (void)fota_set_offline_error(FOTA_E_FLASH);
+        fota_flash_lock();
+        return;
+    }
+
+    g_expected_seq++;
+    g_last_activity_ms = HAL_GetTick();
+
+    /* 每帧提交一次进度：这就是"掉电免重传"的粒度。
+     * 一条记录 = 3 个双字编程（约零点几毫秒），相对一次 1 KB 的暂存编程
+     * 可以忽略；换来的是"任意一次掉电最多退回一帧"。
+     * 页擦除已由 START 阶段的 `fota_meta_reserve()` 提前腾好空间，
+     * 所以传输途中不会再触发擦除。 */
+    (void)fota_meta_append(FOTA_META_STATE_RECEIVING, g_slot, g_staged_bytes);
+
+    fota_send_resp(FOTA_PROTOCOL_ACK, g_expected_seq);
+}
+
+static void fota_handle_finish(void)
+{
+    uint32_t crc_rx = (uint32_t)g_rx[1]
+                    | ((uint32_t)g_rx[2] << 8)
+                    | ((uint32_t)g_rx[3] << 16)
+                    | ((uint32_t)g_rx[4] << 24);
+
+    if (g_staged_bytes != g_staging_used) {
+        /* 收得不全就来 FINISH：NAK 并把**当前期望序号**回给主机，让它从断点继续。
+         *
+         * 这里同样**不置 ERROR**（与 START 阶段的理由一致）：缺口可以由主机补发，
+         * 而 ERROR 会让 `fota recv` 拒绝再次进入接收态，逼着操作员先 `fota erase`。
+         * 这也是"NAK 携带 want_seq"这个设计的全部意义 —— 若 NAK 意味着进入终态，
+         * 携带序号就没有用了。 */
+        g_last_error = FOTA_E_SHORT;
+        fota_send_resp(FOTA_PROTOCOL_NAK, g_expected_seq);
+        return;
+    }
+    if (fota_stage_flush() != 0) {
+        (void)fota_set_offline_error(FOTA_E_FLASH);
+        fota_flash_lock();
+        return;
+    }
+    /* 从 Flash 回读整条记录复算 CRC32 —— 这一步同时证明"真的写进去了"。 */
+    if (fota_stage_verify(crc_rx) != 0) {
+        (void)fota_set_offline_error(FOTA_E_PATCH_CRC);
+        fota_send_resp(FOTA_PROTOCOL_NAK, 0U);
+        fota_flash_lock();
+        return;
+    }
+
+    /* 提交点：先确认补丁整条落在 Flash 里（上面的 stage_verify 刚回读复算过
+     * CRC32），再把 READY 写进元数据。反过来先写 READY，就会出现"引导器认为
+     * 有一条待应用的补丁、而暂存区其实不完整"的状态。 */
+    (void)fota_meta_append(FOTA_META_STATE_READY, g_slot, g_staging_used);
+
+    g_state           = FOTA_STATE_READY;
+    g_apply_requested = 1U;               /* 交给 fota_process：不在中断/接收路径里擦 Flash */
+    g_apply_progress  = 0U;
+    fota_flash_lock();
+    fota_rx_reset();
+
+    fota_send_resp(FOTA_PROTOCOL_ACK, g_expected_seq);
+
+    /* 交还 UART：接下来 fota_process 会在 fota 任务上下文里同步跑完应用。 */
+    cli_set_rx_sink(NULL);
+}
+
+void fota_rx_bytes(const uint8_t *data, uint16_t len)
+{
+    uint16_t i;
+
+    for (i = 0U; i < len; i++) {
+        uint8_t b = data[i];
+
+        if (g_rx_kind == 0U) {
+            /* 等标记。非标记字节直接丢弃 —— 这样"日志文本混进接收流"
+             * 或"上一帧被截断后残留的半帧"都能自动重新同步。 */
+            if (b == (uint8_t)FOTA_FRAME_START) {
+                g_rx_kind = (uint8_t)FOTA_FRAME_START;
+                g_rx_need = (uint16_t)FOTA_START_FRAME_SIZE;
+            } else if (b == (uint8_t)FOTA_FRAME_DATA) {
+                g_rx_kind = (uint8_t)FOTA_FRAME_DATA;
+                g_rx_need = (uint16_t)FOTA_DATA_OVERHEAD;
+            } else if (b == (uint8_t)FOTA_FRAME_FINISH) {
+                g_rx_kind = (uint8_t)FOTA_FRAME_FINISH;
+                g_rx_need = (uint16_t)FOTA_FINISH_FRAME_SIZE;
+            } else {
+                continue;
+            }
+            g_rx[0]     = b;
+            g_rx_len    = 1U;
+            g_last_activity_ms = HAL_GetTick();
+            continue;
+        }
+
+        if (g_rx_len >= (uint16_t)sizeof(g_rx)) {
+            fota_rx_reset();              /* 防御：不应发生（need 恒 ≤ sizeof） */
+            continue;
+        }
+        g_rx[g_rx_len++] = b;
+        g_last_activity_ms = HAL_GetTick();
+
+        if (g_rx_kind == (uint8_t)FOTA_FRAME_DATA
+            && g_rx_len == (uint16_t)FOTA_DATA_OVERHEAD) {
+            /* 定长头齐了，按 len 推出整帧长度 */
+            uint16_t dlen = (uint16_t)(g_rx[3] | ((uint16_t)g_rx[4] << 8));
+            if (dlen == 0U || dlen > (uint16_t)FOTA_CHUNK_SIZE) {
+                fota_rx_reset();
+                continue;
+            }
+            g_rx_need = (uint16_t)(FOTA_DATA_OVERHEAD + (uint16_t)dlen);
+        }
+
+        if (g_rx_len == g_rx_need) {
+            /* ⚠️ 复位解析器位置**在调用处理函数之前**，而且缓冲区内容保留 ——
+             * 处理函数还要从 g_rx 里取字段（信封、seq、载荷）。
+             *
+             * 为什么不是"让每个处理函数自己记得复位"：那样每新增一个 return
+             * 分支就多一次遗漏的机会。事实正是如此 —— 早先 DATA 的成功分支
+             * 就没复位，第一条分片处理完之后解析器停在"已收满但仍属于上一帧"
+             * 的状态，之后每个字节都只是把 g_rx_len 越推越大，直到缓冲区满
+             * 才整体丢弃。症状是"第一条 DATA 之后设备就不理人了"，而它不会
+             * 报任何错。把复位放在唯一的出口位置，这条不变量就不再依赖记性。 */
+            uint8_t kind = g_rx_kind;
+
+            g_rx_len  = 0U;
+            g_rx_need = 0U;
+            g_rx_kind = 0U;
+
+            if (kind == (uint8_t)FOTA_FRAME_DATA) {
+                fota_handle_data();
+            } else if (kind == (uint8_t)FOTA_FRAME_START) {
+                fota_handle_start();
+            } else {
+                fota_handle_finish();
+            }
+        }
+    }
+}
+
+/* ===========================================================================
+ * 7. 应用编排
+ * =========================================================================== */
+
+static void fota_apply_now(void)
+{
+    fota_delta_backend_t io;
+    int derr = 0;
+    int rc;
+
+    g_state          = FOTA_STATE_APPLYING;
+    g_apply_progress = 0U;
+    (void)fota_meta_append(FOTA_META_STATE_APPLYING, g_slot,
+                           g_staging_used);
+
+    /* 规划 §11.3：擦写 Flash 期间执行器必须处于安全态。
+     * 对带 PWM/继电器/电磁阀的工程，"升级期间执行器带电"是**安全事故**，
+     * 不只是功能缺陷。 */
+    hw2c_safe_state();
+
+    io.patch_read = fota_be_patch_read;
+    io.erase      = fota_be_erase;
+    io.program    = fota_be_program;
+    io.read       = fota_be_read;
+    io.watchdog   = fota_be_watchdog;
+    io.progress   = fota_be_progress;
+    io.ctx        = &g_apply_ctx;
+
+    /* fota_delta_apply 的约定：patch_read 的第一次读取应返回 **lite 流**首字节，
+     * 也就是要跳过前面 48 B 信封。 */
+    g_apply_ctx.cursor = FOTA_ENV_SIZE;
+
+    fota_flash_unlock();
+    rc = fota_delta_apply(&g_env, &io, g_src_slot, g_dst_slot, g_dst_size, &derr);
+    fota_flash_lock();
+
+    if (rc != FOTA_DELTA_OK) {
+        g_last_error = (derr != 0) ? derr : rc;
+        g_state      = FOTA_STATE_ERROR;
+        (void)fota_meta_append(FOTA_META_STATE_ERROR, g_slot,
+                               g_staging_used);
+        /* 失败时活动槽**未被触碰**，设备继续跑旧固件。
+         * 用故障原语记录原因并复位：复位后引导器按元数据（state=ERROR）
+         * 走保守分支，不会去引导半成品的目标槽。 */
+        hw2c_fault_trap(HW2C_FAULT_FOTA_APPLY);
+        return;                            /* 理论不可达 */
+    }
+
+    g_apply_progress = 100U;
+    g_state          = FOTA_STATE_DONE;
+    /* 成功也要清 last_error：它是"**上一次**出错的原因"，语义是
+     * "一直报到下一次成功"（见 fota_receive_begin 的注释）。
+     * 真机上这里紧接着就 `NVIC_SystemReset()`，重启后 `fota_init` 本来也会
+     * 清零；但在台架上、"复位"被模拟掉时，一条早就被后续成功操作纠正过的
+     * 旧错误会一直挂在 `fota status` 上，看起来像这次升级有问题。 */
+    g_last_error     = FOTA_E_NONE;
+    (void)fota_meta_append(FOTA_META_STATE_DONE, g_slot, g_staging_used);
+
+    /* 提交：把启动尝试计数归零（新槽第一次启动），然后复位进引导器。
+     * 引导决策表（P4）会看到 pending_slot 指向刚写好的槽并去引导它。 */
+    TAMP->BKP0R = 0U;
+    NVIC_SystemReset();
+}
+
+/* ===========================================================================
+ * 8. 生命周期 / 对外 API
+ * =========================================================================== */
 
 void fota_init(void)
 {
-    state = FOTA_STATE_IDLE;
-    total_size = 0;
-    received_offset = 0;
-    expected_seq = 0;
-    memset(chunk_buf, 0, sizeof(chunk_buf));
+    fota_meta_t rec;
 
-    /* Clear any stale FOTA flags from previous boot */
-    bkp_clear_flags();
+    g_apply_requested = 0U;
+    g_apply_progress  = 0U;
+    g_last_error      = FOTA_E_NONE;
+    g_rx_len          = 0U;
+    g_rx_need         = 0U;
+    g_rx_kind         = 0U;
+    g_stage_pend_len  = 0U;
+    g_staged_bytes    = 0U;
+    g_staging_used    = 0U;
+    g_staging_total   = 0U;
+    g_staging_base    = 0U;
+    g_flash_unlocked  = 0U;
+
+    fota_bkp_unlock();
+
+    if (fota_meta_load(&rec) != 0) {
+        /* 没有可信记录（空页 / 整页都校验不过）。此时**什么都不写**：
+         * 擦写 Flash 有成本，而"没有记录"本身已经是一个明确的初始状态，
+         * 调用方按 IDLE / SLOT_NONE / 0 处理即可。
+         *
+         * ⚠️ 关键在"不可信时**不解释**它"：一条看起来处于 APPLYING 的记录
+         * 若被当真，设备刚上电就会开始擦 Flash。`fota_meta_load` 只认
+         * magic + 非零 seq + CRC16 三者的合取，就是为此。 */
+        g_state = FOTA_STATE_IDLE;
+        return;
+    }
+
+    switch (rec.state) {
+    case FOTA_META_STATE_RECEIVING:
+        /* 上次没收完。暂存区可能还有内容，等主机重发 START 时按身份决定续传；
+         * 这里不主动恢复任何内存状态（g_env 等都要从暂存区重建）。 */
+        g_state = FOTA_STATE_IDLE;
+        break;
+    case FOTA_META_STATE_READY:
+        /* 收齐了但还没应用（掉电在应用之前）。**恢复成 READY**，而不是退回
+         * IDLE：这条记录的意义就是"整条补丁已通过 CRC32 并落在暂存区里"，
+         * 退回 IDLE 会让下一次 START 走完整重传，把它擦掉重收。
+         * 上下文（g_env / 暂存区几何）由 `fota_stage_restore` 从暂存区头部的
+         * 信封重建 —— 信封落盘就是为了这条路径。
+         *
+         * ⚠️ 这里**只恢复、不应用**（不置 g_apply_requested）：`fota_init` 在
+         * 每次上电都会跑，而"刚上电就自己擦掉一个槽"是上面 DONE/APPLYING
+         * 那几条注释反复强调要避免的事。何时应用由操作员决定（`fota apply`），
+         * 状态本身是可见的（`fota status` 会显示 READY 与目标槽）。
+         *
+         * 重建失败 ⇒ **不能**报 READY：apply 会拿这份身份不明的数据去擦掉
+         * 整个目标槽。退回 IDLE，并把记录改写成 ERROR，让 START 重放确定性地
+         * 走完整重传（而不是从一个已经不可信的区域上接着追加）。
+         * 改写成 ERROR 同时也解开了"拒绝进入接收"：ERROR 不是终局，
+         * `fota recv` 仍然可用（见 fota_receive_begin 的注释）。 */
+        if (fota_stage_restore(&rec) == 0) {
+            g_state        = FOTA_STATE_READY;
+            g_staged_bytes = rec.staged;
+        } else {
+            g_state      = FOTA_STATE_IDLE;
+            g_last_error = FOTA_E_STAGING_LOST;
+            (void)fota_meta_append(FOTA_META_STATE_ERROR, rec.slot, rec.staged);
+        }
+        break;
+    case FOTA_META_STATE_DONE:
+        /* 补丁已应用过。分两种情况，判据是**记录指向的槽是不是当前这个槽**：
+         *
+         *   ① 是 ⇒ 这次升级真的生效了。在这里把记录消费掉（追加一条 IDLE）。
+         *      引导器**不写** Flash（它是只读的，见 fota_meta.h），所以"消费"
+         *      只能由 App 做 —— 而 App 直到自己跑起来才能确认"生效了"，
+         *      这个时机正好就是这里。
+         *
+         *   ② 不是 ⇒ 记录说"补丁已落到 X 槽"，可我们正跑在另一个槽上。
+         *      引导器只在目标槽**通过 CRC** 时才切过去，走到这里意味着新固件
+         *      没能起来（CRC 不过，或者起来了但没能在重试次数内确认启动，
+         *      被 boot_nvm 的失败计数退了回来）。
+         *      这时必须把记录**改写成 ERROR**：留 DONE 的话，引导器每次复位
+         *      都会重新去验、重新去试那个坏槽 —— 失效保护被反复推翻，
+         *      而且设备会永久粘在"必须启动那一版"上。
+         *
+         * ⚠️ 别把 ①② 写成"只要 DONE 就消费"：那会把"新槽起不来"的事实抹掉，
+         * 操作员再也看不到"上一次升级失败"（`fota status` 只会显示 IDLE）。
+         */
+        if (rec.slot == fota_active_slot()) {
+            g_state = FOTA_STATE_DONE;
+            (void)fota_meta_consume();
+        } else {
+            g_state      = FOTA_STATE_ERROR;
+            g_last_error = FOTA_E_ROLLBACK;
+            (void)fota_meta_append(FOTA_META_STATE_ERROR, rec.slot, rec.staged);
+        }
+        break;
+    case FOTA_META_STATE_ERROR:
+        g_state = FOTA_STATE_ERROR;
+        break;
+    default:
+        g_state = FOTA_STATE_IDLE;
+        break;
+    }
 }
 
-fota_state_t fota_get_state(void)
-{
-    return state;
-}
+fota_state_t fota_get_state(void)        { return g_state; }
+int          fota_get_last_error(void)   { return g_last_error; }
+uint32_t     fota_get_staged_bytes(void) { return g_staged_bytes; }
 
 uint32_t fota_get_progress(void)
 {
-    return progress_bytes;
-}
-
-/* ---- Process pending FOTA patch from previous session ---- */
-
-static void fota_apply_stored_patch(void)
-{
-    uint32_t flags = bkp_read();
-    if (!(flags & FOTA_FLAG_PATCH_READY)) {
-        return;
-    }
-
-    /* Apply the stored patch (bspatch from Slot A flash + patch data in Slot B) */
-    state = FOTA_STATE_APPLYING;
-    bkp_set_flag(FOTA_FLAG_IN_PROGRESS);
-
-    /* Read old firmware size from Slot A header */
-    uint32_t old_size = 0;
-    {
-        /* Search for magic "H2Ck" in Slot A header area */
-        const uint32_t MAGIC = 0x4841436BUL;  /* "H2Ck" */
-        volatile const uint32_t *slot_a = (volatile const uint32_t *)SLOT_A_ADDR;
-        for (uint32_t off = 0x40 / 4; off < 0x200 / 4; off++) {
-            if (slot_a[off] == MAGIC) {
-                /* image_size is 2 words before magic */
-                old_size = slot_a[off - 2];
-                break;
-            }
+    if (g_state == FOTA_STATE_RECEIVING) {
+        if (g_staging_used == 0U) {
+            return 0U;
         }
+        return (uint32_t)(((uint64_t)g_staged_bytes * 100U) / g_staging_used);
     }
-
-    if (old_size == 0) {
-        state = FOTA_STATE_ERROR;
-        bkp_set_flag(FOTA_FLAG_APPLY_FAIL);
-        bkp_write(flags & ~FOTA_FLAG_PATCH_READY);
-        return;
-    }
-
-    /* Apply the patch */
-    if (fota_bspatch_apply(SLOT_A_ADDR, old_size, SLOT_B_ADDR) != 0) {
-        state = FOTA_STATE_ERROR;
-        bkp_set_flag(FOTA_FLAG_APPLY_FAIL);
-        bkp_write(flags & ~FOTA_FLAG_PATCH_READY);
-        return;
-    }
-
-    state = FOTA_STATE_COMPLETE;
-    progress_bytes = total_size;
+    return g_apply_progress;
 }
 
-/* ---- Main process function (called from FOTA task loop) ---- */
+uint32_t fota_get_pending_slot(void)
+{
+    fota_meta_t rec;
+
+    if (fota_meta_load(&rec) != 0) {
+        return FOTA_META_SLOT_NONE;
+    }
+
+    /* "待启动槽"只对**有一条补丁正走在路上/已落在某个槽上**的记录有意义：
+     *   RECEIVING / READY / APPLYING / DONE —— 有；
+     *   IDLE / ERROR                        —— 没有。
+     *
+     * 为什么不直接 `return rec.slot`：ERROR 记录里那个槽是**诊断信息**
+     * （"上一次是在往哪个槽写的时候失败的"），把它当成待启动槽报出去，
+     * `fota status` 就会在没有任何补丁等待启动时显示一个槽号 ——
+     * 操作员据此判断"还有条补丁备着"，而实际上设备已经回到无事发生。
+     * 跨复位存活的是记录，所以这里读记录而不是 g_state。 */
+    switch (rec.state) {
+    case FOTA_META_STATE_RECEIVING:
+    case FOTA_META_STATE_READY:
+    case FOTA_META_STATE_APPLYING:
+    case FOTA_META_STATE_DONE:
+        return rec.slot;
+    default:
+        return FOTA_META_SLOT_NONE;
+    }
+}
+
+int fota_receive_begin(char *msg, uint32_t msg_len)
+{
+    /* 允许从 IDLE **和 ERROR** 进入。
+     *
+     * ERROR 是"上一次尝试失败"的记录，不是"设备坏了"：`fota_get_last_error()`
+     * 会一直把它报给操作员，直到下一次成功。若因为 ERROR 就拒绝重新接收，
+     * 一次串口噪声造成的失败就会把设备锁在"必须先 fota erase"的状态上 ——
+     * 而 `fota erase` 会擦掉整个目标槽，比重新传一次补丁代价大得多。
+     *
+     * 反过来，READY / DONE 必须拒绝：这两个状态下暂存区里有一条**已校验通过、
+     * 等着启动**的补丁，允许进入接收就等于允许静默丢弃它。要这么做得先显式
+     * `fota erase`（或 `fota apply`），让意图是明确的。 */
+    if (g_state == FOTA_STATE_RECEIVING) {
+        g_last_error = FOTA_E_BUSY;
+        if (msg != NULL && msg_len > 0U) {
+            (void)strncpy(msg, "already receiving", (size_t)(msg_len - 1U));
+            msg[msg_len - 1U] = '\0';
+        }
+        return -1;
+    }
+    if (g_state == FOTA_STATE_READY || g_state == FOTA_STATE_DONE) {
+        g_last_error = FOTA_E_BUSY;
+        if (msg != NULL && msg_len > 0U) {
+            const char *why = (g_state == FOTA_STATE_READY)
+                ? "patch ready (apply or erase first)"
+                : "patch applied (erase first)";
+            (void)strncpy(msg, why, (size_t)(msg_len - 1U));
+            msg[msg_len - 1U] = '\0';
+        }
+        return -1;
+    }
+    if (cli_rx_sink_active() != 0U) {
+        g_last_error = FOTA_E_NO_CLI;
+        if (msg != NULL && msg_len > 0U) {
+            (void)strncpy(msg, "uart busy", (size_t)(msg_len - 1U));
+            msg[msg_len - 1U] = '\0';
+        }
+        return -1;
+    }
+
+    fota_rx_reset();
+    g_expected_seq     = 0U;
+    g_last_activity_ms = HAL_GetTick();
+    g_last_error       = FOTA_E_NONE;
+    g_state            = FOTA_STATE_RECEIVING;
+    /* ⚠️ 这里**不写元数据、不擦暂存区**：START 帧到了才知道这次传的是哪条
+     * 补丁，那时才能判断是"续传"还是"新的一次"。提前清掉等于自断续传。 */
+    cli_set_rx_sink(fota_rx_bytes);
+    return 0;
+}
+
+void fota_receive_abort(void)
+{
+    if (cli_rx_sink_active() != 0U) {
+        cli_set_rx_sink(NULL);
+    }
+    fota_flash_lock();
+    fota_rx_reset();
+    /* 只把状态退回 IDLE：**不清元数据、不擦暂存区**，所以主机可以重发 START 续传。 */
+    if (g_state == FOTA_STATE_RECEIVING) {
+        g_state = FOTA_STATE_IDLE;
+    }
+}
+
+int fota_apply_request(void)
+{
+    if (g_state != FOTA_STATE_READY) {
+        g_last_error = FOTA_E_NOT_READY;
+        return -1;
+    }
+    g_apply_requested = 1U;
+    return 0;
+}
+
+int fota_erase_target(void)
+{
+    uint32_t slot = fota_target_slot();
+    uint32_t base = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_BASE : FOTA_SLOT_B_BASE;
+    uint32_t size = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_SIZE : FOTA_SLOT_B_SIZE;
+
+    if (g_state == FOTA_STATE_APPLYING) {
+        g_last_error = FOTA_E_BUSY;
+        return -1;
+    }
+    fota_flash_unlock();
+    if (fota_flash_erase_range(base, size) != 0) {
+        fota_flash_lock();
+        return -1;
+    }
+    fota_flash_lock();
+    /* 记一条"没有待启动槽"。日志式存储没有"删除"这个动作 ——
+     * 追加一条新状态就是删除。 */
+    (void)fota_meta_consume();
+    g_state          = FOTA_STATE_IDLE;
+    g_staged_bytes   = 0U;
+    g_staging_used   = 0U;
+    g_staging_total  = 0U;
+    g_apply_progress = 0U;
+    return 0;
+}
 
 void fota_process(void)
 {
-#ifndef TEST
-    static uint32_t last_activity_tick = 0;
-#endif
-
-    switch (state) {
-
-    case FOTA_STATE_IDLE: {
-        /* Check for stored patch from previous session */
-        uint32_t flags = bkp_read();
-        if (flags & FOTA_FLAG_PATCH_READY) {
-            fota_apply_stored_patch();
+    if (g_state == FOTA_STATE_RECEIVING) {
+        uint32_t now = HAL_GetTick();
+        /* ⚠️ 这里**不能**再判 `g_last_activity_ms != 0U`。
+         *
+         * 那是"用 0 当未初始化哨兵"的写法，而 `HAL_GetTick()` 在刚启动时
+         * **合法地就是 0**（TIM14 计数从 0 开始）—— 于是"开机后第一件事就是
+         * 进入接收、然后主机静默"这个场景下，超时一次都不会触发，接收态
+         * 永久挂着、UART 也永久不还给 CLI。这个哨兵在主机上会被
+         * `mock_tick_reset()` 稳定复现（L5 就这么抓到的）。
+         *
+         * 不需要哨兵：进入 RECEIVING 的每一条路径（fota_receive_begin /
+         * fota_handle_start）都会设置 g_last_activity_ms，而无符号减法本来
+         * 就处理 tick 回绕。 */
+        if (((now - g_last_activity_ms) > (uint32_t)FOTA_ACK_TIMEOUT_MS)
+            && (g_rx_len == 0U)) {
+            /* 只有在"半帧都没收着"时才算空闲超时。收到半个帧但卡住的情况
+             * 交给主机重传（帧会在下一个标记处重新同步），不在这里误判。 */
+            fota_receive_abort();
         }
-        break;
     }
 
-    case FOTA_STATE_RECEIVING: {
-        /* Wait for UART to complete receiving one chunk */
-        if (!UART_IsRxComplete()) {
-#ifndef TEST
-            /* Timeout check for receive */
-            uint32_t now = HAL_GetTick();
-            if (now - last_activity_tick > ACK_TIMEOUT_MS && last_activity_tick != 0) {
-                state = FOTA_STATE_ERROR;
-            }
-#endif
-            break;
-        }
-
-        uint16_t rx_len = UART_GetRxCount();
-        if (rx_len < 6) {
-            /* Minimum chunk: seq(2B) + len(2B) + at least 1 data byte + CRC(2B) */
-            state = FOTA_STATE_ERROR;
-            break;
-        }
-
-        /* Parse chunk header */
-        uint16_t seq = ((uint16_t)chunk_buf[1] << 8) | chunk_buf[0];
-        uint16_t data_len = ((uint16_t)chunk_buf[3] << 8) | chunk_buf[2];
-
-        if (data_len > FOTA_CHUNK_SIZE) {
-            state = FOTA_STATE_ERROR;
-            break;
-        }
-
-        /* Verify CRC-16 over data */
-        uint16_t received_crc = ((uint16_t)chunk_buf[data_len + 5] << 8) | chunk_buf[data_len + 4];
-        uint16_t computed_crc = crc16_compute(&chunk_buf[4], data_len);
-
-        if (computed_crc != received_crc) {
-            /* Send NAK with last good sequence */
-            uint8_t nak[3];
-            nak[0] = FOTA_PROTOCOL_NAK;
-            if (expected_seq > 0) {
-                nak[1] = (uint8_t)((expected_seq - 1) & 0xFF);
-                nak[2] = (uint8_t)(((expected_seq - 1) >> 8) & 0xFF);
-            } else {
-                nak[1] = 0xFF;
-                nak[2] = 0xFF;
-            }
-            UART_SendByte(nak[0]);
-            UART_SendByte(nak[1]);
-            UART_SendByte(nak[2]);
-        } else if (seq == expected_seq) {
-            /* Store received data to patch buffer */
-            /* In production, write chunk data to flash or RAM buffer for bspatch */
-            progress_bytes += data_len;
-            expected_seq++;
-
-            /* Send ACK */
-            UART_SendByte(FOTA_PROTOCOL_ACK);
-
-#ifndef TEST
-            last_activity_tick = HAL_GetTick();
-#endif
-
-            /* Start next chunk receive */
-            UART_StartRx_IT(chunk_buf, FOTA_CHUNK_SIZE + 4);
-        }
-        /* else: seq != expected_seq — duplicate/old chunk, resend ACK */
-
-        break;
-    }
-
-    case FOTA_STATE_APPLYING: {
-        /* bspatch is applied synchronously in fota_apply_stored_patch() */
-        break;
-    }
-
-    case FOTA_STATE_VERIFYING: {
-        /* CRC verification of reconstructed firmware in Slot B */
-        break;
-    }
-
-    case FOTA_STATE_COMPLETE:
-    case FOTA_STATE_ERROR:
-    default:
-        break;
+    if (g_state == FOTA_STATE_READY && g_apply_requested != 0U) {
+        g_apply_requested = 0U;
+        fota_apply_now();
     }
 }

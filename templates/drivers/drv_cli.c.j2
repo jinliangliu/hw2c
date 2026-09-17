@@ -119,6 +119,10 @@
 static UART_HandleTypeDef *cli_huart;
 static SemaphoreHandle_t   cli_rx_sem = NULL;
 
+/* 二进制接收侧的接管回调（见 drv_cli.h 的说明）。
+ * 非 NULL 时 cli_task() 不再把字节喂给行编辑器，而是整批交给它。 */
+static cli_rx_sink_t       cli_rx_sink = NULL;
+
 /* Ring buffer — powered by LwRB (third-party, MIT) */
 static uint8_t      cli_ringbuf_data[CLI_RINGBUF_SIZE];
 static lwrb_t       cli_ringbuf;
@@ -975,22 +979,50 @@ static void cmd_mqtt(int argc, char *argv[], cli_output_fn out)
 {% endif %}
 
 {% if has_fota_receive %}
+/*
+ * FOTA 命令组。
+ *
+ * `recv` 是**唯一入口**：它把 UART 的字节流从行编辑器移交给接收状态机
+ * （见 drv_cli.h 里 cli_rx_sink_t 的说明）。这不是权宜之计，而是安全属性 ——
+ * 只有被明确要求时才接受固件，"一通电就等 START"会让任意串口噪声都可能
+ * 触发一次 Flash 擦写。
+ */
 static void cmd_fota(int argc, char *argv[], cli_output_fn out)
 {
+    static const char *state_names[] = {
+        /* 顺序必须与 fota_state_t 一致；ERROR 在最后，见 drv_fota.h 的说明 */
+        "IDLE", "RECEIVING", "READY", "APPLYING", "DONE", "ERROR"
+    };
+
     if (argc < 2) {
-        out("Usage: fota status | fota progress\r\n");
+        out("Usage: fota status | progress | recv | apply | erase\r\n");
         return;
     }
     if (strcmp(argv[1], "status") == 0) {
-        static const char *state_names[] = {
-            "IDLE", "RECEIVING", "APPLYING", "VERIFYING", "COMPLETE", "ERROR"
-        };
         fota_state_t state = fota_get_state();
         out("FOTA state: %s\r\n",
             (state <= FOTA_STATE_ERROR) ? state_names[state] : "UNKNOWN");
+        out("  pending slot: %lu  staged: %lu bytes\r\n",
+            (unsigned long)fota_get_pending_slot(),
+            (unsigned long)fota_get_staged_bytes());
+        out("  last error: %d\r\n", fota_get_last_error());
     } else if (strcmp(argv[1], "progress") == 0) {
-        uint32_t progress = fota_get_progress();
-        out("FOTA progress: %lu%%\r\n", progress);
+        out("FOTA progress: %lu%%\r\n", (unsigned long)fota_get_progress());
+    } else if (strcmp(argv[1], "recv") == 0) {
+        char msg[32];
+        if (fota_receive_begin(msg, sizeof(msg)) == 0) {
+            /* 提示语走 cli_output()，随后字节流被接管 —— 主机看到这行之后
+             * 再发 START 帧。 */
+            out("FOTA ready, send START frame\r\n");
+        } else {
+            out("FOTA recv refused: %s\r\n", msg);
+        }
+    } else if (strcmp(argv[1], "apply") == 0) {
+        out(fota_apply_request() == 0 ? "FOTA apply scheduled\r\n"
+                                      : "FOTA apply refused\r\n");
+    } else if (strcmp(argv[1], "erase") == 0) {
+        out(fota_erase_target() == 0 ? "FOTA target slot erased\r\n"
+                                     : "FOTA erase failed\r\n");
     } else {
         out("Unknown fota subcommand: %s\r\n", argv[1]);
     }
@@ -1279,10 +1311,63 @@ void cli_task(void *arg)
     for (;;) {
         /* Wait for at least one character */
         if (xSemaphoreTake(cli_rx_sem, pdMS_TO_TICKS(100)) == pdTRUE) {
-            uint8_t ch;
-            while (lwrb_read(&cli_ringbuf, &ch, 1) > 0) {
-                hw2c_cli_input(&cli_inst, ch);
+            uint8_t batch[64];
+            size_t  got;
+
+            /* 一次性把环形缓冲里已积累的字节取出来，再决定交给谁。
+             *
+             * 为什么按批而不是逐字节：接管者（FOTA 的帧解析器）在任务上下文里
+             * 跑，逐字节进出回调会把每一帧拆成上百次调用；更实际的是，
+             * 逐字节取会在批量数据到达时让 CLI 任务与接收任务反复抢占。
+             * 批量取出后再分发，两边都只用一次调用。 */
+            got = lwrb_read(&cli_ringbuf, batch, sizeof(batch));
+
+            if (cli_rx_sink != NULL) {
+                /* 接管中：行编辑器完全看不到这些字节。
+                 * 再次取一次 cli_rx_sink 的当前值 —— 回调内部可能已经交还
+                 * （FOTA 收完 FINISH 就会），那样余下的批次应当回到行编辑器。 */
+                cli_rx_sink_t sink = cli_rx_sink;
+                if (sink != NULL) {
+                    sink(batch, (uint16_t)got);
+                    continue;
+                }
+            }
+
+            {
+                size_t i;
+                for (i = 0; i < got; i++) {
+                    hw2c_cli_input(&cli_inst, (char)batch[i]);
+                }
             }
         }
+    }
+}
+
+/* ==================================================================
+ *  Binary RX handover + raw TX (used by the FOTA receiver)
+ * ================================================================== */
+
+void cli_set_rx_sink(cli_rx_sink_t sink)
+{
+    cli_rx_sink = sink;
+}
+
+uint8_t cli_rx_sink_active(void)
+{
+    return (cli_rx_sink != NULL) ? 1U : 0U;
+}
+
+void cli_write_raw(const uint8_t *data, uint16_t len)
+{
+    uint16_t i;
+
+    if (data == NULL || len == 0U) {
+        return;
+    }
+    /* 与 cli_output() 同一个 TDR 写者（log_putc → TXE 中断 drain），
+     * 所以字节级不会与日志互相撕裂；但整帧仍可能与日志文本交错，
+     * 主机侧按帧标记重新同步。 */
+    for (i = 0U; i < len; i++) {
+        log_putc((char)data[i]);
     }
 }

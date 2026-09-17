@@ -98,6 +98,53 @@ void cli_register_command(const char *name, const char *help,
  */
 void cli_task(void *arg);
 
+/* ---- 二进制接收侧接管（FOTA 用） ----------------------------------------
+ *
+ * 为什么需要这一层：这个仓库里 **UART 的字节流只有一个消费者** ——
+ * `cli_task()` 从 LwRB 里取字节喂给行编辑器。FOTA 接收侧若自己去抢
+ * RXNE 中断，就会与 CLI 争同一个字节（历史上 `drv_fota.c` 正是凭空假设了
+ * `UART_StartRx_IT()` 这类不存在的接口，见规划 §1.2）。
+ *
+ * 所以改成**显式移交**：CLI 命令 `fota recv` 把 sink 装上去，FOTA 处理完
+ * FINISH（或空闲超时）再卸下来。同一时刻只有一个消费者，没有竞态，
+ * 也无需为 FOTA 引入临界区。
+ *
+ * 回调在 **cli_task 上下文**里被调用（不是 ISR），因此 sink 内部可以
+ * 安全地做 Flash 编程之外的任何事 —— 但**仍不得阻塞**：它是 CLI 任务的
+ * 唯一执行流，阻塞会把 CLI 一起卡住。
+ *
+ * @param  data  收到的字节（可能多于 1 字节，取决于环形缓冲里已积累多少）
+ * @param  len   字节数，非 0
+ */
+typedef void (*cli_rx_sink_t)(const uint8_t *data, uint16_t len);
+
+/**
+ * @brief  接管 / 交还 CLI 的 UART 接收字节流。
+ * @param  sink  NULL 表示交还行编辑器；非 NULL 表示自此所有收到的字节
+ *               都送给该回调，行编辑器看不到。
+ * @note   允许在 sink 的回调内部再次调用（FOTA 处理完 FINISH 就是这样交还的）。
+ */
+void cli_set_rx_sink(cli_rx_sink_t sink);
+
+/**
+ * @brief  当前是否处于"接收侧接管"状态。
+ * @return 非 0 表示字节流正被 sink 消费（行编辑器被旁路）。
+ */
+uint8_t cli_rx_sink_active(void);
+
+/**
+ * @brief  原样写出一段**二进制**字节（ACQ/NAK 这类协议帧，不做格式化）。
+ *
+ *         走与 `cli_output()` 相同的 TX 通道（`log_putc()` + TXE 中断），
+ *         因此与日志流共享同一个 TDR 写者，不会产生字节级竞态。
+ *         ⚠️ 但也因此**可能与并发的日志文本交错**：主机侧解析必须能在
+ *         噪声中重新同步（扫描帧标记），这一点写进了规划 §10 与 L5 用例。
+ *
+ * @param  data  待发送字节
+ * @param  len   字节数
+ */
+void cli_write_raw(const uint8_t *data, uint16_t len);
+
 /**
  * @brief  Formatted output to the CLI UART.
  *

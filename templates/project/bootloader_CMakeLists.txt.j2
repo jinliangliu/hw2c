@@ -45,7 +45,31 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMSIS_DEVICE_DIR}/Include
     ${CMSIS_CORE_DIR}
     ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/../src/drivers
 )
+
+{% if has_fota %}
+# ── FOTA 元数据：**与 App 共用同一个 .c** ────────────────────────────────────
+#
+# 它不是一个可以各生成一份的东西 —— 两侧对页基址、记录长度、字段偏移的
+# 理解必须逐字节一致，而"改了一侧忘了另一侧"的症状是"升级状态莫名其妙读不
+# 出来"，只在改配置的时候出现。所以这里引用 ../src/drivers/drv_fota_meta.c，
+# 而不是让生成器往引导器目录再写一份。
+#
+# ⚠️ 文件名带 `drv_` 前缀：驱动产物的命名规则是 `drv_<name>.{c,h}`
+# （见 generate.py 的外设驱动循环），`<name>` 是驱动名而不是模板名。
+# 写成 fota_meta.c 时 cmake 会报 "Cannot find source file" —— 而这条路径
+# 只在真的生成带引导器的工程时才走到。
+#
+# `FOTA_META_READ_ONLY` 把写路径整段排除（见 fota_meta.h/.c）：引导器只
+# 读记录、决定启动哪个槽、跳转，消费记录由 App 做。于是引导器**不引入
+# HAL**（它连 HAL 源文件都不进构建）、不需要 tick 时基。
+#
+# 用宏显式排除，而不是指望 --gc-sections 把未调用的函数扔掉：
+# 前者是构建期就成立的约束，后者是运气。
+target_sources(${PROJECT_NAME} PRIVATE ../src/drivers/drv_fota_meta.c)
+target_compile_definitions(${PROJECT_NAME} PRIVATE FOTA_META_READ_ONLY)
+{% endif %}
 
 target_compile_options(${PROJECT_NAME} PRIVATE
     -Os -g0 -Wall

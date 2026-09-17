@@ -1,204 +1,883 @@
 /**
  * @file    test_fota_protocol.c
- * @brief   Unit tests for FOTA protocol state machine (drv_fota.c)
- *          Tests: init/reset, CRC16, BKP4R persistence, flag operations.
- *          Full state machine transitions require hardware UART, not tested here.
+ * @brief   FOTA 持久元数据与状态映射的设备侧单测（fota_meta.c / drv_fota.c）。
+ *
+ * 这个测试覆盖什么、不覆盖什么
+ * ---------------------------
+ * 覆盖的是**本工程自己就能断言**的那部分：
+ *   · 元数据**日志式存储**的语义（追加 / 扫描取最新 / 半写记录被跳过 /
+ *     页满擦页后继续 / 消费）；
+ *   · `fota_init()` 把存储里的状态映射成运行期状态的那张表
+ *     （含"上次没收完"、"收齐了还没应用"、"补丁生效"、
+ *      "新槽起不来、已回退"这几种跨复位的处境）；
+ *   · 收齐后掉电的那条路径：从暂存区头部的信封**重建**运行期上下文，
+ *     以及重建不成时的保守行为（不报 READY / 不改写成可被误解释的状态）；
+ *   · 帧常量与真源自洽、UART 接管/交还的时序。
+ *
+ * **不覆盖**完整协议行为（丢包 / 乱序 / 重复 / CRC 错 / 超时 / 续传）。
+ * 那需要一个能喂字节、能逐字节比对响应流的台架，而 `run_tests.py` 把每个
+ * 测试**单独**编译（只带 unity + mock_hal），塞不进 vendored 解码器与
+ * CLI 桩。完整协议在仓库侧用**真** drv_fota.c 覆盖：
+ *
+ *     generator/tests/test_fota_protocol_l5.py     （L5 协议台架 + 变异验证）
+ *     generator/tests/test_fota_delta_l6.py        （L6 掉电注入）
+ *
+ * 为什么元数据值得在自己的工程里再测一遍
+ * ------------------------------------
+ * 它是**引导器与 App 之间唯一的共享状态**：引导器只读（`FOTA_META_READ_ONLY`），
+ * App 读写。两侧对"页在哪、记录多长、哪个字段是什么"的理解必须逐字节一致，
+ * 而 L5/L6 都不经过引导器。日志语义（尤其是"半写记录必须被跳过而不是被
+ * 解释")一旦破坏，症状是"设备在某次掉电之后引导了错的槽"—— 这类缺陷必须
+ * 在最近的地方被拦住。
+ *
+ * 本文件早先的版本把元数据放在 TAMP 的 BKP5R..BKP9R 上 —— 那几个寄存器
+ * 在 STM32G0B1 上**并不存在**（TAMP 只有 BKP0R..BKP4R），而主机侧全绿，
+ * 因为当时的 mock 把结构体开到了 BKP31R。这段历史见 fota_meta.h 开头。
+ *
+ * 桩只打在**外部边界**上
+ * --------------------
+ * `drv_fota.c` 与 `fota_meta.c` 是原样 `#include` 进来的真源码，没有任何
+ * `#ifdef TEST` 分支。替身只有下面这些，都是外部依赖，不是它们自己的逻辑：
+ *   · CLI 字节流（cli_set_rx_sink / cli_rx_sink_active / cli_write_raw）
+ *   · 看门狗与故障原语（IWDG_Refresh / hw2c_fault_trap）
+ *   · 信封解析器（fota_delta_parse_env）—— **受控**桩，由用例决定接受还是
+ *     拒绝；它让"驱动的重建逻辑"与"格式层的校验规则"在这个单元里被分开
+ *   · 差分解码与解码器纯函数（fota_delta_apply / fota_delta_crc32_update /
+ *     hw2c_safe_state）—— **陷阱桩**：一旦被调用就判失败，因为它们所在的
+ *     路径（暂存校验 / 擦写应用）在这个单元里没有被断言，给个"看起来能用"
+ *     的返回值只会造出假绿。原因见下面的就地注释。
+ * 把解码器换成受控桩是**正确的单元边界**而非偷懒：解码正确性属于
+ * fota_delta 的责任，已由 L5/L6 覆盖；在这里跑真解码只会让测试依赖补丁样本。
  */
 #include "unity.h"
 #include "mock_hal.h"
+
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 
-/* ---- Stubs for functions referenced by drv_fota.c but not tested here ---- */
+#include "drv_{{ cli_name }}.h"
+#include "hw2c_fault.h"
+#include "drv_fota.h"
 
-static int fota_bspatch_apply(uint32_t old_base, uint32_t old_size, uint32_t new_base)
+/* ===========================================================================
+ * 外部边界的替身
+ * =========================================================================== */
+
+/* ---- CLI 字节流 ----------------------------------------------------------
+ * 只记状态，不搬字节：本测试不喂协议帧，只验证"接管/交还"这件事本身。
+ * `g_fake_sink` 是 `cli_rx_sink_active()` 的真源 —— 真实实现由 drv_cli
+ * 维护，这里复刻它的可观察语义（重定向后行编辑器被旁路）。 */
+static cli_rx_sink_t g_fake_sink = NULL;
+static uint8_t       g_fake_raw[FOTA_MAX_FRAME];
+static uint16_t      g_fake_raw_len = 0U;
+static uint32_t      g_fault_traps  = 0U;
+
+void cli_set_rx_sink(cli_rx_sink_t sink)      { g_fake_sink = sink; }
+uint8_t cli_rx_sink_active(void)              { return (g_fake_sink != NULL) ? 1U : 0U; }
+void cli_write_raw(const uint8_t *data, uint16_t len)
 {
-    (void)old_base; (void)old_size; (void)new_base;
-    return 0;
+    if (data == NULL || len == 0U || len > sizeof(g_fake_raw)) {
+        return;
+    }
+    (void)memcpy(g_fake_raw, data, (size_t)len);
+    g_fake_raw_len = len;
 }
 
-static bool UART_IsRxComplete(void)       { return false; }
-static uint16_t UART_GetRxCount(void)     { return 0; }
-static void UART_SendByte(uint8_t byte)   { (void)byte; }
-static void UART_StartRx_IT(uint8_t *buf, uint16_t size) { (void)buf; (void)size; }
+/* ---- 看门狗 / 故障原语 ---- */
+void IWDG_Refresh(void)                 { /* 单测里不喂狗 */ }
+void hw2c_fault_trap(uint32_t code)     { (void)code; g_fault_traps++; }
 
-/* Include the source under test to access static functions */
+/* ---- 差分解码器（本模块的下游，另行覆盖）---- */
+int fota_delta_apply(const fota_delta_env_t *env,
+                     const fota_delta_backend_t *io,
+                     uint32_t src_slot, uint32_t dst_slot, uint32_t dst_size,
+                     int *out_err)
+{
+    (void)env; (void)io; (void)src_slot; (void)dst_slot; (void)dst_size;
+    if (out_err != NULL) { *out_err = FOTA_DELTA_E_ARG; }
+    return FOTA_DELTA_E_ARG;
+}
+
+/* 受控的信封解析器。
+ *
+ * `fota_init()` 的 READY 分支会从**暂存区头部**把 48 B 信封读回来交给它，
+ * 于是这条路径上的两件事在这里被**分开**了：
+ *   · 驱动自己的逻辑（暂存区几何推导、与记录交叉核对、失败时的保守行为）
+ *     —— 本文件覆盖，正是最该在最近的单元里盯住的部分（地址算错 = apply
+ *     会去擦一片无关 Flash）；
+ *   · 格式层的校验规则（魔法 / 版本 / 内部 CRC / 签名 / 长度）
+ *     —— 由 L5/L6 用**真**解码器与真信封覆盖（`test_fota_protocol_l5.py`
+ *     的负例表逐条验证每条规则）。
+ * 把解码器换成受控桩在这里是单元边界，不是偷懒：真解析器一进来，
+ * 这个编译单元就得依赖 vendored 解码器与补丁样本。
+ *
+ * 默认（`g_env_ok == 0`）**一律拒绝** —— 这也是真机上一个空白页会得到的
+ * 结论（0xFF 的 magic 不合法）。于是"忘了打桩"的用例会停在保守分支上，
+ * 而不是拿到一张假绿。 */
+static fota_delta_env_t g_env_stub;
+static int              g_env_stub_ok     = 0;
+static uint32_t         g_env_stub_calls  = 0U;
+static uint8_t          g_env_stub_seen[FOTA_ENV_SIZE];
+
+int fota_delta_parse_env(uint32_t (*patch_read)(void *, uint8_t *, uint32_t),
+                         void *ctx, fota_delta_env_t *out)
+{
+    uint32_t got;
+
+    g_env_stub_calls++;
+    got = (patch_read != NULL) ? patch_read(ctx, g_env_stub_seen, FOTA_ENV_SIZE)
+                               : 0U;
+    if (got != FOTA_ENV_SIZE) {
+        return FOTA_DELTA_E_ARG;
+    }
+    if (g_env_stub_ok == 0) {
+        return FOTA_DELTA_E_ARG;
+    }
+    if (out != NULL) {
+        *out = g_env_stub;
+    }
+    return FOTA_DELTA_OK;
+}
+
+/* ---- 两个"今天到不了"的符号 -------------------------------------------------
+ * `drv_fota.c` 还引用两个本单元拿不到定义的符号（都在 `fota_delta.c` 里）：
+ *
+ *   · `fota_delta_crc32_update()` ← `fota_stage_verify()`（收齐全部 DATA 之后）
+ *   · `hw2c_safe_state()`        ← `fota_apply_now()`（READY 之后开始擦写）
+ *
+ * 为什么不把 `fota_delta.c` 整份 `#include` 进来（那才最符合"桩只打在外部
+ * 边界上"的原则）：它 `#include "hpatch_lite.h"` / `"tuz_dec.h"`，即
+ * vendored 解码器；而 `run_tests.py` 给每个测试编译的包含路径里没有
+ * `static/third_party/<lib>/`（它只带 unity + mock_hal + HAL/CMSIS 头，
+ * 见生成工程 `test/run_tests.py` 顶部的 INCLUDES 列表）。于是解码器及其
+ * CRC32 在这个编译单元里**物理上不存在**，而这两个符号是**编译期**就要解析
+ * 的（`fota_stage_verify` / `fota_apply_now` 都被别的函数引用着）。
+ *
+ * 所以只能给桩，但桩**不是**"返回个随便的值算了"：一个能返回 0 的 CRC32 桩
+ * 会让 `fota_stage_verify()` 拿假 CRC 去比，比不过 → 被解释成"暂存区坏了"，
+ * 而测试根本没有断言那条路径，于是依然**是绿的**。这类"假绿"正是 A9
+ * （mock 让测试失效）的同一族缺陷。两个桩因此都在被真的调用时**直接判失败**：
+ * 将来谁要在这个单元里驱动 DATA/FINISH 或 apply 路径，会立刻看到
+ * "该补真实现了"，而不是领到一张无意义的成绩单。
+ * （Unity 的 TEST_ABORT 是 longjmp，见 static/unity/unity_internals.h:929，
+ * 所以从普通函数里长跳出测试是安全的。） */
+uint32_t fota_delta_crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
+{
+    (void)crc; (void)data; (void)len;
+    TEST_FAIL_MESSAGE("fota_delta_crc32_update is stubbed: this unit must not "
+                      "drive the staging-verify path (see test file header)");
+    return crc;
+}
+void hw2c_safe_state(void)
+{
+    TEST_FAIL_MESSAGE("hw2c_safe_state is stubbed: this unit must not drive "
+                      "the apply path (see test file header)");
+}
+
+/* ===========================================================================
+ * 被测源码（原样引入，允许直接调用其 static 函数）
+ *
+ * ⚠️ 元数据模块必须一起进来：`drv_fota.c` 只调用它的公开 API。两个 .c 都
+ * 是**产品代码本身**，不是替身。
+ * =========================================================================== */
+#include "../src/drivers/drv_fota_meta.c"
 #include "../src/drivers/drv_fota.c"
 
-/* ---- CRC-16/CCITT reference: "123456789" -> 0x29B1 ---- */
+/* ===========================================================================
+ * 夹具
+ * =========================================================================== */
 
 void setUp(void)
 {
+    /* 冷启动：寄存器（含 TAMP 备份域）清零、整片 Flash 回到 0xFF、tick 归零。
+     * 后两项分别代表"上电后 Flash 是擦除态"与"刚启动时 HAL_GetTick() 就是 0"，
+     * 都是真机上的**合法初始状态**，而不是测试特权。 */
     mock_cmsis_reset();
     mock_flash_reset();
+    mock_tick_reset();
+    g_fake_sink    = NULL;
+    g_fake_raw_len = 0U;
+    g_fault_traps  = 0U;
+
+    /* 受控信封解析器回到"一律拒绝"的默认态 —— 也就是真机上空白页的结论。
+     * 忘了摆现场的用例因此会落在保守分支上，不会拿到假绿。 */
+    g_env_stub_ok    = 0;
+    g_env_stub_calls = 0U;
+    memset(&g_env_stub, 0, sizeof(g_env_stub));
+    memset(g_env_stub_seen, 0, sizeof(g_env_stub_seen));
+
     fota_init();
 }
 
 void tearDown(void) {}
 
-/* ---- Init/reset tests ---- */
+/* ===========================================================================
+ * 布置 "收齐之后掉电" 的现场
+ *
+ * `fota_init()` 的 READY 分支要从**暂存区头部的信封**重建运行期上下文，
+ * 所以测它就必须先把现场摆出来：记录 + 暂存区里的信封 + 解析器的结论，
+ * 三者一致才是"收齐了"，任何一处不一致都应当落到保守分支。
+ * =========================================================================== */
 
-void test_fota_init_sets_state_idle(void)
+/* 按**契约**算出暂存区起点：staging_base = slot_base + slot_size - align8(staged)。
+ * 测试这里显式再算一遍是**有意**的 —— 断言的正是"驱动读/擦的地址就是我按
+ * 契约算出来的那个地址"。若驱动里的派生关系改了而这里没改，用例会红，
+ * 而不是"两边一起错、测试照样绿"（这类地址错误在真机上表现为 apply 擦掉
+ * 一片无关 Flash，而在主机上只表现为一次没什么用的 memcpy）。 */
+static uint32_t test_staging_base(uint32_t slot, uint32_t staged_used)
 {
+    uint32_t slot_base = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_BASE
+                                                    : FOTA_SLOT_B_BASE;
+    uint32_t slot_size = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_SIZE
+                                                    : FOTA_SLOT_B_SIZE;
+    uint32_t total     = (staged_used + 7U) & ~7U;
+
+    return slot_base + (slot_size - total);
+}
+
+/* 盖上"信封"并让受控解析器接受它。
+ * 内容本身没有语义（真信封的字段是格式层的责任，由 L5/L6 覆盖），
+ * 这里只要求它是**可辨认**的：0xFF 是擦除态，所以任何非 0xFF 的花纹都能
+ * 区分"读到了我盖的东西"与"读到了一片空白"。 */
+static uint8_t g_stamp[FOTA_ENV_SIZE];
+
+static void stamp_envelope(uint32_t base, uint32_t patch_size)
+{
+    uint32_t i;
+
+    for (i = 0U; i < FOTA_ENV_SIZE; i++) {
+        g_stamp[i] = (uint8_t)(0xA0U + (i & 0x1FU));
+    }
+    /* 头 4 B 放 patch_size，纯为调试时一眼可辨；判据是整段逐字节比对。 */
+    g_stamp[0] = (uint8_t)(patch_size & 0xFFU);
+    g_stamp[1] = (uint8_t)((patch_size >> 8) & 0xFFU);
+    for (i = 0U; i < FOTA_ENV_SIZE; i++) {
+        mock_flash_poke(base + i, g_stamp[i]);
+    }
+}
+
+/* 摆一个自洽的 "READY + 暂存区完好" 现场。 */
+static void seed_durable_ready(uint32_t slot, uint32_t patch_size)
+{
+    uint32_t staged = FOTA_ENV_SIZE + patch_size;
+
+    stamp_envelope(test_staging_base(slot, staged), patch_size);
+    memset(&g_env_stub, 0, sizeof(g_env_stub));
+    g_env_stub.patch_size = patch_size;
+    g_env_stub_ok         = 1;
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_READY, slot, staged));
+}
+
+/* ---- 1. 冷启动 ---------------------------------------------------------- */
+
+void test_init_starts_idle_with_empty_accounting(void)
+{
+    TEST_ASSERT_EQUAL(FOTA_STATE_IDLE, fota_get_state());
+    TEST_ASSERT_EQUAL_UINT32(0, fota_get_progress());
+    TEST_ASSERT_EQUAL_UINT32(0, fota_get_staged_bytes());
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_NONE, fota_get_pending_slot());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_NONE, fota_get_last_error());
+    TEST_ASSERT_EQUAL_UINT32(0, g_fault_traps);
+}
+
+void test_init_does_not_claim_the_cli_stream(void)
+{
+    /* 接管必须是显式的（`fota recv`），而不是"上电就听"。否则 CLI 永远
+     * 收不到输入，而这一条从外部看起来只是"串口没反应"。 */
+    TEST_ASSERT_EQUAL_UINT8(0, cli_rx_sink_active());
+}
+
+/* ---- 2. 帧常量与缓冲 ---------------------------------------------------- */
+
+void test_frame_markers_are_pairwise_distinct(void)
+{
+    /* 解析器**只靠首字节**分派，所以三个标记必须互不相等 —— 相等时的
+     * 症状是"某一类帧永远被当成另一类"，而帧长不同会让解析器很快失步。 */
+    TEST_ASSERT_TRUE(FOTA_FRAME_START != FOTA_FRAME_DATA);
+    TEST_ASSERT_TRUE(FOTA_FRAME_START != FOTA_FRAME_FINISH);
+    TEST_ASSERT_TRUE(FOTA_FRAME_DATA  != FOTA_FRAME_FINISH);
+}
+
+void test_start_frame_holds_marker_envelope_and_crc(void)
+{
+    /* START = 1 B 标记 + 48 B 信封 + 2 B 传输级 CRC16 */
+    TEST_ASSERT_EQUAL_UINT32(1U + FOTA_ENV_SIZE + 2U, FOTA_START_FRAME_SIZE);
+    /* 信封大小是**格式真源**里的事实：C 侧宏与 JSON 不一致时立刻红，
+     * 而不是等到两端各自按自己的理解算偏移。 */
+    TEST_ASSERT_EQUAL_UINT32({{ fota_fmt.env_size }}U, FOTA_ENV_SIZE);
+}
+
+void test_rx_buffer_fits_the_longest_frame(void)
+{
+    /* 最长的一帧是 DATA：标记(1) + seq(2) + len(2) + 载荷(chunk) + crc16(2)。
+     *
+     * ⚠️ `FOTA_DATA_OVERHEAD` 是"除载荷之外的**全部**定长字节"，**已经含尾部
+     * crc16** —— 所以这里只加 chunk_size。早先这条断言多写了一个 `+ 2U`
+     * （把 crc16 数了两遍），于是它实际在要求"缓冲比真实最长帧还大 2 B"：
+     * 缓冲明明够用却被判成溢出，而`FOTA_MAX_FRAME` 本身是对的。
+     * 先把这段"开销到底包含什么"钉住，再断言长度关系 ——
+     * 否则下次改常量时，又只能靠猜是哪一项算错了。 */
+    TEST_ASSERT_EQUAL_UINT32(1U + 4U + 2U, FOTA_DATA_OVERHEAD);
+    TEST_ASSERT_TRUE(FOTA_MAX_FRAME >= FOTA_DATA_OVERHEAD + FOTA_CHUNK_SIZE);
+}
+
+void test_idle_timeout_is_not_zero(void)
+{
+    /* 0 会让"进入接收后立刻判超时"，表现为 UART 刚接管就被交还。 */
+    TEST_ASSERT_TRUE(FOTA_ACK_TIMEOUT_MS > 0U);
+}
+
+/* ---- 3. 记录布局自洽 ---------------------------------------------------- */
+
+void test_record_layout_is_doubleword_programmable(void)
+{
+    /* STM32G0 只支持双字（8 B）编程。记录长度不是 8 的整数倍时，最后一次
+     * HAL_FLASH_Program 会**跨出记录边界**，把下一条记录的头几个字节一起
+     * 写掉 —— 那会让"空槽"看起来被写过。 */
+    TEST_ASSERT_EQUAL_UINT32(0, FOTA_META_RECORD_SIZE % 8U);
+    /* 页尾余数（{{ fota_meta.meta_unused_tail }} B）**不参与日志**：把它当半条记录扫描会读出
+     * 一段全 0xFF 的"记录"。扫描上界必须用 RECORD_COUNT，余数由这里对账。 */
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_UNUSED_TAIL,
+                             FOTA_META_PAGE_SIZE % FOTA_META_RECORD_SIZE);
+    /* magic 必须在记录的第一个字节：判断"空槽"就是读首字是否为 0xFFFFFFFF。 */
+    TEST_ASSERT_EQUAL_UINT32(0, FOTA_META_OFF_MAGIC);
+    /* CRC16 只覆盖校验字段**之前**的部分（覆盖到自己是没有不动点的方程）。 */
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_OFF_CRC16, FOTA_META_CRC16_LEN);
+    /* 每个 32 bit 字段都按 u32 直取，必须落在 4 字节边界上。 */
+    TEST_ASSERT_EQUAL_UINT32(0, FOTA_META_OFF_SEQ      % 4U);
+    TEST_ASSERT_EQUAL_UINT32(0, FOTA_META_OFF_STATE    % 4U);
+    TEST_ASSERT_EQUAL_UINT32(0, FOTA_META_OFF_SLOT     % 4U);
+    TEST_ASSERT_EQUAL_UINT32(0, FOTA_META_OFF_STAGED   % 4U);
+}
+
+void test_slot_zero_means_none(void)
+{
+    /* 0 保留给"没有待启动槽"。若 0 被解读成"槽 A"，一条被清零的记录就会
+     * 让引导器去引导一个空槽 —— 这是最贵的一种"看起来在工作"。 */
+    TEST_ASSERT_EQUAL_UINT32(0, FOTA_META_SLOT_NONE);
+    TEST_ASSERT_TRUE(FOTA_META_SLOT_A != FOTA_META_SLOT_NONE);
+    TEST_ASSERT_TRUE(FOTA_META_SLOT_B != FOTA_META_SLOT_NONE);
+    TEST_ASSERT_TRUE(FOTA_META_SLOT_A != FOTA_META_SLOT_B);
+}
+
+void test_magic_spells_fotm(void)
+{
+    /* 内存里读出来是 'FOTM' —— 便于在 hexdump 里认出来。
+     * 与格式真源 `fota_format.json` 的 metadata.fields.magic 一致。 */
+    TEST_ASSERT_EQUAL_UINT32(0x4D544F46UL, FOTA_META_MAGIC);
+}
+
+void test_state_values_are_distinct(void)
+{
+    /* 两个状态取同一个值时的症状是"某个状态永远进不去"，而所有 switch
+     * 依然编译通过（重复的 case 才报错，重复的宏不会）。 */
+    TEST_ASSERT_TRUE(FOTA_META_STATE_IDLE      != FOTA_META_STATE_RECEIVING);
+    TEST_ASSERT_TRUE(FOTA_META_STATE_RECEIVING != FOTA_META_STATE_READY);
+    TEST_ASSERT_TRUE(FOTA_META_STATE_READY     != FOTA_META_STATE_APPLYING);
+    TEST_ASSERT_TRUE(FOTA_META_STATE_APPLYING  != FOTA_META_STATE_DONE);
+    TEST_ASSERT_TRUE(FOTA_META_STATE_DONE      != FOTA_META_STATE_ERROR);
+    /* 运行期枚举与存储枚举**取值对齐**（它们来自同一个真源，
+     * 但绝不允许互相赋值：一个跨复位存在 Flash 里，一个是当前进程的状态）。 */
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_IDLE,  FOTA_STATE_IDLE);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_DONE,  FOTA_STATE_DONE);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_ERROR, FOTA_STATE_ERROR);
+}
+
+/* ---- 4. 日志式存储的语义 ------------------------------------------------ */
+
+void test_empty_page_has_no_record(void)
+{
+    fota_meta_t rec;
+
+    /* 一块全 0xFF 的页（正是擦除态）**不是**一条记录：magic 与 seq 都恰好
+     * 是 0xFFFFFFFF，只看这两个字段的话，"空页"会被读成一条长度为
+     * RECORD_COUNT 的"合法记录"。 */
+    memset(&rec, 0x5A, sizeof(rec));
+    TEST_ASSERT_EQUAL_INT(-1, fota_meta_load(&rec));
+    /* 失败时**不修改** out：调用方必须把"没有记录"当成 IDLE/NONE 处理，
+     * 而不是"随便用某个值"。 */
+    TEST_ASSERT_EQUAL_UINT32(0x5A5A5A5AU, rec.state);
+}
+
+void test_append_then_load_roundtrip(void)
+{
+    fota_meta_t rec;
+
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_RECEIVING,
+                                              FOTA_META_SLOT_B, 1234U));
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_RECEIVING, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_B, rec.slot);
+    TEST_ASSERT_EQUAL_UINT32(1234U, rec.staged);
+    /* seq 从 1 开始（0 与 0xFFFFFFFF 都保留给非法/擦除态）。 */
+    TEST_ASSERT_EQUAL_UINT32(1U, rec.seq);
+
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_READY,
+                                              FOTA_META_SLOT_B, 4321U));
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_READY, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(4321U, rec.staged);
+    TEST_ASSERT_EQUAL_UINT32(2U, rec.seq);       /* 单调递增 */
+}
+
+void test_newest_record_wins_regardless_of_position(void)
+{
+    uint32_t i;
+    fota_meta_t rec;
+
+    /* 连续追加到接近满页：扫描必须按 **seq** 取最新，而不是按"最后一个
+     * 非空槽"或"第一个非空槽"。 */
+    for (i = 0U; i < 5U; i++) {
+        TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_RECEIVING,
+                                                  FOTA_META_SLOT_A,
+                                                  (i + 1U) * 100U));
+    }
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_RECEIVING, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_A, rec.slot);
+    TEST_ASSERT_EQUAL_UINT32(500U, rec.staged);
+    TEST_ASSERT_EQUAL_UINT32(5U, rec.seq);
+}
+
+void test_torn_record_is_skipped_and_the_previous_one_still_holds(void)
+{
+    fota_meta_t rec;
+
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_RECEIVING,
+                                              FOTA_META_SLOT_B, 100U));
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_READY,
+                                              FOTA_META_SLOT_B, 200U));
+
+    /* 模拟"写到一半掉电"：第 2 条记录（槽 1）的校验字被破坏。
+     * 真实硬件上这会表现为"CRC 双字还没落盘，仍是 0xFF"。 */
+    mock_flash_poke(FOTA_META_PAGE_BASE + FOTA_META_RECORD_SIZE
+                        + FOTA_META_OFF_CRC16, 0x00U);
+    mock_flash_poke(FOTA_META_PAGE_BASE + FOTA_META_RECORD_SIZE
+                        + FOTA_META_OFF_CRC16 + 1U, 0x00U);
+
+    /* ⚠️ 关键：坏记录必须被**跳过**，而上一条仍然有效 —— 这是"日志式"
+     * 相对"两个槽乒乓"的全部价值。乒乓在擦旧槽时会把唯一有效记录也擦掉，
+     * 掉电即全丢。若这里改成"最后一条坏就返回 -1"，接收进度会在每次掉电
+     * 时归零。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_RECEIVING, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(100U, rec.staged);
+    TEST_ASSERT_EQUAL_UINT32(1U, rec.seq);
+}
+
+void test_a_record_with_a_broken_magic_is_skipped(void)
+{
+    fota_meta_t rec;
+
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_DONE,
+                                              FOTA_META_SLOT_A, 7U));
+    /* 只坏 magic、保留 CRC —— 校验字覆盖了 magic，所以载荷整体不可信。 */
+    mock_flash_poke(FOTA_META_PAGE_BASE + FOTA_META_OFF_MAGIC, 0x00U);
+
+    TEST_ASSERT_EQUAL_INT(-1, fota_meta_load(&rec));
+}
+
+void test_page_full_erases_and_keeps_sequence_monotonic(void)
+{
+    uint32_t i;
+    fota_meta_t rec;
+    uint32_t erases_before;
+
+    erases_before = mock_flash_get_erase_count();
+
+    /* 写满一页再多写 3 条，强制走"页满 ⇒ 擦页 ⇒ 从 0 号槽继续"。 */
+    for (i = 0U; i < FOTA_META_RECORD_COUNT + 3U; i++) {
+        TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_RECEIVING,
+                                                  FOTA_META_SLOT_B, i + 1U));
+    }
+
+    TEST_ASSERT_TRUE(mock_flash_get_erase_count() > erases_before);
+    /* 擦页之后仍能取到**最新的那条** —— 擦页时 seq 的当前最大值还在内存里，
+     * 所以新记录的 seq 接着涨，而不是回绕到 1。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_RECEIVING, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_RECORD_COUNT + 3U, rec.staged);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_RECORD_COUNT + 3U, rec.seq);
+}
+
+void test_consume_clears_the_pending_state(void)
+{
+    fota_meta_t rec;
+
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_DONE,
+                                              FOTA_META_SLOT_B, 999U));
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_consume());
+
+    /* 日志式存储没有"删除"这个动作：追加一条 IDLE/NONE/0 **就是**删除。
+     * 断言"清零的记录读出来就是无事发生"，而不是"记录消失了"。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_IDLE, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_NONE, rec.slot);
+    TEST_ASSERT_EQUAL_UINT32(0U, rec.staged);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_NONE, fota_get_pending_slot());
+}
+
+/* ---- 5. fota_init 的状态映射表 ------------------------------------------ */
+
+void test_init_maps_receiving_to_idle(void)
+{
+    fota_meta_t rec;
+
+    /* 上次没收完。**不能**在这里直接恢复：`g_env` 要从 START 帧重建，
+     * 而上层此时也无法继续收（UART 还没接管）。退回 IDLE，等主机重发
+     * START —— 那时续传判定会认出这是同一条补丁，从断点接着收，
+     * 而不是从 0 重传（这条路径由 L5 台架的 case 8 端到端覆盖）。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_RECEIVING,
+                                              FOTA_META_SLOT_B, 456U));
+    fota_init();
+    TEST_ASSERT_EQUAL(FOTA_STATE_IDLE, fota_get_state());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_NONE, fota_get_last_error());
+    /* 记录本身不能被顺手清掉，否则续传的前提就没了。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(456U, rec.staged);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_RECEIVING, rec.state);
+}
+
+void test_init_restores_ready_so_the_patch_can_still_be_applied(void)
+{
+    /* 收齐了、已通过 CRC32，但还没应用就掉电/复位了。这条记录的**全部价值**
+     * 就是"整条补丁已经落在暂存区里并通过校验"，所以重启后必须把上下文
+     * 重建起来（信封就在暂存区头部 —— 落盘正是为了这条路径），让
+     * `fota apply` 仍然可用。
+     *
+     * 反过来（退回 IDLE）的代价不是"多等一会儿"：下一次 START 的续传判定
+     * 只认 RECEIVING 记录，于是会走**完整重传**分支，把一份已经通过 CRC32
+     * 的补丁从暂存区里擦掉重收。 */
+    TAMP->BKP1R = 0U;                             /* 活动槽 = A ⇒ 目标槽 B */
+    seed_durable_ready(FOTA_META_SLOT_B, 300U);   /* staged = 48 + 300 */
+
+    fota_init();
+
+    TEST_ASSERT_EQUAL(FOTA_STATE_READY, fota_get_state());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_NONE, fota_get_last_error());
+    TEST_ASSERT_EQUAL_UINT32(FOTA_ENV_SIZE + 300U, fota_get_staged_bytes());
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_B, fota_get_pending_slot());
+
+    /* 信封必须是**从契约算出的那个地址**读回来的。地址算错的后果是 apply
+     * 去擦一片无关的 Flash，而在主机上它只表现为"读到了一片 0xFF"。 */
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(g_stamp, g_env_stub_seen, FOTA_ENV_SIZE);
+
+    /* 恢复的是**状态**，不是动作：`fota_process()` 在这里不该自动开始擦写 ——
+     * `fota_init` 每次上电都会跑，而"刚上电就自己擦掉一个槽"正是这个文件里
+     * 反复避免的事。 */
+    fota_process();
+    TEST_ASSERT_EQUAL(FOTA_STATE_READY, fota_get_state());
+
+    /* 但显式 apply 必须能走通（这就是恢复 READY 的目的）。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_apply_request());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_NONE, fota_get_last_error());
+}
+
+void test_init_refuses_ready_when_the_staging_envelope_is_unreadable(void)
+{
+    fota_meta_t rec;
+
+    TAMP->BKP1R = 0U;
+
+    /* 记录说"已收齐"，但暂存区是擦除态（0xFF）—— 信封读不回来。
+     * 这时**必须**拒绝恢复：apply 会拿这份身份不明的数据去擦掉整个目标槽。
+     * 退回 IDLE，并把记录改写成 ERROR，让下一次 START 确定性地走完整重传。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_READY,
+                                              FOTA_META_SLOT_B,
+                                              FOTA_ENV_SIZE + 300U));
+    fota_init();
+
+    TEST_ASSERT_EQUAL(FOTA_STATE_IDLE, fota_get_state());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_STAGING_LOST, fota_get_last_error());
+    TEST_ASSERT_EQUAL_UINT32(0, fota_get_staged_bytes());
+    /* ERROR 记录里那个槽是**诊断信息**，不是"待启动槽"。 */
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_NONE, fota_get_pending_slot());
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_ERROR, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_B, rec.slot);
+
+    /* 而且这**不是**死路：ERROR 允许重新接收（与 fota_receive_begin 的约定
+     * 一致）。若这里也拒绝，操作员就只能靠 `fota erase` 把整个目标槽擦掉
+     * 才能重来 —— 代价比重新传一次补丁大得多。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_receive_begin(NULL, 0U));
+}
+
+void test_init_refuses_ready_when_the_record_does_not_match_the_envelope(void)
+{
+    fota_meta_t rec;
+    uint32_t   base;
+
+    TAMP->BKP1R = 0U;
+
+    /* 记录与信封**不是同一次传输**：记录说 staged = 48 + 300，而信封里声明
+     * 的 patch_size 是 296。这两样对不上时，按任何一方算出的基址都可能是
+     * 别人的地址 —— 必须拒绝，而不是"挑一个能用的凑合"。 */
+    base = test_staging_base(FOTA_META_SLOT_B, FOTA_ENV_SIZE + 300U);
+    stamp_envelope(base, 296U);
+    memset(&g_env_stub, 0, sizeof(g_env_stub));
+    g_env_stub.patch_size = 296U;                 /* 与记录声明的 300 不符 */
+    g_env_stub_ok         = 1;
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_READY,
+                                              FOTA_META_SLOT_B,
+                                              FOTA_ENV_SIZE + 300U));
+    fota_init();
+
+    TEST_ASSERT_EQUAL(FOTA_STATE_IDLE, fota_get_state());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_STAGING_LOST, fota_get_last_error());
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_ERROR, rec.state);
+}
+
+void test_init_adopts_done_kind_of_record_and_consumes_it(void)
+{
+    /* 补丁已应用，而且记录指向的槽**就是当前正在运行的槽**（复位后
+     * BKP1R == 0 ⇒ 活动槽 A）—— 说明这次升级真的生效了。
+     * 引导器是**只读**的，所以"消费"只能由 App 做，时机正是这里。 */
+    fota_meta_t rec;
+
+    TAMP->BKP1R = 0U;                                  /* 活动槽 = A */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_DONE,
+                                              FOTA_META_SLOT_A, 888U));
+
+    fota_init();
+
+    TEST_ASSERT_EQUAL(FOTA_STATE_DONE, fota_get_state());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_NONE, fota_get_last_error());
+    /* 已消费：再读就是 IDLE/NONE。不做这件事的话，这条记录会永久粘住，
+     * 引导器每次复位都去强制启动那个槽 —— "新槽起不来就回退"这条失效
+     * 保护会被反复推翻。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_IDLE, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_NONE, rec.slot);
+}
+
+void test_init_reports_rollback_when_done_points_at_another_slot(void)
+{
+    /* 记录说"补丁已落到槽 B"，可我们正跑在槽 A 上。引导器只在目标槽
+     * **通过 CRC** 时才切过去，所以走到这里意味着新固件没能起来
+     * （CRC 不过，或起了但没能在重试次数内确认启动而被退了回来）。 */
+    fota_meta_t rec;
+
+    TAMP->BKP1R = 0U;                                  /* 活动槽 = A */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_DONE,
+                                              FOTA_META_SLOT_B, 555U));
+
+    fota_init();
+
+    TEST_ASSERT_EQUAL(FOTA_STATE_ERROR, fota_get_state());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_ROLLBACK, fota_get_last_error());
+    /* 必须把 DONE **改写成 ERROR**：留着 DONE 的话，引导器每次复位都会
+     * 重新去试那个起不来的槽。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_ERROR, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_SLOT_B, rec.slot);
+}
+
+void test_init_maps_error_to_error(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_ERROR,
+                                              FOTA_META_SLOT_B, 321U));
+    fota_init();
+    TEST_ASSERT_EQUAL(FOTA_STATE_ERROR, fota_get_state());
+}
+
+/* ---- 6. UART 接管 / 交还 ------------------------------------------------ */
+
+void test_receive_begin_takes_over_the_uart(void)
+{
+    char msg[48];
+
+    TEST_ASSERT_EQUAL_INT(0, fota_receive_begin(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL(FOTA_STATE_RECEIVING, fota_get_state());
+    TEST_ASSERT_EQUAL_UINT8(1, cli_rx_sink_active());
+}
+
+void test_receive_begin_twice_is_rejected_as_busy(void)
+{
+    char msg[48];
+
+    TEST_ASSERT_EQUAL_INT(0, fota_receive_begin(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL_INT(-1, fota_receive_begin(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL_INT(FOTA_E_BUSY, fota_get_last_error());
+}
+
+void test_receive_begin_is_refused_while_a_patch_waits(void)
+{
+    char msg[48];
+
+    /* READY 状态下暂存区里有一条**已校验通过、等着启动**的补丁。
+     * 允许进入接收就等于允许静默丢弃它 —— 要这么做得先显式 erase
+     * （或先 apply 把它用掉）。 */
+    TAMP->BKP1R = 0U;                             /* 活动槽 = A ⇒ 目标槽 B */
+    seed_durable_ready(FOTA_META_SLOT_B, 100U);
+    fota_init();
+    TEST_ASSERT_EQUAL(FOTA_STATE_READY, fota_get_state());
+
+    TEST_ASSERT_EQUAL_INT(-1, fota_receive_begin(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL_INT(FOTA_E_BUSY, fota_get_last_error());
+    /* 被拒时**不能**顺手接管 UART：那会让 CLI 静默失联。 */
+    TEST_ASSERT_EQUAL_UINT8(0, cli_rx_sink_active());
+}
+
+void test_error_state_does_not_lock_the_device_out(void)
+{
+    char msg[48];
+
+    /* ERROR 是"上一次尝试失败"的记录，不是"设备坏了"。若因为 ERROR 就拒绝
+     * 重新接收，一次串口噪声造成的失败就会把设备锁在"必须先 fota erase"上，
+     * 而 erase 会擦掉整个目标槽 —— 代价比重新传一次补丁大得多。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_ERROR,
+                                              FOTA_META_SLOT_B, 100U));
+    fota_init();
+    TEST_ASSERT_EQUAL(FOTA_STATE_ERROR, fota_get_state());
+
+    TEST_ASSERT_EQUAL_INT(0, fota_receive_begin(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL(FOTA_STATE_RECEIVING, fota_get_state());
+    TEST_ASSERT_EQUAL_UINT8(1, cli_rx_sink_active());
+}
+
+void test_abort_returns_the_uart_and_keeps_staging(void)
+{
+    fota_meta_t rec;
+    char        msg[48];
+
+    /* ⚠️ 这里先自己写一条 RECEIVING 记录，而**不是**指望 `fota_receive_begin`
+     * 去写：进入接收时刻意不写元数据（那时还不知道这次传的是哪条补丁，
+     * 提前清掉等于自断续传）。真机上这条记录由 START 帧的 `fota_handle_start`
+     * 落盘，本文件不动协议帧，所以只能手工摆出来 —— 否则这条断言会变成
+     * "对着一个从来就不存在的记录断言它还在"。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_append(FOTA_META_STATE_RECEIVING,
+                                              FOTA_META_SLOT_B, 4096U));
+
+    TEST_ASSERT_EQUAL_INT(0, fota_receive_begin(msg, sizeof(msg)));
+    fota_receive_abort();
+
+    TEST_ASSERT_EQUAL_UINT8(0, cli_rx_sink_active());
+    TEST_ASSERT_EQUAL(FOTA_STATE_IDLE, fota_get_state());
+    /* 只退回 IDLE：**不清元数据、不擦暂存区**，所以主机重发 START 能续传。
+     * `fota_meta_append` 与 abort 各写了一次记录，检查的是**内容**而不是
+     * "有没有记录" —— 用 `fota_meta_load(NULL)` 只能看出后者。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_meta_load(&rec));
+    TEST_ASSERT_EQUAL_UINT32(FOTA_META_STATE_RECEIVING, rec.state);
+    TEST_ASSERT_EQUAL_UINT32(4096U, rec.staged);
+}
+
+void test_abort_is_safe_without_a_session(void)
+{
+    fota_receive_abort();
+    TEST_ASSERT_EQUAL_UINT8(0, cli_rx_sink_active());
     TEST_ASSERT_EQUAL(FOTA_STATE_IDLE, fota_get_state());
 }
 
-void test_fota_init_clears_bkp_flags(void)
+/* ---- 7. 空闲超时 -------------------------------------------------------- */
+
+void test_no_timeout_before_the_deadline(void)
 {
-    /* bkp_read() should return 0 after init */
-    uint32_t val = bkp_read();
-    TEST_ASSERT_EQUAL_UINT32(0, val);
+    char msg[48];
+
+    TEST_ASSERT_EQUAL_INT(0, fota_receive_begin(msg, sizeof(msg)));
+    mock_tick_advance(FOTA_ACK_TIMEOUT_MS - 1U);
+    fota_process();
+
+    TEST_ASSERT_EQUAL(FOTA_STATE_RECEIVING, fota_get_state());
+    TEST_ASSERT_EQUAL_UINT8(1, cli_rx_sink_active());
 }
 
-void test_fota_get_progress_starts_zero(void)
+void test_idle_timeout_returns_the_uart(void)
 {
-    TEST_ASSERT_EQUAL_UINT32(0, fota_get_progress());
+    char msg[48];
+
+    /* ⚠️ 这个用例专门覆盖"用 0 当未初始化哨兵"的写法：`HAL_GetTick()` 在
+     * 刚启动时**合法地就是 0**（TIM14 从 0 开始计数），于是
+     * `if (g_last_activity_ms != 0 && now - g_last_activity_ms > TIMEOUT)`
+     * 在"开机后第一件事就是进入接收、然后主机静默"这个场景下一次都不触发 ——
+     * 接收态永久挂着、UART 也永久不还给 CLI。tick 从 0 起的这个夹具
+     * 就是为它准备的。 */
+    TEST_ASSERT_EQUAL_INT(0, fota_receive_begin(msg, sizeof(msg)));
+    TEST_ASSERT_EQUAL_UINT32(0U, HAL_GetTick());
+
+    mock_tick_advance(FOTA_ACK_TIMEOUT_MS + 1U);
+    fota_process();
+
+    TEST_ASSERT_EQUAL(FOTA_STATE_IDLE, fota_get_state());
+    TEST_ASSERT_EQUAL_UINT8(0, cli_rx_sink_active());
+    TEST_ASSERT_TRUE(g_fault_traps == 0U);      /* 超时不是故障 */
 }
 
-/* ---- BKP4R flag persistence ---- */
+/* ---- 8. 非法时序 -------------------------------------------------------- */
 
-void test_bkp_write_read_roundtrip(void)
+void test_apply_request_requires_ready_state(void)
 {
-    bkp_write(0xDEADBEEFUL);
-    TEST_ASSERT_EQUAL_UINT32(0xDEADBEEFUL, bkp_read());
+    TEST_ASSERT_EQUAL_INT(-1, fota_apply_request());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_NOT_READY, fota_get_last_error());
 }
 
-void test_bkp_set_flag_single_bit(void)
+void test_process_does_nothing_when_idle(void)
 {
-    bkp_write(0);
-    bkp_set_flag(FOTA_FLAG_IN_PROGRESS);
-    TEST_ASSERT_EQUAL_UINT32(FOTA_FLAG_IN_PROGRESS, bkp_read());
+    fota_process();
+    fota_process();
+    TEST_ASSERT_EQUAL(FOTA_STATE_IDLE, fota_get_state());
+    TEST_ASSERT_EQUAL_UINT32(0, g_fault_traps);
 }
 
-void test_bkp_set_flag_multiple_bits(void)
-{
-    bkp_write(0);
-    bkp_set_flag(FOTA_FLAG_IN_PROGRESS);
-    bkp_set_flag(FOTA_FLAG_PATCH_READY);
-    uint32_t expected = FOTA_FLAG_IN_PROGRESS | FOTA_FLAG_PATCH_READY;
-    TEST_ASSERT_EQUAL_UINT32(expected, bkp_read());
-}
-
-void test_bkp_clear_flags_wipes_all(void)
-{
-    bkp_write(FOTA_FLAG_IN_PROGRESS | FOTA_FLAG_PATCH_READY | FOTA_FLAG_VERIFY_FAIL);
-    bkp_clear_flags();
-    TEST_ASSERT_EQUAL_UINT32(0, bkp_read());
-}
-
-void test_bkp_flag_constants_distinct(void)
-{
-    /* Ensure flag bits don't overlap */
-    TEST_ASSERT_EQUAL_UINT32(0, FOTA_FLAG_IN_PROGRESS & FOTA_FLAG_PATCH_READY);
-    TEST_ASSERT_EQUAL_UINT32(0, FOTA_FLAG_IN_PROGRESS & FOTA_FLAG_VERIFY_FAIL);
-    TEST_ASSERT_EQUAL_UINT32(0, FOTA_FLAG_IN_PROGRESS & FOTA_FLAG_APPLY_FAIL);
-    TEST_ASSERT_EQUAL_UINT32(0, FOTA_FLAG_PATCH_READY & FOTA_FLAG_VERIFY_FAIL);
-    TEST_ASSERT_EQUAL_UINT32(0, FOTA_FLAG_PATCH_READY & FOTA_FLAG_APPLY_FAIL);
-    TEST_ASSERT_EQUAL_UINT32(0, FOTA_FLAG_VERIFY_FAIL & FOTA_FLAG_APPLY_FAIL);
-}
-
-/* ---- CRC16 computation tests ---- */
-
-void test_crc16_empty_returns_ffff(void)
-{
-    uint16_t crc = crc16_compute(NULL, 0);
-    TEST_ASSERT_EQUAL_HEX16(0xFFFF, crc);
-}
-
-void test_crc16_known_vector_123456789(void)
-{
-    /* ITU-T CRC-16: hex "313233343536373839" -> 0x29B1 */
-    const uint8_t test_data[] = {'1','2','3','4','5','6','7','8','9'};
-    uint16_t crc = crc16_compute(test_data, sizeof(test_data));
-    TEST_ASSERT_EQUAL_HEX16(0x29B1, crc);
-}
-
-void test_crc16_known_vector_A(void)
-{
-    /* Single byte 'A' (0x41) with CRC-16/CCITT-FALSE (init=0xFFFF) */
-    const uint8_t test_data[] = {'A'};
-    uint16_t crc = crc16_compute(test_data, sizeof(test_data));
-    TEST_ASSERT_EQUAL_HEX16(0xB915, crc);
-}
-
-void test_crc16_all_zeros(void)
-{
-    /* 8 zero bytes with CRC-16/CCITT-FALSE (init=0xFFFF) */
-    const uint8_t test_data[8] = {0};
-    uint16_t crc = crc16_compute(test_data, sizeof(test_data));
-    TEST_ASSERT_EQUAL_HEX16(0x313E, crc);
-}
-
-void test_crc16_idempotent(void)
-{
-    /* Running CRC on same data twice produces same result */
-    const uint8_t test_data[] = {0xAA, 0xBB, 0xCC, 0xDD};
-    uint16_t crc1 = crc16_compute(test_data, sizeof(test_data));
-    uint16_t crc2 = crc16_compute(test_data, sizeof(test_data));
-    TEST_ASSERT_EQUAL_HEX16(crc1, crc2);
-}
-
-/* ---- Protocol constants ---- */
-
-void test_fota_chunk_size_is_1024(void)
-{
-    TEST_ASSERT_EQUAL_UINT16(1024, FOTA_CHUNK_SIZE);
-}
-
-void test_start_cmd_magic(void)
-{
-    TEST_ASSERT_EQUAL_HEX16(0xF00AU, FOTA_PROTOCOL_START_CMD);
-}
-
-void test_end_cmd_magic(void)
-{
-    TEST_ASSERT_EQUAL_HEX16(0xF00EU, FOTA_PROTOCOL_END_CMD);
-}
-
-void test_protocol_flag_values(void)
-{
-    TEST_ASSERT_EQUAL_HEX8(0x06U, FOTA_PROTOCOL_ACK);
-    TEST_ASSERT_EQUAL_HEX8(0x15U, FOTA_PROTOCOL_NAK);
-}
-
-/* ---- FOTA version encoding mask ---- */
-
-void test_version_mask_isolates_upper_24_bits(void)
-{
-    uint32_t raw = 0x123456ABUL;
-    uint32_t version = (raw & FOTA_VERSION_MASK) >> FOTA_VERSION_SHIFT;
-    TEST_ASSERT_EQUAL_HEX32(0x00123456UL, version);
-}
-
-void test_version_mask_ignores_lower_8_bits(void)
-{
-    uint32_t raw = 0x00000001UL;
-    uint32_t version = (raw & FOTA_VERSION_MASK) >> FOTA_VERSION_SHIFT;
-    TEST_ASSERT_EQUAL_HEX32(0x00000000UL, version);
-}
+/* ===========================================================================
+ * 入口
+ * =========================================================================== */
 
 int main(void)
 {
     UNITY_BEGIN();
-    RUN_TEST(test_fota_init_sets_state_idle);
-    RUN_TEST(test_fota_init_clears_bkp_flags);
-    RUN_TEST(test_fota_get_progress_starts_zero);
-    RUN_TEST(test_bkp_write_read_roundtrip);
-    RUN_TEST(test_bkp_set_flag_single_bit);
-    RUN_TEST(test_bkp_set_flag_multiple_bits);
-    RUN_TEST(test_bkp_clear_flags_wipes_all);
-    RUN_TEST(test_bkp_flag_constants_distinct);
-    RUN_TEST(test_crc16_empty_returns_ffff);
-    RUN_TEST(test_crc16_known_vector_123456789);
-    RUN_TEST(test_crc16_known_vector_A);
-    RUN_TEST(test_crc16_all_zeros);
-    RUN_TEST(test_crc16_idempotent);
-    RUN_TEST(test_fota_chunk_size_is_1024);
-    RUN_TEST(test_start_cmd_magic);
-    RUN_TEST(test_end_cmd_magic);
-    RUN_TEST(test_protocol_flag_values);
-    RUN_TEST(test_version_mask_isolates_upper_24_bits);
-    RUN_TEST(test_version_mask_ignores_lower_8_bits);
+
+    /* 1. 冷启动 */
+    RUN_TEST(test_init_starts_idle_with_empty_accounting);
+    RUN_TEST(test_init_does_not_claim_the_cli_stream);
+
+    /* 2. 帧常量与缓冲 */
+    RUN_TEST(test_frame_markers_are_pairwise_distinct);
+    RUN_TEST(test_start_frame_holds_marker_envelope_and_crc);
+    RUN_TEST(test_rx_buffer_fits_the_longest_frame);
+    RUN_TEST(test_idle_timeout_is_not_zero);
+
+    /* 3. 记录布局自洽 */
+    RUN_TEST(test_record_layout_is_doubleword_programmable);
+    RUN_TEST(test_slot_zero_means_none);
+    RUN_TEST(test_magic_spells_fotm);
+    RUN_TEST(test_state_values_are_distinct);
+
+    /* 4. 日志式存储的语义 */
+    RUN_TEST(test_empty_page_has_no_record);
+    RUN_TEST(test_append_then_load_roundtrip);
+    RUN_TEST(test_newest_record_wins_regardless_of_position);
+    RUN_TEST(test_torn_record_is_skipped_and_the_previous_one_still_holds);
+    RUN_TEST(test_a_record_with_a_broken_magic_is_skipped);
+    RUN_TEST(test_page_full_erases_and_keeps_sequence_monotonic);
+    RUN_TEST(test_consume_clears_the_pending_state);
+
+    /* 5. fota_init 的状态映射表 */
+    RUN_TEST(test_init_maps_receiving_to_idle);
+    RUN_TEST(test_init_restores_ready_so_the_patch_can_still_be_applied);
+    RUN_TEST(test_init_refuses_ready_when_the_staging_envelope_is_unreadable);
+    RUN_TEST(test_init_refuses_ready_when_the_record_does_not_match_the_envelope);
+    RUN_TEST(test_init_adopts_done_kind_of_record_and_consumes_it);
+    RUN_TEST(test_init_reports_rollback_when_done_points_at_another_slot);
+    RUN_TEST(test_init_maps_error_to_error);
+
+    /* 6. UART 接管 / 交还 */
+    RUN_TEST(test_receive_begin_takes_over_the_uart);
+    RUN_TEST(test_receive_begin_twice_is_rejected_as_busy);
+    RUN_TEST(test_receive_begin_is_refused_while_a_patch_waits);
+    RUN_TEST(test_error_state_does_not_lock_the_device_out);
+    RUN_TEST(test_abort_returns_the_uart_and_keeps_staging);
+    RUN_TEST(test_abort_is_safe_without_a_session);
+
+    /* 7. 空闲超时 */
+    RUN_TEST(test_no_timeout_before_the_deadline);
+    RUN_TEST(test_idle_timeout_returns_the_uart);
+
+    /* 8. 非法时序 */
+    RUN_TEST(test_apply_request_requires_ready_state);
+    RUN_TEST(test_process_does_nothing_when_idle);
+
     return UNITY_END();
 }

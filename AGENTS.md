@@ -125,6 +125,13 @@ python flash_capture.py                                  # COM4 @115200 抓日�
    指向本地 commit 会让 GitHub Actions checkout 失败，历史 run 35/36）。
    详见 `docs/requirements.md` §6.1。
 
+   **`static/third_party/` 同样只读**，规则与上同：它是 vendored 的第三方源码
+   （如差分解码器 HPatchLite、tinyuz），每个条目带 `PROVENANCE.json` 记录
+   上游 URL / commit / 许可。**不得就地改写、不得打补丁**；需要改动时只有
+   「生成代码侧适配」或「升级 vendored 版本并更新 PROVENANCE.json」两条路。
+   判据与 `static/stm32g0/` 一致：`git diff --stat -- static/` 必须为空
+   （§14 验收第 7 条）。
+
    **已验证案例 —— FreeRTOS ARMv6-M 端口毒值**：`portable/GCC/ARM_CM0/port.c`
    把 `ulCriticalNesting` 初始化为 `0xAAAAAAAA`，且上游至 `78069a79e`
    （2026-07-16）仍未修复。后果：`xPortStartScheduler()` 之前**第一次**

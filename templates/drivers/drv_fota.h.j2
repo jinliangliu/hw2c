@@ -1,5 +1,23 @@
-#ifndef __DRV_FOTA_H
-#define __DRV_FOTA_H
+#ifndef __DRV_{{ peripheral.name | upper }}_H
+#define __DRV_{{ peripheral.name | upper }}_H
+
+/*
+ * FOTA 接收侧（规划 P3）：帧解析 + 尾仓暂存 + 元数据 + 应用编排。
+ *
+ * 与 `fota_delta.{c,h}` 的分工
+ * ---------------------------
+ *   · `fota_delta`  = **纯算法**：把一条补丁流解成新镜像，I/O 全靠注入。
+ *                     它不知道 UART、不知道 TAMP、也不知道"尾仓"是什么。
+ *   · `drv_fota`    = **传输与持久化**：收帧、暂存、记元数据、置安全态、
+ *                     然后把暂存区当作补丁流交给 `fota_delta_apply()`。
+ *
+ * 这条分界是刻意的：算法那一半可以原样编到主机上（L6 掉电注入就是这么做
+ * 的），传输这一半只在有 UART 与备份域的目标上才有意义。
+ *
+ * 帧约定**全部**来自 `generator/data/fota_format.json` 的 `transport` 段。
+ * 本文件里不允许出现字面量帧标记或长度 —— 主机侧发送端读同一份真源，
+ * 两侧各写一份正是 A3 类缺陷（编译与单测全绿、链路静默失效）的成因。
+ */
 
 #ifdef TEST
 #include "mock_hal.h"
@@ -10,41 +28,160 @@
 
 #include <stdint.h>
 
-/* ---- Protocol constants ---- */
+/* ⚠️ 文件名是 `drv_fota_delta.h`（模板 `fota_delta.h.j2` 的输出名由驱动名
+ * 决定，不是模板名）。早先这里写的是 `"fota_delta.h"` —— 而这条 include
+ * 直到 P3（`has_fota_receive` 第一次为真）才真的被编译，之前一直是"看着
+ * 像对的"字面量。凡是只在某个分支成立时才被编译的东西，都要有闸门兜着。 */
+#include "drv_fota_delta.h"
 
-#define FOTA_CHUNK_SIZE         1024
-#define FOTA_PROTOCOL_START_CMD 0xF00AU
-#define FOTA_PROTOCOL_END_CMD   0xF00EU
-#define FOTA_PROTOCOL_ACK       0x06U
-#define FOTA_PROTOCOL_NAK       0x15U
+/* 元数据存储 + 共用的 Flash 原语（CRC16 / 页号换算）。
+ * 引导器读的也是这一份 —— 两侧对布局的理解必须逐字节一致。 */
+#include "drv_fota_meta.h"
 
-/* ---- TAMP BKP4R flag bits ---- */
+/* ---- 帧约定（真源 → 常量）--------------------------------------------- */
 
-#define FOTA_FLAG_IN_PROGRESS   0x01U   /* Bit 0: receiving patch */
-#define FOTA_FLAG_PATCH_READY   0x02U   /* Bit 1: patch fully written to Slot B */
-#define FOTA_FLAG_VERIFY_FAIL   0x04U   /* Bit 2: CRC verify failed */
-#define FOTA_FLAG_APPLY_FAIL    0x08U   /* Bit 3: bspatch apply error */
+#define FOTA_FRAME_START          {{ "0x%02XU" | format(fota_transport.frame_start) }}
+#define FOTA_FRAME_DATA           {{ "0x%02XU" | format(fota_transport.frame_data) }}
+#define FOTA_FRAME_FINISH         {{ "0x%02XU" | format(fota_transport.frame_finish) }}
+#define FOTA_PROTOCOL_ACK         {{ "0x%02XU" | format(fota_transport.ack) }}
+#define FOTA_PROTOCOL_NAK         {{ "0x%02XU" | format(fota_transport.nak) }}
 
-/* Version number encoded in BKP4R upper 24 bits */
-#define FOTA_VERSION_MASK       0xFFFFFF00U
-#define FOTA_VERSION_SHIFT      8U
+/* DATA 帧一次能携带的最大字节数 */
+#define FOTA_CHUNK_SIZE           {{ fota_transport.chunk_size }}U
 
-/* ---- State enum ---- */
+/* 停等协议的空闲超时：超过这个时间没有收到任何字节就放弃本次接收，
+ * 把 UART 交还给 CLI。**不清元数据** —— 暂存的补丁还在，主机可以接着发。 */
+#define FOTA_ACK_TIMEOUT_MS       {{ fota_transport.ack_timeout_ms }}U
 
+/* START 帧长度：标记(1) + 信封(48) + CRC16(2) */
+#define FOTA_START_FRAME_SIZE     {{ fota_transport.start_total }}U
+/* FINISH 帧长度：标记(1) + patch_crc32(4) */
+#define FOTA_FINISH_FRAME_SIZE    {{ fota_transport.finish_total }}U
+/* ACK / NAK 帧长度：标记(1) + next/want_seq(2) */
+#define FOTA_RESP_FRAME_SIZE      {{ fota_transport.ack_total }}U
+/* DATA 帧的定长开销：标记(1) + seq(2) + len(2) + crc16(2) */
+#define FOTA_DATA_OVERHEAD        (1U + {{ fota_transport.data_hdr_size }}U \
+                                   + {{ fota_transport.data_crc16_size }}U)
+/* 接收缓冲要能装下最长的一帧（DATA） */
+#define FOTA_MAX_FRAME            {{ fota_transport.max_frame }}U
+
+/* ---- 槽位 ---------------------------------------------------------------
+ * `FOTA_SLOT_A_BASE` / `FOTA_SLOT_B_BASE` / `_SIZE` 由 `drv_fota_delta.h` 从同一
+ * 份 `boot_config` 产出，本文件直接复用 —— 不再写第二份，"两个槽的地址
+ * 各写一遍"正是跨槽读写错槽那类缺陷的来源。 */
+
+/* ---- 持久元数据 ---------------------------------------------------------
+ *
+ * 状态与槽位编号（`FOTA_META_STATE_*` / `FOTA_META_SLOT_*`）以及记录布局，
+ * 现在都定义在 `fota_meta.h` 里 —— 因为**引导器也要读同一份记录**，两侧
+ * 各写一遍就等于给"悄悄分叉"留了门。
+ *
+ * 这里原先还有一组 `FOTA_META_REG_BKPnR` 宏。它们指向的 BKP5R..BKP9R 在
+ * STM32G0B1 上**并不存在**（TAMP 只有 BKP0R..BKP4R，且已被 boot_nvm 与
+ * boot_main 占满），所以整块被搬到了 Flash 页。见 `fota_meta.h` 的说明。
+ */
+
+
+/* ---- 状态 --------------------------------------------------------------
+ *
+ * ⚠️ 必须保持 `0..FOTA_STATE_ERROR` 连续且 ERROR 在最后：CLI 的 `fota status`
+ * 直接拿状态值当下标取名字（`(state <= FOTA_STATE_ERROR) ? names[state] : "UNKNOWN"`）。
+ * 插入新状态只能追加到 ERROR 之前，并同步更新 CLI 的名字表。
+ */
 typedef enum {
-    FOTA_STATE_IDLE,
-    FOTA_STATE_RECEIVING,
-    FOTA_STATE_APPLYING,
-    FOTA_STATE_VERIFYING,
-    FOTA_STATE_COMPLETE,
-    FOTA_STATE_ERROR
+    FOTA_STATE_IDLE = {{ fota_meta.st_idle }},
+    FOTA_STATE_RECEIVING = {{ fota_meta.st_receiving }},
+    FOTA_STATE_READY = {{ fota_meta.st_ready }},
+    FOTA_STATE_APPLYING = {{ fota_meta.st_applying }},
+    FOTA_STATE_DONE = {{ fota_meta.st_done }},
+    FOTA_STATE_ERROR = {{ fota_meta.st_error }}
 } fota_state_t;
 
-/* ---- API ---- */
+/* 校验失败 / 协议错误。与 fota_delta_err_t 分开编号，避免两套错误码撞号：
+ * 负数是 fota_delta 的（直接透传），正数是本层的。 */
+#define FOTA_E_NONE              0
+#define FOTA_E_NO_CLI            101   /* 没接上 CLI 的字节流 */
+#define FOTA_E_BUSY              102   /* 非 IDLE 却要求进入接收 */
+#define FOTA_E_NOT_READY         103   /* 还没收齐就要求应用 */
+#define FOTA_E_STAGING_FULL      104   /* 准入不通过（槽装不下） */
+#define FOTA_E_PATCH_CRC         105   /* FINISH 的 CRC 与暂存区不符 */
+#define FOTA_E_SHORT             106   /* 收齐的字节数少于信封声明 */
+#define FOTA_E_FLASH             107   /* 暂存区编程失败 */
+#define FOTA_E_IO                108   /* 协议层错误（帧头/长度/序号异常已处理）*/
+#define FOTA_E_ROLLBACK          109   /* 补丁应用成功但新槽没能起来，已回退旧槽 */
+#define FOTA_E_STAGING_LOST      110   /* 记录说"已收齐"，但暂存区里的信封读不回来/对不上 */
 
+/* ---- API ---------------------------------------------------------------- */
+
+/**
+ * @brief 初始化：读回元数据、校验自校验字，必要时把状态复位。
+ *
+ * 冷启动时备份域是随机值，所以先校验 `BKP9R`；不通过就整块重置为 IDLE，
+ * **而不是**按里面看起来像什么就去做什么 —— 一个"看起来处于 APPLYING"的
+ * 随机值会导致刚上电就开始擦 Flash。
+ */
 void fota_init(void);
-fota_state_t fota_get_state(void);
+
+/**
+ * @brief 周期处理（由 `fota_task` 以 10 ms 周期调用）。
+ *
+ * 负责三件事：接收空闲超时、把 UART 交还 CLI、执行待办的应用任务。
+ * 应用（擦 + 解码 + 校验）在本函数里**同步跑完**，不拆成分片 ——
+ * 规划 §5.3 的结论：把并发问题消掉，而不是加锁。
+ */
 void fota_process(void);
+
+fota_state_t fota_get_state(void);
+
+/** 进度百分比 0..100（应用阶段的 dst_pos/new_size；接收阶段按已收字节数折算）。 */
 uint32_t fota_get_progress(void);
 
-#endif /* __DRV_FOTA_H */
+/** 最近一次失败的详细错误码（正数 = 本层，负数 = fota_delta 的 fota_delta_err_t）。 */
+int fota_get_last_error(void);
+
+/** 暂存区已提交的字节数（含 48 B 信封）。可断点续传的依据。 */
+uint32_t fota_get_staged_bytes(void);
+
+/** 待启动槽（FOTA_META_SLOT_A / _B / _NONE）。 */
+uint32_t fota_get_pending_slot(void);
+
+/**
+ * @brief 进入接收模式：接管 CLI 的 UART 字节流，等待主机发 START 帧。
+ *
+ * **为什么由 CLI 命令触发，而不是"上电就等 START"**（与规划 §10.1 的措辞
+ * 略有出入，实施时定的）：UART 字节流在 App 里只有一个消费者（CLI 的行编辑器），
+ * 让 FOTA 常驻监听就得与它抢字节或者给每个字节加一层分派。更实际的是，
+ * "只有被明确要求时才接受固件"本身也是**安全属性**：一颗误码或一段
+ * 无关的串口数据不再可能触发一次 Flash 擦写。
+ *
+ * @param msg     失败时写入原因（可为 NULL）
+ * @param msg_len 缓冲区长度
+ * @return 0 成功进入接收；非 0 = 拒绝，原因已写进 msg
+ */
+int fota_receive_begin(char *msg, uint32_t msg_len);
+
+/**
+ * @brief 放弃本次接收：交还 UART、把状态退回 IDLE。
+ * @note   **不擦除暂存区** —— 主机可以重发 START 继续（若身份一致会续传）。
+ */
+void fota_receive_abort(void);
+
+/**
+ * @brief 由 `cli_task` 在接管状态下调用，喂入收到的字节。
+ * @note   在 CLI 任务的上下文里执行（不是 ISR）。内部不阻塞。
+ */
+void fota_rx_bytes(const uint8_t *data, uint16_t len);
+
+/**
+ * @brief 请求应用暂存区里的补丁（`fota recv` 收齐后自动置位，也可手动触发）。
+ * @return 0 已受理；非 0 = 当前状态不允许
+ */
+int fota_apply_request(void);
+
+/**
+ * @brief 擦除目标槽（含尾仓暂存区），放弃本次升级并把元数据清回 IDLE。
+ * @return 0 成功
+ */
+int fota_erase_target(void);
+
+#endif /* __DRV_{{ peripheral.name | upper }}_H */

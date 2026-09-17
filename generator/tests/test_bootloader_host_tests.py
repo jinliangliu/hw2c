@@ -152,7 +152,105 @@ def test_mock_cmsis_reset_clears_every_modelled_register_block():
 
 
 # ---------------------------------------------------------------------------
-# 约定 3：run_tests.py 的 include 路径必须真实存在
+# 约定 3：mock **不得凭空发明**寄存器/位名
+#
+# 2026-09-17 的实测缺陷（A9 的第二种形态）
+# -----------------------------------------
+# 元数据方案原先写在 `docs/plans/differential-ota.md` §9.1 的 TAMP 备份寄存器上
+# （BKP5R..BKP9R）。实际上 STM32G0B1 的 TAMP **只有 5 个**备份寄存器
+# （RM0444 §31.1；§31.6.8 偏移 0x100 + 4*x, x = 0..4），BKP0R..BKP4R 已被
+# boot_nvm 与旧 FOTA 标志占满。但主机侧**全绿**：`mock_hal.h` 当时把结构体
+# 开到了 BKP31R，于是"写入一个不存在的寄存器"在主机上是一次普通的成员赋值。
+#
+# 这与"mock 太宽松"不同，方向更坏：mock 与产品代码**共享同一个错误前提**，
+# 测试既不可能发现问题、也不可能提示问题所在。两个具体形态：
+#   · TAMP 多出 BKP5R..BKP31R（硅片上不存在）；
+#   · FLASH_OPTR 的 DBANK 位被写成 bit15（真值是 bit21）—— 主机上永远读到 0，
+#     恒判单 bank，目标上则直接编不过。
+# 下面两条断言把"凭空的寄存器/位名"变成构建期之前的失败。
+# ---------------------------------------------------------------------------
+
+_CMSIS_DEVICE_HEADER = (
+    _REPO_ROOT / "static" / "stm32g0" / "CMSIS" / "Device" / "ST" / "STM32G0xx"
+    / "Include" / "stm32g0b1xx.h"
+)
+
+
+def _struct_fields(text: str, type_name: str) -> list:
+    """取出某个 `typedef struct { ... } <type_name>;` 里的字段名列表。
+
+    vendored 头里的结构体字段名前后没有别的花样，直接按 `;` 切即可。
+    """
+    match = re.search(r"typedef struct\s*\{(?P<body>.*?)\}\s*%s\s*;"
+                      % re.escape(type_name), _strip_c_comments(text), flags=re.S)
+    assert match is not None, "在文本里找不到 %s 的结构体定义" % type_name
+    return re.findall(r"([A-Za-z_]\w*)\s*(?:\[\d+\])?\s*;", match.group("body"))
+
+
+def test_mock_tamp_backup_register_count_matches_silicon():
+    """mock 的 TAMP 备份寄存器必须与 vendored CMSIS **逐个**一致。
+
+    多一个都能让"往不存在的寄存器写元数据"在主机上变成一次普通赋值 ——
+    而它在目标上要么编不过，要么静默写进保留区、跨复位才暴露。
+    """
+    mock = (_TEMPLATES / "test" / "mock_hal.h.j2").read_text(encoding="utf-8")
+    real = _CMSIS_DEVICE_HEADER.read_text(encoding="utf-8")
+
+    def bkps(text):
+        fields = _struct_fields(text, "TAMP_TypeDef")
+        return sorted(f for f in fields if re.fullmatch(r"BKP\d+R", f))
+
+    mock_bkp, real_bkp = bkps(mock), bkps(real)
+    assert real_bkp == ["BKP0R", "BKP1R", "BKP2R", "BKP3R", "BKP4R"], (
+        "vendored CMSIS 的 TAMP 备份寄存器变了（%s）—— RM0444 说 G0 只有 5 个，"
+        "若换了器件请同时更新 mock 与本测试" % real_bkp
+    )
+    assert mock_bkp == real_bkp, (
+        "mock 的 TAMP 备份寄存器与硅片不一致：mock=%s，真实=%s。"
+        "mock 凭空多出寄存器会让『写到不存在的寄存器』在主机测试里永远不报错"
+        % (mock_bkp, real_bkp)
+    )
+
+
+@pytest.mark.parametrize("prefix", ["FLASH_OPTR_", "FLASH_CR_"])
+def test_mock_flash_bit_names_exist_in_vendored_cmsis(prefix):
+    """mock 定义的每个 `FLASH_OPTR_*` / `FLASH_CR_*` 位名都必须在真头里存在。
+
+    实测缺陷：mock 曾定义 `FLASH_OPTR_DBANK_BIT (1UL << 15)` 并附了一段
+    "CMSIS 没给这一位起名字，只能自己写"的理由 —— 实际上真值是 bit21 且
+    CMSIS 里有 `FLASH_OPTR_DUAL_BANK`。主机上 `1UL << 15` 落在保留位、
+    永远读到 0（恒判单 bank），目标上直接编不过。
+
+    同一个坑在 `FLASH_CR` 上更隐蔽：`FLASH_CR_LOCK` 是**可读的运行期状态**
+    （HAL 自己就是靠读它决定要不要走密钥序列），若 mock 把它写成别的位，
+    "读锁状态"的代码在主机上永远得到 False —— 与目标相反。
+    """
+    mock = (_TEMPLATES / "test" / "mock_hal.h.j2").read_text(encoding="utf-8")
+    real = _CMSIS_DEVICE_HEADER.read_text(encoding="utf-8")
+
+    mock_bits = set(re.findall(r"#define\s+(%s[A-Z0-9_]+)" % prefix, mock))
+    assert mock_bits, "mock_hal.h.j2 里没有定义任何 %s* 位" % prefix
+    fake = sorted(b for b in mock_bits if b not in real)
+    assert not fake, (
+        "mock 定义了 vendored CMSIS 里不存在的 %s 位：%s。"
+        "这类位名让『读运行期器件状态』变成『读一个永远为 0 的保留位』"
+        % (prefix, fake)
+    )
+
+    # 位号也必须一致（只对同时给出 _Pos 的位做校验；alias 写法跳过）
+    for name, pos in re.findall(
+            r"#define\s+(%s(?:[A-Z0-9_]+))_Pos\s+(\d+)U" % prefix, mock):
+        real_pos = re.search(r"#define\s+%s_Pos\s+\((\d+)U\)" % re.escape(name),
+                             real)
+        assert real_pos is not None, "%s_Pos 在 vendored CMSIS 里不存在" % name
+        assert int(pos) == int(real_pos.group(1)), (
+            "%s 的位号不一致：mock=%s，真实=%s"
+            % (name, pos, real_pos.group(1))
+        )
+
+
+# ---------------------------------------------------------------------------
+# 约定 4：run_tests.py 的 include 路径必须真实存在
 # ---------------------------------------------------------------------------
 
 def test_run_tests_static_include_paths_exist():

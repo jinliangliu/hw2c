@@ -604,14 +604,15 @@ def render_templates(env: Environment, context: dict, output_dir: str,
         test_templates["test/test_boot_nvm.c.j2"] = os.path.join(test_dir, "test_boot_nvm.c")
         test_templates["test/test_boot_jump.c.j2"] = os.path.join(test_dir, "test_boot_jump.c")
 
-    # FOTA unit tests
+    # FOTA 单元测试（规划 §12 的 L5 层）
     #
-    # ⚠️ 目前**不生成** `test_fota_protocol.c` / `test_fota_bspatch.c`：
-    #    · 前者测的 `drv_fota` 接收驱动编不过（调用了 `drv_uart.c` 里的 static 函数），
-    #      协议本身也要按规划 §10 重写 —— 一并归 P3；
-    #    · 后者测的是 `fota_bspatch`，已被 `fota_delta` 取代（规划 §11.1）。
-    # 留在这里的两个模板若继续生成，会让 `run_tests.py` 编译失败，
-    # 而"生成一个从不编译的测试"正是本仓库反复踩到的坑（见 fota_demo 的说明）。
+    # `test_fota_bspatch.c` **已随旧 BSDIFF 实现一起退役**（规划 §11.1/§16.6）：
+    # 它测的 `fota_bspatch.{c,h}.j2` 已删除，留着只会让 `run_tests.py` 编译失败。
+    # "生成一个从不编译的测试"正是本仓库反复踩到的坑（A9 的镜像版本）。
+    #
+    # `test_fota_protocol.c` 现在真的有内容可测了：P3 把 `drv_fota` 重写成
+    # 帧解析 + 尾仓暂存 + 元数据状态机，且接口上不再依赖 `drv_uart.c` 里
+    # 不存在的 static 函数（UART 字节流由 CLI 显式移交，见 drv_cli.h）。
     if context.get("has_fota_receive"):
         test_templates["test/test_fota_protocol.c.j2"] = os.path.join(test_dir, "test_fota_protocol.c")
 

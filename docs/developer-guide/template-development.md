@@ -35,8 +35,8 @@ templates/
 │   ├── drv_modbus.c.j2 + .h.j2   # Modbus RTU protocol driver
 │   ├── drv_mqtt.c.j2 + .h.j2     # MQTT 3.1.1 client driver
 │   ├── drv_cli.c.j2 + .h.j2      # UART CLI debug shell driver
-│   ├── drv_fota.c.j2 + .h.j2     # FOTA firmware update manager
-│   └── fota_bspatch.c.j2 + .h.j2 # BSDIFF patch application engine
+│   ├── drv_fota.c.j2 + .h.j2     # FOTA receive state machine (frames + staging)
+│   └── fota_delta.c.j2 + .h.j2   # H2CD delta decoder (pure algorithm + injectable I/O)
 ├── bootloader/
 │   ├── boot_main.c.j2            # Bootloader entry point
 │   ├── boot_nvm.c.j2 + .h.j2     # Non-volatile storage (TAMP backup registers)
@@ -421,17 +421,36 @@ UART-based interactive debug shell. Provides commands including `help`, `version
 | `priority` | `4` | CLI task priority |
 | `max_cmd_len` | `64` | Maximum command line length |
 
+### `drivers/fota_delta.c.j2` / `drivers/fota_delta.h.j2`
+
+**Condition:** Generated when `has_bootloader` is true.
+
+Device-side delta decoder. Pure algorithm with an **injectable I/O backend**
+(`fota_delta_backend_t`: patch read / erase / program / read / watchdog /
+progress) and **no `#ifdef TEST`** — the same source is compiled for the target
+and for the host. Decoding a patch erases the destination slot, writes the new
+image page by page, fills in the image header last, and re-reads the payload to
+recompute and compare the CRC32.
+
+Layout constants come from `generator/data/fota_format.json`; the templates
+never contain a literal offset.
+
 ### `drivers/drv_fota.c.j2` / `drivers/drv_fota.h.j2`
 
-**Condition:** Generated when `has_fota` is true.
+**Condition:** Generated when `has_bootloader`, `has_uart` **and** a CLI driver
+are all present (`has_fota_receive`).
 
-Firmware Over-The-Air (FOTA) update manager. Orchestrates the firmware update lifecycle: receiving patch data, triggering BSDIFF patch application, CRC verification, and slot switching.
+FOTA receive state machine. Parses the three transport frames (START / DATA /
+FINISH), acknowledges in order, re-ACKs duplicates and out-of-order chunks, NAKs
+bad CRCs, and stages the patch into the **tail of the destination slot** so that
+a power loss does not require re-transmission. Transfer state lives in TAMP
+backup registers (`BKP5R..BKP9R`, with a self-check word); the application step
+runs synchronously in the dedicated low-priority `fota` task after the outputs
+have been driven to their safe state.
 
-### `drivers/fota_bspatch.c.j2` / `drivers/fota_bspatch.h.j2`
-
-**Condition:** Generated together with `drv_fota` when `has_fota` is true.
-
-BSDIFF patch application engine. Applies binary diffs to firmware images in-place, minimizing OTA data transfer size. Works with the dual-slot bootloader to safely update firmware with rollback capability.
+The UART byte stream is handed over explicitly by the `fota recv` CLI command
+(`cli_set_rx_sink()`), because the CLI's line editor is otherwise the only
+consumer of those bytes.
 
 ---
 

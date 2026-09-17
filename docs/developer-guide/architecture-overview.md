@@ -11,7 +11,7 @@ hw2c
 │   ├── validator.py         # YAML validation
 │   ├── context_builder.py   # Template rendering context
 │   ├── models.py            # Pydantic type models
-│   ├── bsdiff_tool.py       # BSDIFF patch generation
+│   ├── delta_tool.py        # H2CD delta build / repack / apply
 │   ├── fota_sender.py       # FOTA patch delivery
 │   ├── patch_crc.py         # CRC metadata post-processing
 │   ├── allocators/          # Pin assignment engine

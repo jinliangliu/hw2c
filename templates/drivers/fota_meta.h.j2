@@ -1,0 +1,214 @@
+#ifndef __DRV_{{ peripheral.name | upper }}_H
+#define __DRV_{{ peripheral.name | upper }}_H
+
+/*
+ * FOTA 持久元数据 + 引导器/App 共用的 Flash 底层原语。
+ *
+ * 本头文件里有三样东西，它们的共同点是"引导器与 App 都必须理解得完全一致"：
+ *   1. `fota_crc16()`       —— 全工程唯一的 CRC-16/CCITT-FALSE 实现
+ *                              （帧尾、信封头、元数据记录都用它）；
+ *   2. `fota_flash_locate()` —— 绝对地址 → HAL 擦除 API 的 (页号, bank)；
+ *   3. 元数据页的日志式存储   —— 跨复位的状态。
+ * 各自复制一份的实现会在"改了一处漏了另一处"时产生最难查的一类缺陷。
+ *
+ * 为什么不是 TAMP 备份寄存器（2026-09-17 定稿，**推翻规划 §9.1 的前提**）
+ * ----------------------------------------------------------------------
+ * §9.1 写「G0 的 TAMP 有 `BKP0R..BKP31R`，空间充足」。这句是错的：
+ *   · RM0444 §31.1 —— "5 backup registers"；
+ *   · §31.6.8 —— `TAMP_BKPxR` 偏移 `0x100 + 4*x, x = 0..4`；
+ *   · vendored 的 `stm32g0b1xx.h` 里 `TAMP_TypeDef` 正好止于 `BKP4R`。
+ * 而 `BKP0R..BKP3R` 归 `boot_nvm`（失败计数 / 活动槽 / boot_ok / 初始化魔数），
+ * `BKP4R` 归 `boot_main` 的旧 FOTA 标志 —— **一个不剩**。
+ * 于是早期实现往 `BKP5R..BKP9R` 写元数据：目标上编译期就报「没有该成员」，
+ * 若绕过编译则落到保留地址、**写入静默不生效**，只有跨复位才看得出来。
+ *
+ * 改用 Flash 页还修掉一个更根本的问题：备份域**没有 V_BAT 电池时 VDD 一掉
+ * 就丢**，而规划 §7.2「掉电免重传」正是靠这份元数据。放 Flash 之后掉电语义
+ * 才名副其实 —— Flash 只在被擦除时丢。
+ *
+ * 本模块被**引导器与 App 共用**（只生成一份 .c，两边的 CMake 引用同一个文件）
+ * 它是"引导器的启动决策"与"App 的传输进度"之间唯一的共享状态，两侧对布局
+ * 的理解必须逐字节一致；生成两份就等于给"悄悄分叉"留了门。
+ *
+ * 格式真源：`generator/data/fota_format.json` 的 `metadata` 段。本文件里
+ * 不允许出现字面量页基址、记录长度或字段偏移。
+ *
+ * `FOTA_META_READ_ONLY`：引导器**只读**这份记录（它的职责是"决定 + 跳转"，
+ * 不写 Flash），所以引导器工程用这个宏把写路径整段排除，从而完全不依赖
+ * HAL Flash 与 tick 时基。**由构建显式定义**，而不是指望 `--gc-sections`
+ * 碰巧把未调用的写函数扔掉 —— 前者是约束，后者是运气。
+ */
+
+#if defined(TEST)
+/* 主机侧：**跑的是同一份逻辑**，替身只打在 Flash 这个外部边界上
+ * （`mock_hal` 把存储映射到真实的 0x08000000，见 mock_hal.c）。
+ * 这一支必须排在最前面：主机侧也要能测只读模式（引导器的读路径）。 */
+#include "mock_hal.h"
+#elif defined(FOTA_META_READ_ONLY)
+/* 引导器：只需要 CMSIS。读路径不碰任何 Flash 控制器寄存器，也不需要
+ * HAL 与 tick 时基 —— 这正是"引导器不写元数据"这件事换来的简化。 */
+#include "stm32g0xx.h"
+#else
+/* App：读 + 写（HAL Flash）。 */
+#include "stm32g0xx_hal.h"
+#endif
+
+#include <stdint.h>
+
+/* ---- 几何（真源 → 常量）------------------------------------------------- */
+
+/* 元数据页 = 引导器区的**最后一页**。页基址由 `bootloader.size_kb` 算出，
+ * 而引导器代码被限制在 `[boot_base, FOTA_META_PAGE_BASE)` —— 这条约束由
+ * 链接脚本的 `ASSERT` 强制，涨过界是**链接失败**而不是悄悄踩掉元数据页。 */
+#define FOTA_META_PAGE_BASE    {{ "0x%08XUL" | format(fota_meta.meta_page_base) }}
+#define FOTA_META_PAGE_SIZE    {{ fota_meta.meta_page_size }}U
+#define FOTA_META_RECORD_SIZE  {{ fota_meta.meta_record_size }}U
+#define FOTA_META_RECORD_COUNT {{ fota_meta.meta_record_count }}U
+/* 页尾余数（{{ fota_meta.meta_page_size }} % {{ fota_meta.meta_record_size }} = {{ fota_meta.meta_unused_tail }} B）**不参与日志**。
+ * 把它当半条记录扫描时，读出的全 0xFF 段恰好会让 magic 与 seq 都等于
+ * 0xFFFFFFFF —— 看上去像一条记录。扫描上界必须用 RECORD_COUNT。 */
+#define FOTA_META_UNUSED_TAIL  {{ fota_meta.meta_unused_tail }}U
+
+#define FOTA_META_MAGIC        {{ "0x%08XUL" | format(fota_meta.meta_magic) }}
+#define FOTA_META_SEQ_INVALID  0xFFFFFFFFUL   /* 擦除态：与 seq==0 一起排除 */
+
+/* ---- 记录内偏移（真源 → 常量）------------------------------------------ */
+#define FOTA_META_OFF_MAGIC    {{ fota_meta.meta_off_magic }}U
+#define FOTA_META_OFF_SEQ      {{ fota_meta.meta_off_seq }}U
+#define FOTA_META_OFF_STATE    {{ fota_meta.meta_off_state }}U
+#define FOTA_META_OFF_SLOT     {{ fota_meta.meta_off_slot }}U
+#define FOTA_META_OFF_STAGED   {{ fota_meta.meta_off_staged }}U
+#define FOTA_META_OFF_CRC16    {{ fota_meta.meta_off_crc16 }}U
+/* CRC16 只覆盖校验字段**之前**的部分。覆盖到自己也行（先填 0 再算），
+ * 但那要求两侧约定"填什么"，多一条隐式契约就多一类分叉。 */
+#define FOTA_META_CRC16_LEN    {{ fota_meta.meta_crc16_len }}U
+
+/* ---- 擦除粒度 ------------------------------------------------------------
+ * 元数据页大小就是器件的擦除粒度。`drv_fota` 按页擦除暂存区/目标槽时也用
+ * 这一个值 —— 两处各写一份"页大小"会在改配置时出现"一半按新粒度、一半按
+ * 旧粒度"的错位。生成器另有断言保证它与 `delta_page_size` 相等。 */
+#define FOTA_FLASH_PAGE_SIZE   FOTA_META_PAGE_SIZE
+
+/* ---- 状态 ----------------------------------------------------------------
+ * 写进 Flash 记录的 `state`。与 `drv_fota` 的运行期枚举 `fota_state_t`
+ * 取值刻意对齐（都来自 `fota_meta.st_*`），但**不要互相赋值**：
+ * 前者跨复位存在 Flash 里，后者是当前进程的状态。 */
+#define FOTA_META_STATE_IDLE      {{ fota_meta.st_idle }}U
+#define FOTA_META_STATE_RECEIVING {{ fota_meta.st_receiving }}U
+#define FOTA_META_STATE_READY     {{ fota_meta.st_ready }}U
+#define FOTA_META_STATE_APPLYING  {{ fota_meta.st_applying }}U
+#define FOTA_META_STATE_DONE      {{ fota_meta.st_done }}U
+#define FOTA_META_STATE_ERROR     {{ fota_meta.st_error }}U
+
+/* ---- 槽编号 --------------------------------------------------------------
+ * ⚠️ 与 `boot_nvm` 的 `BOOT_SLOT_A/B`（0/1）**故意不同**：这里 0 保留给
+ * "没有待启动槽"。0 与 1 复用是最容易写错的一处 —— 元数据被清零后若 0 被
+ * 解读成"槽 A"，引导器就会在一次擦除后去引导一个空槽。让 NONE 占掉 0 之后，
+ * "清零 = 没有待启动槽"在数值上就自洽了。 */
+#define FOTA_META_SLOT_NONE       {{ fota_meta.slot_none }}U
+#define FOTA_META_SLOT_A          {{ fota_meta.slot_a }}U
+#define FOTA_META_SLOT_B          {{ fota_meta.slot_b }}U
+
+/* ---- 记录 ---------------------------------------------------------------- */
+
+typedef struct {
+    uint32_t seq;      /* 单调递增序号，越大越新 */
+    uint32_t state;    /* FOTA_META_STATE_* */
+    uint32_t slot;     /* FOTA_META_SLOT_*：本次补丁的**目标槽** */
+    uint32_t staged;   /* 已提交字节数（含信封）—— 断点续传的依据 */
+} fota_meta_t;
+
+/* ---- API ----------------------------------------------------------------- */
+
+/**
+ * @brief CRC-16/CCITT-FALSE（初值 0xFFFF、不反射、无终值异或）。
+ *
+ * 全工程**唯一**的 CRC16 实现：传输层帧尾、格式层信封头、元数据记录自校验
+ * 都用它。三处若各写一份，"算法漂移"会表现成"所有校验都失败但看不出为什么"。
+ */
+uint16_t fota_crc16(const uint8_t *data, uint32_t len);
+
+/**
+ * @brief 读出**最新**的有效记录。
+ *
+ * 扫描整页，取 `seq` 最大且通过校验的那一条。校验不过的记录（写了一半就
+ * 掉电）被跳过，其后面那条更早的记录仍然有效 —— 这是日志式存储相对
+ * "两个槽乒乓"的关键优势：乒乓在擦旧槽时会把唯一有效记录也擦掉。
+ *
+ * @param out 输出（可为 NULL，此时只问"有没有"）
+ * @return 0 = 找到有效记录；-1 = 没有（页是空的、或整页都不可信）
+ *
+ * @note 返回 -1 时**不修改** `*out`。调用方必须把"没有记录"当成
+ *       `IDLE / SLOT_NONE / 0` 处理，而不是"随便用某个值"。
+ */
+int fota_meta_load(fota_meta_t *out);
+
+#ifndef FOTA_META_READ_ONLY
+/* ---- 写路径（引导器不需要）----------------------------------------------
+ * 引导器只做"读记录 → 决定启动哪个槽 → 跳转"，**不写** Flash：
+ *   · 消费一条已处理的记录（`fota_meta_consume`）由 App 在确认自己跑起来
+ *     之后做 —— App 本来就要写 Flash，多这一条记录不增加任何依赖；
+ *   · 引导器因此完全不需要 HAL、不需要 tick 时基、不需要链接 Flash 驱动。
+ *
+ * 这一段用 `FOTA_META_READ_ONLY` 关掉（**由构建显式定义**），而不是指望
+ * `--gc-sections` 碰巧把未调用的写函数扔掉 —— 前者是约束，后者是运气。
+ */
+
+/**
+ * @brief 追加一条记录（提交点）。
+ *
+ * 写到第一个全 0xFF 的记录槽；页满时擦掉整页后从 0 号槽重新开始（`seq`
+ * 接着内存里记的最大值 +1）。**掉电安全**：一条记录 = 3 个双字，含 CRC16 的
+ * 第 3 个双字最后落盘，所以被打断的记录一定校验不过、被 `fota_meta_load`
+ * 跳过；已提交的上一条不受影响。
+ *
+ * @param state  FOTA_META_STATE_*
+ * @param slot   FOTA_META_SLOT_*
+ * @param staged 已提交字节数
+ * @return 0 成功；-1 编程/擦除失败（此时**没有**产生新记录，旧记录仍有效）
+ */
+int fota_meta_append(uint32_t state, uint32_t slot, uint32_t staged);
+
+/**
+ * @brief 消费掉当前记录（追加 `IDLE / SLOT_NONE / 0`）。
+ *
+ * 引导器在决定启动哪个槽之后调用，避免下次复位重复触发同一次升级。
+ * 名字刻意与 `fota_meta_append` 区分：调用点想表达的是"这笔升级已经处理
+ * 完了"，而不是"随便写一条 IDLE"。
+ */
+int fota_meta_consume(void);
+
+/**
+ * @brief 确保日志还能追加至少 `slots_needed` 条记录。不足则**先擦页**。
+ *
+ * 用途是"把页擦除挪到安全时机"：接收期间每个 DATA 帧都要提交一次进度，
+ * 而页擦除有一个"整页元数据同时消失"的窗口。让擦除落在**传输开始之前**
+ * （此时还没有值得保留的进度），传输期间就不会再触发擦除 —— 否则一次恰好
+ * 落在擦除窗口里的掉电，会把已经收了几百 KB 的断点信息整块丢掉。
+ *
+ * @param slots_needed 后续预计需要的追加次数（含一点余量）
+ * @param erased_out   非 NULL 时写入"是否真的擦过页"，便于调用方记日志
+ * @return 0 = 空间足够（含"擦过之后足够"）；-1 = 连擦页都失败
+ *
+ * @note 擦页会丢掉**当前所有**记录，包括调用方刚读到的那条。所以调用方必须
+ *       在本函数返回后立刻重新 `fota_meta_append()` 一次当前状态。
+ *       本函数自己不做这件事 —— 它不知道"当前状态"是什么。
+ */
+int fota_meta_reserve(uint32_t slots_needed, int *erased_out);
+
+/**
+ * @brief 把绝对 Flash 地址换算成 HAL 擦除 API 需要的 (页号, bank)。
+ *
+ * 页号语义随**运行期**的 `DBANK` 选项位变化：双 bank 时 `Page` 是 bank 内
+ * 页号且 `Banks` 选 bank；单 bank 时 `Page` 是全局页号且只有 `Bank1` 合法。
+ * 选项字节在运行期可读，读它才能两种布局都对 —— 这不是猜配置。
+ *
+ * @note 之所以放在这里而不是各写一份：`drv_fota` 擦暂存区、本模块擦元数据
+ *       页都要用它，而"两个地方各写一遍页号换算"正是"改了一处漏了另一处"
+ *       的经典位置。DBANK 位号也在这一处引用，改也就改一处。
+ */
+void fota_flash_locate(uint32_t abs_addr, uint32_t *page_no, uint32_t *bank);
+
+#endif /* !FOTA_META_READ_ONLY */
+
+#endif /* __DRV_{{ peripheral.name | upper }}_H */

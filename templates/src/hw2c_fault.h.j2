@@ -40,6 +40,7 @@ extern "C" {
 #define HW2C_FAULT_NMI         5u   /* NMI_Handler                      */
 #define HW2C_FAULT_SCHEDULER   6u   /* vTaskStartScheduler() returned   */
 #define HW2C_FAULT_UNEXPECTED  7u   /* anything else                    */
+#define HW2C_FAULT_FOTA_APPLY  8u   /* 差分补丁应用失败（活动槽未改动，可重试） */
 
 /**
  * @brief  Drive every generated actuator output to its inactive state.

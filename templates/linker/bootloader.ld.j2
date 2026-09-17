@@ -22,14 +22,24 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);
 _Min_Heap_Size = {{ heap_size | default('0x0') }};
 _Min_Stack_Size = {{ stack_size | default('0x200') }};
 
-/* Memories definition */
+/*
+ * Memories definition
+ *
+ * ⚠️ FLASH 的 LENGTH 是 **`boot_config.size_kb` 减去元数据页**，不是 size_kb。
+ * 引导器区的最后一页归 FOTA 元数据（`fota_meta.{c,h}`），不是可执行区。
+ *
+ * 如果这里写 `size_kb*1024`，引导器代码一旦涨到最后一页，链接器会**痛快地**
+ * 把代码放进去 —— 元数据页在运行期被 `fota_meta_append()` 擦掉时，
+ * 擦的是引导器正在执行的代码。症状是"升级到一半设备再也不启动"，
+ * 而且只在代码恰好涨过一页时才出现。
+ *
+ * 现在改成：越界 = **链接失败**（下面的 ASSERT 给出可读的原因）。
+ */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 144K
-  FLASH  (rx)     : ORIGIN = 0x08000000,   LENGTH = {{ boot_config.size_kb }}K
+  FLASH  (rx)     : ORIGIN = 0x08000000,   LENGTH = {{ boot_config._boot_code_size }}
 }
-
-/* App 槽位地址（绝对符号，不占空间，供 Bootloader 代码引用） */
 __app_slot_a_start__ = {{ boot_config._app_a_start }};
 __app_slot_a_end__   = {{ boot_config._app_a_end }};
 __app_slot_b_start__ = {{ boot_config._app_b_start }};
@@ -121,6 +131,11 @@ SECTIONS
     __bootloader_end__ = .;
   } >FLASH
 
+  /* 元数据页基址（绝对符号，不占空间）。App 侧不链接本脚本，它从
+   * fota_meta.h 的 FOTA_META_PAGE_BASE 拿同一个值 —— 两者都由
+   * `bootloader_context.py` 从 `bootloader.size_kb` 算出，只有一处真源。 */
+  __fota_meta_page__ = {{ '0x%08X' | format(boot_config._meta_page_base) }};
+
   _sidata = LOADADDR(.data);
 
   .data :
@@ -180,3 +195,15 @@ SECTIONS
 
   .ARM.attributes 0 : { *(.ARM.attributes) }
 }
+
+/*
+ * 引导器代码不得越过元数据页 —— 越过就是"运行期自己擦掉自己"。
+ *
+ * FLASH 区域的 LENGTH 已经扣掉了这一页，所以越界本来就会以
+ * "region FLASH overflowed" 的形式失败；这条 ASSERT 的价值在于把
+ * **为什么**写进链接错误里。溢出报错只说明"放不下"，不说明"放不下"
+ * 是因为元数据页占了地方，而最容易的错误修法是去调大 size_kb ——
+ * 那会把元数据页一起搬走，让已经写进去的升级状态凭空消失。
+ */
+ASSERT(__bootloader_end__ <= {{ '0x%08X' | format(boot_config._meta_page_base) }},
+       "FATAL: bootloader code overlaps the FOTA metadata page at {{ '0x%08X' | format(boot_config._meta_page_base) }}. Shrink the bootloader or raise bootloader.size_kb.")

@@ -19,7 +19,8 @@ from .bearer_context import associate_bearers
 from .hal_context import compute_hal_sources
 from .bootloader_context import (build_boot_config, inject_bootloader_drivers,
                                    get_boot_led_pin, fota_format_for_templates,
-                                   fota_delta_budget)
+                                   fota_delta_budget, fota_transport_for_templates,
+                                   fota_meta_for_templates)
 
 # Builder registry — auto-discovers all @register_builder classes
 try:
@@ -129,7 +130,8 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
                                                      mcu_flash_kb)
     boot_led = get_boot_led_pin(pins) if has_bootloader else {}
     boot_result = inject_bootloader_drivers(has_bootloader, has_uart,
-                                             boot_config, uart_name)
+                                             boot_config, uart_name,
+                                             has_cli=has_cli)
     drivers.extend(boot_result['drivers_additions'])
     has_fota = boot_result['has_fota']
     has_fota_receive = boot_result['has_fota_receive']
@@ -1034,6 +1036,10 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
         fota_delta_page_size=budget['page_size'],
         fota_delta_cache_size=budget['cache_size'],
         fota_delta_dict_size=budget['dict_size'],
+        # 传输层帧约定与元数据布局，同样来自真源（防"两侧各写一份"）。
+        # 元数据布局需要 boot_config：页基址由 bootloader.size_kb 决定。
+        fota_transport=fota_transport_for_templates(),
+        fota_meta=fota_meta_for_templates(boot_config),
         has_iwdg=(has_bootloader or peri_result["has_iwdg"]),
         has_event_mgr=True,
         has_tickless=has_tickless,

@@ -209,7 +209,7 @@
 | MQTT 3.1.1 | `drv_mqtt.c` | ✅ |
 | Modbus RTU 主/从（FC03/06/16 + CRC16 + 异常码） | `drv_modbus.c` | ✅ |
 | CLI 调试终端 | `drv_cli.c` | ✅ |
-| FOTA 差分升级 | `drv_fota.c` + `fota_bspatch.c` | ✅ |
+| FOTA 差分升级 | `drv_fota.c`（接收侧）+ `fota_delta.c`（解码侧） | ⏳ |
 | Bootloader A/B | `boot_*.c` | ✅ |
 
 ### FR-11 通信协议栈 ✅
@@ -507,7 +507,7 @@ hw2c 的处理方式（**不修改 vendor**）：
 | FR-11 协议栈 | `templates/drivers/drv_{modbus,mqtt,cellular,uart}.c.j2`、`examples/modbus_demo/` |
 | FR-12 控制中间件 | `templates/app/pid_*.j2`、`foc_*.j2`、`fall_detect*.j2`、`attitude.c.j2`、`examples/{solenoid_valve,thermo,knob}_*/` |
 | FR-13 低功耗/RTC | `templates/src/{sleep,power_mgr}.c.j2`、`templates/drivers/drv_rtc.c.j2`、`templates/rtos/tickless_idle.c.j2` |
-| FR-14 Bootloader/FOTA | `templates/bootloader/`、`templates/drivers/fota_delta.{c,h}.j2`、`generator/delta_tool.py`、`generator/data/fota_format.json`、`generator/tests/test_fota_delta_l6.py`、`examples/fota_demo/`（旧的 `generator/bsdiff_tool.py` 与 `fota_bspatch.{c,h}.j2` 已退役，见 `docs/plans/differential-ota.md` §11.1 / §16.6） |
+| FR-14 Bootloader/FOTA | `templates/bootloader/`、`templates/drivers/drv_fota.{c,h}.j2`（接收侧状态机）、`templates/drivers/fota_delta.{c,h}.j2`（解码与应用）、`generator/delta_tool.py`、`generator/data/fota_format.json`、`generator/tests/test_fota_delta_l6.py`、`generator/tests/test_fota_protocol*`、`examples/fota_demo/`（旧的 `generator/bsdiff_tool.py` 与 `fota_bspatch.{c,h}.j2` 已退役，见 `docs/plans/differential-ota.md` §11.1 / §16.6） |
 | FR-15 调试可观测 | `templates/drivers/drv_{cli,log}.c.j2`、`templates/src/telemetry.c.j2`、`docs/user-guide/cli-commands.md` |
 | FR-16 测试体系 | `templates/test/`、`generator/run_tests.py`、`generator/tests/`、`tests/`、`parser/tests/` |
 | FR-17 工具链/CI | `templates/project/*`、`templates/vscode/*`、`.github/workflows/build_and_test.yml` |

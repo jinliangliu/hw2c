@@ -550,24 +550,138 @@ A/B 双槽天然存在的问题：**Slot A 与 Slot B 的链接基址不同**，
 
 ## 9. 元数据与启动决策
 
-### 9.1 元数据布局（扩展现有 TAMP BKP）
+### 9.1 元数据布局（**专用 Flash 页 + 日志式记录**）
 
-现有 `boot_nvm` 用了 `BKP0R..BKP3R`、FOTA 用了 `BKP4R`。G0 的 TAMP 有
-`BKP0R..BKP31R`，空间充足。建议**按字段拆分**（现有 FOTA 把一个寄存器当位图用，
-可读性差且容易互相覆盖）：
+> **本节已按 2026-09-17 的实测结论重写。原版（"扩展现有 TAMP BKP"）建立在一个
+> 错误的前提上，整节作废。**
 
-| 寄存器 | 用途 |
+#### 原版错在哪
+
+原文写"现有 `boot_nvm` 用了 `BKP0R..BKP3R`、FOTA 用了 `BKP4R`。G0 的 TAMP 有
+`BKP0R..BKP31R`，空间充足"，并据此把元数据分配到 `BKP5R..BKP9R`。**"32 个"是错的**：
+
+| 证据 | 内容 |
 |---|---|
-| `BKP5R` | `pending_slot`（0=无, 1=A, 2=B）+ `state`（IDLE/RECEIVING/APPLYING/VERIFYING） |
-| `BKP6R` | `patch_size`（尾仓模式用于定位与续传） |
-| `BKP7R` | `patch_crc32`（收齐后比对，避免用被截断的补丁去擦槽） |
-| `BKP8R` | `attempt_count`（新槽已尝试启动次数，配合 `max_retries` 回滚） |
-| `BKP9R` | 元数据自校验：`CRC16(BKP5R..BKP8R)` —— 备份域读回来的值也应当被怀疑 |
+| RM0444 §31.1 | TAMP 章开头写明 "**5** backup registers" |
+| RM0444 §31.6.8 | `TAMP_BKPxR` 偏移 `0x100 + 4*x`，**x = 0..4** |
+| vendored `stm32g0b1xx.h` | `TAMP_TypeDef` 正好止于 `BKP4R`；位定义也只到 `TAMP_BKP4R` |
 
-**为什么要 `BKP9R`**：备份域寄存器在**掉电（VDD 消失）**后才丢失，而在
-NRST 复位、看门狗复位、STOP 模式唤醒后均保持。这既是它的价值，也是它的风险 ——
-若某个字段被写成越界值（如 `pending_slot = 7`），引导器必须能识别并回退到
-"两个槽都校验、选有效的那个"的保守策略，而不是按非法值取地址。
+而 `BKP0R`（失败计数）、`BKP1R`（活动槽）、`BKP2R`（boot_ok 魔数）、`BKP3R`
+（NVM 初始化魔数）归 `boot_nvm`，`BKP4R` 归 `boot_main` 的旧 FOTA 标志 ——
+**一个不剩**。于是早期实现往 `BKP5R..BKP9R` 写元数据：目标上编译期就报
+"no member named 'BKP5R'"，若绕过编译则写进保留地址、**静默不生效**，只有跨复位
+才看得出来。
+
+> 这个缺陷能在 P0/P2'/P3 的主机测试里全部通过，原因值得单独记一笔：
+> 当时的 `mock_hal.h` 把 `TAMP_TypeDef` 开到了 `BKP31R`，**mock 凭空造出了硅片上
+> 不存在的寄存器**。这不是"mock 太宽松"，而是 mock 与产品代码**共享同一个错误
+> 前提** —— 测试既发现不了问题、也提示不了方向（A9 最贵的一种）。
+> 现已截断到 5 个寄存器，并加了护栏
+> `test_bootloader_host_tests.py::test_mock_tamp_backup_register_count_matches_silicon`。
+
+#### 现在的方案
+
+元数据放在**引导器区（`bootloader.size_kb`）的最后一页**，用**日志式追加记录**：
+
+| 项 | 值 | 真源 |
+|---|---|---|
+| 页基址 | `0x08000000 + size_kb*1024 - page_size` | `bootloader_context.py` 由 YAML 算出 |
+| 页大小 | `2048`（= 器件擦除粒度，与 `delta_page_size` 必须相等，生成期断言） | `fota_format.json:metadata.page_size` |
+| 记录长度 | `24 B`（3 个双字，正好一次 8 B 编程粒度 ×3） | `fota_format.json:metadata.record_size` |
+| 字段 | `magic(4) seq(4) state(4) slot(4) staged(4) crc16(2)` + `pad(2)` | `fota_format.json:metadata.fields` |
+| 容量 | 85 条 + 8 B 页尾余数（**余数不参与日志**，扫描上界用 `RECORD_COUNT`） | 推导 |
+| `magic` | `0x4D544F46`（内存里读出来是 `'FOTM'`） | `fota_format.json:metadata.fields.magic` |
+
+**为什么是日志式而不是"两个槽乒乓"**：乒乓每轮都要擦一整页，而"擦掉旧槽"那段
+时间里**唯一**的有效记录正好在被擦的页上，掉电即全丢。追加式把每次状态变更写成
+一条 24 B 新记录，页满（85 条）才擦一次；掉电最多毁掉**正在写的那一条** ——
+扫描时 CRC16 不过就被跳过，上一条仍然有效。这一条性质由生成出来的
+`test_fota_protocol.c::test_torn_record_is_skipped_and_the_previous_one_still_holds`
+正面钉住。
+
+**提交点最后**：一条记录 = 3 个双字，含 CRC16 的第 3 个双字**最后落盘**。被打断
+的记录一定校验不过、被跳过；已提交的上一条不受影响。反过来先写校验值，就会留下
+"校验通过但内容是半截"的记录 —— 那是最坏的一种状态。
+
+**记录里只放无法从别处重算的字段**：
+
+* `state` / `slot` —— 决策本身，以及目标槽（暂存区地址由它算出，而信封本身就在
+  暂存区里，是个鸡生蛋）；
+* `staged` —— 已提交字节数。补丁正文里可以合法出现 `0xFF`，所以**扫描暂存区推不出**
+  "写到哪了"；
+* `new_crc32` / `patch_size` **不存**：它们就在暂存区开头那 48 B 信封里，而 START
+  阶段本来就要逐字段比对来帧信封与暂存信封（判定续传）。再存一份只会在两边不一致
+  时制造歧义。
+
+**页擦除的时机**：接收期间每个 DATA 帧都要提交一次进度，而页擦除有一个"整页元数据
+同时消失"的窗口。`fota_meta_reserve(slots_needed)` 把擦除**挪到传输开始之前**
+（此时还没有值得保留的进度），于是传输途中不会再触发擦除。否则一次恰好落在擦除
+窗口里的掉电，会把已经收了几百 KB 的断点信息整块丢掉。
+
+#### 所有权：引导器只读，App 读写
+
+| 角色 | 权限 | 说明 |
+|---|---|---|
+| 引导器 | **只读**（`FOTA_META_READ_ONLY`） | 读最新记录 → 决定启动哪个槽 → 跳转。不写 Flash ⇒ 不需要 HAL、不需要 tick 时基、不需要考虑"擦写中途掉电" |
+| App | 读 + 写 | 传输期每帧提交进度；应用后提交 `DONE`；**启动后消费已生效的记录** |
+
+**为什么"消费"必须由 App 做**：引导器没有清记录的能力，所以它只能在
+**目标槽通过 CRC** 时才切过去 —— 没有这个闸门，"切过去 → CRC 失败 → 退回旧槽 →
+再切过去"就是死循环。有了闸门，最坏情况只是每次复位多验一次目标槽的 CRC，设备
+始终跑在能跑的那一版上。而"消费"这件事等 App 跑起来做刚刚好：App 能确认
+"记录指向的槽 == 我正在运行的槽"，这才叫"升级真的生效了"。
+
+反向的情形同样重要：若记录说 `DONE` 指向 B，而 App 跑在 A 上（说明新固件没能起来，
+被 CRC 或 boot_nvm 的失败计数退了回来），App 必须把记录**改写成 `ERROR`**，
+而不是留着 `DONE` —— 留 `DONE` 会让引导器每次复位都重新去试那个起不来的槽，
+失效保护被反复推翻。
+
+#### 跨复位的状态映射（`fota_init`）
+
+记录里存的是**上一次掉电时的处境**，而运行期状态是**这一秒能做/该做什么**。
+两者不是一一对应，`fota_init()` 负责翻译。这张表是设计的核心，也是最容易
+"看起来没问题"的地方（改错了以后，症状是"某次掉电之后补丁被静默擦掉重传"，
+而不是任何一条报错）：
+
+| 记录状态 | 运行期状态 | 动作 | 依据 |
+|---|---|---|---|
+| 无（空页 / 整页校验不过） | `IDLE` | 不写 Flash | "没有记录"本身就是明确的初始状态；**不可信时不解释它** |
+| `RECEIVING` | `IDLE` | 保留记录与暂存区 | 运行期上下文（`g_env`）要从 START 帧重建。主机重发 START 后，身份一致 ⇒ 续传（ACK 带断点序号） |
+| `READY` | `READY` | **从暂存区头部读回信封重建上下文** | 记录的全部价值就是"整条补丁已通过 CRC32 并落盘"。退回 IDLE 会让下一次 START 走**完整重传**，把已校验通过的补丁擦掉重收 |
+| `READY`（重建失败） | `IDLE` | 记录改写成 `ERROR` | 信封读不回来 / 与记录的 `staged` 对不上 ⇒ 暂存区身份不可信，**不能**报 READY（apply 会拿它去擦掉整个目标槽） |
+| `DONE` 且 `slot == 活动槽` | `DONE` | 消费（追加一条 `IDLE`） | 升级真的生效了；引导器只读，消费只能由 App 做 |
+| `DONE` 且 `slot != 活动槽` | `ERROR` | 记录改写成 `ERROR` | 新槽起不来、已回退。留 `DONE` 会让引导器每次复位重新去试那个坏槽 |
+| `APPLYING` | `IDLE` | 不写 Flash | 落在 `default` 分支：**上电不解释半截状态**，否则设备刚上电就开始擦 Flash |
+| `ERROR` | `ERROR` | 不写 Flash | 是"上一次尝试失败"的记录，不是"设备坏了"。`fota recv` 仍然可用 |
+
+两条由此确定的性质：
+
+* **恢复的是状态，不是动作**：`READY` 恢复后**不**自动开始应用
+  （不置 `g_apply_requested`）。`fota_init()` 每次上电都会跑，而"刚上电就自己
+  擦掉一个槽"是这张表反复避免的事 —— 何时应用由操作员决定（`fota apply`），
+  状态本身是可见的（`fota status` 会显示 `READY` 与目标槽）。
+* **"拒绝进入接收"的判据落在持久事实上**：`READY` / `DONE` 下 `fota_receive_begin`
+  必须拒绝（允许进入 = 允许静默丢弃一条已校验通过的补丁），而要这么做得先显式
+  `fota erase` 或 `fota apply`。这个判据只有真的把 `READY` 恢复起来才成立 ——
+  若退回 `IDLE`，跨复位后就再也没有东西拦得住它。
+
+覆盖：生成工程侧的
+`test_fota_protocol.c::test_init_restores_ready_so_the_patch_can_still_be_applied`
+（含"不得自动 apply"与"必须拒绝接收"）与两个保守分支
+（`..._when_the_staging_envelope_is_unreadable` /
+`..._when_the_record_does_not_match_the_envelope`）；端到端（**真**信封解析器、
+收齐后只调 `fota_init()` 模拟复位）由 L5 台架的 `case 9` 覆盖，并有变异用例
+`test_l5_bench_detects_dropping_the_ready_restore` 证明该用例真的会红。
+
+#### 与链接脚本的契约
+
+引导器代码区 = `[0x08000000, 页基址)`，链接脚本的 `FLASH` 区域 `LENGTH` 就是
+"区域大小 - 一页"，并带一条可读的 `ASSERT`。**这条约束是必须的**：若 `LENGTH`
+仍写 `size_kb*1024`，引导器代码涨到最后一页时链接器会痛快地把它放进去，而运行期
+`fota_meta_append()` 擦页时擦掉的正是**引导器正在执行的代码** —— 症状是"升级到
+一半设备再也不启动"，且只在代码恰好涨过一页时出现。
+实测引导器约 1.6 KB / 8 KB，余量充足。
+
 
 ### 9.2 启动决策表（重写 `boot_main` 阶段 4/4.5/5/6）
 
@@ -1139,10 +1253,10 @@ L1（Python 结构检查）跑得快但证明不了 cover 编码正确；L2 用 
 **P3**（传输与元数据）、**P4**（启动决策表 / 16 B 头部落地）、
 **P5**（`examples/fota_demo/`，必须开 `bootloader.enabled`，否则模板永不编译）。
 
-三件未决事项仍等用户点头：
-① `requirements.md` FR-14 的 ✅ 与事实不符（整条路径从未被生成/编译/测试）；
-② 压缩从哪个偏移开始（本实现取 §16.8.1 的方案 (i)：**头明文 + 正文压缩**，已落地）；
-③ `static/third_party/` 需补进 `AGENTS.md` 的供应商只读清单。
+三件未决事项的处置（2026-09-17 全部落地）：
+① ✅ `requirements.md` FR-14 已由 ✅ 改为 ⏳，并写明缺口；
+② ✅ 压缩自 `patch` 流第 0 字节起（本实现取 §16.8.1 的方案 (i)：**头明文 + 正文压缩**），已落地；
+③ ✅ `static/third_party/` 已补进 `AGENTS.md` 第 1 条（供应商只读）清单。
 
 ---
 
@@ -1224,9 +1338,10 @@ L1（Python 结构检查）跑得快但证明不了 cover 编码正确；L2 用 
    没有算 tinyuz 自身的预留开销（`tuz_reserved_mem_size()` = dict_size + 8）
    与适配层其余静态量**。另有 512 B 是有意的松弛：不压缩路径下
    `s_temp_cache` 要 2,048 全用，压缩路径只用 1,536。
-   ⇒ 建议把 §14 第 2 条改为"**≤ 9 KB 且与镜像/补丁大小无关**"（后者是结构性的：
-   所有缓冲都是编译期定长，`fota_delta_budget()` 是唯一出处）；
-   若坚持 8 KB，则把 `cache_size` 降到 1,024（实测可降到 ≈7.5 KB，代价是吞吐）。
+   ⇒ **已改判**（用户 2026-09-17 批准）：§14 第 2 条改为"**≤ 9 KB 且与镜像/补丁
+   大小无关**"（后者是结构性的：所有缓冲都是编译期定长，`fota_delta_budget()`
+   是唯一出处）。备选方案（把 `cache_size` 降到 1,024，≈7.5 KB，代价是吞吐）
+   保留在案，若将来 RAM 吃紧可随时启用。
 
 7. **差分适配层当前会被链接器整个丢掉 —— 这是预期的，不是缺陷。**
    `drv_fota_delta.c` 编译进了 app，但没有任何调用者（接收侧在 P3），
@@ -1266,12 +1381,15 @@ L1（Python 结构检查）跑得快但证明不了 cover 编码正确；L2 用 
 - **P4**（引导决策表 / 16 B 头部落地）。
 - **P5**（HIL 端到端）：`examples/fota_demo/` 已就位，剩下真板 A→B 升级 + 回滚。
 
-待用户点头的清单（在 §17 三条之外新增）：
+两件待裁决事项均已批准（用户 2026-09-17），并在本文件记录处置：
 
-④ §14 第 2 条的 8 KB 是否改为 9 KB（见 18.2 第 6 条）；
-⑤ `requirements.md` FR-14.4 仍写着"BSDIFF 差分"、实现条目仍列
-  `generator/bsdiff_tool.py` —— 而 §16.6/§11.1 已裁定 `bsdiff_tool.py` 与
-  `fota_bspatch.{c,h}.j2` **直接退役**（现已被 `delta_tool.py` + `fota_delta.{c,h}.j2`
-  取代）。这些文件与 `docs/developer-guide/{architecture-overview,template-development}.md`
-  里对应的章节尚未清理；留着会有"两套 FOTA 实现"的误导风险，建议单独一个
-  commit 做退役清理。
+④ ✅ §14 第 2 条的 RAM 上限由 8 KB 改为 **9 KB**（依据见 18.2 第 6 条）；
+⑤ ✅ 旧 BSDIFF 实现已退役：删 `generator/bsdiff_tool.py`、
+  `templates/drivers/fota_bspatch.{c,h}.j2`、`templates/test/test_fota_bspatch.c.j2`，
+  并同步 `docs/requirements.md` 与 `docs/developer-guide/{architecture-overview,
+  template-development}.md`。
+  > 原计划"单独一个 commit 做退役清理"在执行时**改为与 P3 同一提交**：
+  > `templates/drivers/drv_fota.c.j2` 原先 `#include "drv_fota_bspatch.h"` 并调用
+  > `fota_bspatch_apply()`，先删被依赖方会让仓库里存在一个"模板 include 了
+  > 已删除的头"的悬空提交。P3 重写 `drv_fota` 后该依赖自然消失，
+  > 于是两件事合并为一个原子提交。

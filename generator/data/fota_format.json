@@ -66,10 +66,10 @@
                       "comment": "本次新定的格式，取值以『内存里读出来是 H2CD』为准。"},
       "format_ver":  {"offset": 4,  "size": 2, "type": "u16", "value": 1},
       "flags":       {"offset": 6,  "size": 2, "type": "u16", "comment": "bit0=payload 经 tinyuz 压缩；其余保留，必须为 0"},
-      "old_size":    {"offset": 8,  "size": 4, "type": "u32", "comment": "旧镜像 payload 字节数"},
-      "old_crc32":   {"offset": 12, "size": 4, "type": "u32", "comment": "旧镜像 payload 的 CRC32"},
-      "new_size":    {"offset": 16, "size": 4, "type": "u32", "comment": "新镜像 payload 字节数"},
-      "new_crc32":   {"offset": 20, "size": 4, "type": "u32", "comment": "新镜像 payload 的 CRC32，解码完成后设备侧必须复算出相同值"},
+      "old_size":    {"offset": 8,  "size": 4, "type": "u32", "comment": "旧镜像在槽内的**整段占用**字节数 = 192(向量表) + 16(头) + code。⚠️ 早期注释写作『payload 字节数』是错的，设备侧 fota_delta_apply() 按『整段』使用它（src_hdr.image_size + 208 == old_size 是其校验式）"},
+      "old_crc32":   {"offset": 12, "size": 4, "type": "u32", "comment": "旧镜像**代码区**（crc_region）的 CRC32，与镜像头里的 crc32 同算法、同覆盖段"},
+      "new_size":    {"offset": 16, "size": 4, "type": "u32", "comment": "新镜像在槽内的**整段占用**字节数（语义同 old_size）。擦除长度直接取它，因为向量表与头部都在槽首，必须一并擦掉"},
+      "new_crc32":   {"offset": 20, "size": 4, "type": "u32", "comment": "新镜像代码区的 CRC32，解码完成后设备侧必须复算出相同值"},
       "patch_size":  {"offset": 24, "size": 4, "type": "u32", "comment": "信封之后的 lite 补丁字节数（已压缩时 = 压缩后长度）"},
       "fw_version":  {"offset": 28, "size": 4, "type": "u32", "comment": "本次升级后的固件版本号（24-bit 有效），设备据此回填新镜像头部"},
       "hdr_crc16":   {"offset": 32, "size": 2, "type": "u16", "comment": "CRC-16/CCITT-FALSE 覆盖前 32 字节"},
@@ -78,6 +78,144 @@
     },
     "flags_bits": {
       "compressed": 1
+    }
+  },
+
+  "transport": {
+    "_comment": [
+      "接收侧状态机（drv_fota）与主机侧发送端（generator/fota_sender.py）共用的帧约定。",
+      "放在真源里而不是两侧各写一份，理由与 image_header / delta_envelope 相同：",
+      "『两侧布局不一致』（A3 类）是最贵的缺陷 —— 编译、单测全绿，链路静默失效。",
+      "",
+      "一帧 = 类型字节 + 载荷 + 尾校验。帧间没有分隔符，接收端按",
+      "『类型字节 → 定长/变长载荷 → 尾校验』推进；校验不过就整体丢弃并重新同步，",
+      "不提交任何状态。这样任意位置被截断/插入噪声都不会被当成半个合法帧。"
+    ],
+    "frame_marker_size": 1,
+    "start": {
+      "value": 165, "value_hex": "0xA5",
+      "fields": [
+        {"name": "env", "size": 48, "comment": "delta_envelope 整条记录"},
+        {"name": "crc16", "size": 2, "type": "u16",
+         "comment": "CRC-16/CCITT-FALSE 覆盖 48 B 信封。信封自带的 hdr_crc16 只覆盖其前 32 B，二者范围不同、互补：内层是格式级，外层是传输级（要能先拦下被截断/损坏的 START，再交给格式层）"}
+      ],
+      "total_size": 51
+    },
+    "data": {
+      "value": 164, "value_hex": "0xA4",
+      "fields": [
+        {"name": "seq",  "offset": 0, "size": 2, "type": "u16", "comment": "分片序号，自 0 起逐片 +1"},
+        {"name": "len",  "offset": 2, "size": 2, "type": "u16", "comment": "data 字节数，1..chunk_size"},
+        {"name": "data", "offset": 4, "size": "len"},
+        {"name": "crc16", "offset_after": "data", "size": 2, "type": "u16",
+         "comment": "CRC-16/CCITT-FALSE 覆盖 seq|len|data。**刻意包含 seq** —— 只覆盖 data 时，seq 或 len 被打坏会静默通过，而这两者恰恰驱动重传/定位逻辑"}
+      ]
+    },
+    "finish": {
+      "value": 166, "value_hex": "0xA6",
+      "fields": [
+        {"name": "patch_crc32", "size": 4, "type": "u32",
+         "comment": "整条补丁记录（信封 48 B + 其后的 lite 流）的 CRC-32/ISO-HDLC，即主机侧 .h2cd 文件的 zlib.crc32"}
+      ],
+      "total_size": 5
+    },
+    "ack": {"value": 6,  "value_hex": "0x06", "payload": "u16 next_seq", "total_size": 3},
+    "nak": {"value": 21, "value_hex": "0x15", "payload": "u16 want_seq", "total_size": 3},
+    "chunk_size": 1024,
+    "ack_timeout_ms": 2000
+  },
+
+  "staging": {
+    "_comment": [
+      "尾仓暂存（规划 §7.2）：补丁在传输期就落进**目标槽的尾部**，应用期只读它。",
+      "好处是掉电免重传 —— 目标槽尾部那几页不在『新镜像占用范围』内，",
+      "所以重跑应用阶段不需要重新收一遍补丁。",
+      "",
+      "布局（dst_slot 为目标槽基址，slot_size 为其容量）：",
+      "  新镜像：  [dst_slot, dst_slot + align_up(new_size, page))     ← 应用期擦除并写入",
+      "  补丁暂存：[staging_base, staging_base + align_up(env+patch,8)) ← 传输期写入，应用期只读",
+      "  其中 staging_base = dst_slot + slot_size - align_up(48 + patch_size, 8)",
+      "",
+      "⚠️ 准入公式必须用『新镜像实际擦掉的字节数』（align_up(new_size, page)），",
+      "而不是 new_size —— 擦除是按整页做的，用 new_size 会让边界情况少算一页，",
+      "从而把暂存区的首页擦掉（补丁被毁），而一切校验仍然『通过』。"
+    ],
+    "align": 8,
+    "admission": "align_up(new_size, page_size) + align_up(env_size + patch_size, 8) <= slot_size",
+    "resume_granularity": "per committed DATA frame"
+  },
+
+  "metadata": {
+    "_comment": [
+      "FOTA 持久元数据：**专用 Flash 页**（引导器区最后一页），日志式追加记录。",
+      "",
+      "为什么不是 TAMP 备份寄存器（2026-09-17 定稿，**推翻规划 §9.1 的前提**）:",
+      "  §9.1 写『G0 的 TAMP 有 BKP0R..BKP31R，空间充足』—— 这句是错的。",
+      "  RM0444 §31.1: '5 backup registers'；§31.6.8: TAMP_BKPxR 偏移",
+      "  0x100 + 4*x, x = 0..4。vendored 的 stm32g0b1xx.h 里 TAMP_TypeDef",
+      "  也正好止于 BKP4R。而 BKP0R..BKP3R 早已被 boot_nvm 占用（失败计数、",
+      "  活动槽、boot_ok 魔数、NVM 初始化魔数），BKP4R 被旧 FOTA 标志占用",
+      "  且 boot_main 仍在读它 —— 五个寄存器一个不剩。",
+      "  于是 P3 早期实现写的 TAMP->BKP5R..BKP9R 落空：编译期报『没有该成员』，",
+      "  若绕过编译则写到保留地址、**静默不持久**。",
+      "  这个缺陷能活到 P3 才暴露，是因为 mock_hal 把 TAMP 建模成",
+      "  BKP0R..BKP31R —— 替身凭空造出了硅片上不存在的寄存器（A9 的典型形态）。",
+      "",
+      "改用 Flash 页还顺带修掉一个更根本的问题：备份域**没有 V_BAT 电池时",
+      "VDD 一掉就丢**，而 §7.2『掉电免重传』正是靠这份元数据。放 Flash 之后",
+      "掉电语义才名副其实（Flash 只在被擦除时丢）。",
+      "",
+      "布局：引导器区 [boot_base, boot_base + boot_size) 的**最后一页**。",
+      "  metadata_base = boot_base + boot_size - page_size",
+      "  引导器代码被限制在 [boot_base, metadata_base) —— 由链接脚本的",
+      "  ASSERT 强制：涨过界会让链接失败，而不是悄悄踩掉元数据页。",
+      "",
+      "为什么是『日志式追加 + 取 seq 最大者』而不是『两个槽乒乓』：",
+      "  乒乓需要每轮擦一整页，而『擦掉旧槽』那段时间里**唯一**的有效记录",
+      "  正好在被擦的页上，掉电即全丢。追加式把每次状态变更写成一条 24 B",
+      "  新记录，页满（2048/24 = 85 条）才擦一次；掉电最多毁掉**正在写的",
+      "  那一条**，扫描时 CRC16 不过就被跳过，上一条仍然有效。",
+      "  坏一条记录只损失 24 B，且下次追加会自然跳到下一条。"
+    ],
+    "page_source": "bootloader_last_page",
+    "page_size": 2048,
+    "record_size": 24,
+    "record_align": 8,
+    "_record_size_rationale": [
+      "24 B = 恰好 3 个双字，与 STM32G0 的双字编程粒度对齐：一次追加就是",
+      "3 次 HAL_FLASH_Program(uint64_t)，不存在'半个双字'的中间态。",
+      "代价是 2048 / 24 = 85 条余 8 B —— 页尾那 8 B **明确不参与日志**",
+      "（扫描只取前 85 条）。用 32 B 记录能整除（64 条）但要多浪费每条 8 B，",
+      "且多出来的 8 B 只能变成 reserved 字段 —— 与其引入没有语义的填充，",
+      "不如让页尾留一截并写清楚。"
+    ],
+    "journal": {
+      "scan_step": "record_size",
+      "record_count": 85,
+      "unused_tail_bytes": 8,
+      "newest_wins": "max(seq)",
+      "validity": "magic && seq != 0 && seq != 0xFFFFFFFF && crc16 matches",
+      "append_target": "first record slot whose first word reads 0xFFFFFFFF",
+      "on_full": "erase page, then append at offset 0 with seq = last_seq + 1",
+      "torn_write": "record fails crc16 and is skipped; the next append moves on"
+    },
+    "fields": {
+      "magic": {"offset": 0, "size": 4, "type": "u32", "value": 1297370950, "value_hex": "0x4D544F46", "ascii_if_read_as_bytes": "FOTM", "comment": "内存里读出来是 'FOTM'（与 image_header.magic 同一约定：value 是 ASCII 字节的 LE 解释）"},
+      "seq": {"offset": 4, "size": 4, "type": "u32", "comment": "单调递增；0 与 0xFFFFFFFF 都不算有效记录（擦除态与未初始化态）"},
+      "state": {"offset": 8, "size": 4, "type": "u32", "comment": "FOTA_META_STATE_*（与 drv_fota 的运行期状态取值刻意对齐）"},
+      "slot": {"offset": 12, "size": 4, "type": "u32", "comment": "FOTA_META_SLOT_*：本次补丁的**目标槽**。必须持久化 —— 暂存区地址由它决定，而信封本身就在暂存区里（鸡生蛋）"},
+      "staged": {"offset": 16, "size": 4, "type": "u32", "comment": "已提交字节数（含 48 B 信封），断点续传的依据。无法从 Flash 内容反推：补丁正文里可以合法出现 0xFF，扫描找不到『写到哪了』"},
+      "crc16": {"offset": 20, "size": 2, "type": "u16", "comment": "CRC-16/CCITT-FALSE 覆盖前 20 B（即 crc16 字段之前）。算法与帧尾 CRC、信封头 CRC、fota_delta 完全同一份"},
+      "pad": {"offset": 22, "size": 2, "type": "u16", "comment": "保持记录为 24 B（3 个双字，匹配 STM32G0 的双字编程粒度）"}
+    },
+    "not_stored": {
+      "_comment": [
+        "**刻意不存**的字段，以及它们从哪来 —— 存在这里就等于制造第二份真源。",
+        "new_crc32 / patch_size：都写在暂存区开头的 48 B 信封里。设备在 START",
+        "阶段就要把来帧信封与暂存信封逐字段比对以判定续传，所以按设计它总是",
+        "已经读出了信封；再在元数据里存一份，只会在两边不一致时产生歧义。",
+        "attempt_count：归 boot_nvm 的 BKP0R（同一个事实两份真源是 A3 的同构体）。"
+      ]
     }
   }
 }

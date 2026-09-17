@@ -130,6 +130,355 @@ def fota_delta_budget(boot_config: dict) -> dict:
     }
 
 
+def fota_align_up(value: int, align: int) -> int:
+    """向上取整到 `align` 的倍数。`align` 必须是正数。"""
+    if align <= 0:
+        raise ValueError("align must be positive, got %r" % (align,))
+    return ((int(value) + align - 1) // align) * align
+
+
+def fota_staging_geometry(slot_size: int, page_size: int, env_size: int,
+                          patch_size: int, new_size: int) -> dict:
+    """尾仓暂存（规划 §7.2）的几何与准入判定。
+
+    **为什么准入公式不能只用 `new_size`**：擦除是按**整页**做的，设备侧
+    `io->erase(dst_slot, new_size)` 实际擦掉 `align_up(new_size, page_size)` 字节。
+    若在准入里只算 `new_size`，边界情况（例如 new_size 恰为整页数）会少算一页，
+    于是应用阶段把尾仓的**首页**给擦了 —— 补丁被毁，而所有校验仍然通过，
+    失败会以"CRC 不符"的形式出现在很远的地方。这是典型的"边界差一页"缺陷，
+    所以这里用**实际擦除量**而不是声明量。
+
+    Returns:
+        dict，含 `ok`（准入通过与否）、`reason`（不通过的原因，便于写进日志）、
+        `image_bytes`（新镜像实际占用，= 擦除量）、`staged_total`（暂存区占用，
+        8 字节对齐）、`staging_off`（暂存区相对槽基址的偏移）、`headroom`（余量）。
+        不通过时 `staging_off` 为 None —— 让调用方无法"忽略 ok 硬用偏移"。
+    """
+    staged_raw = int(env_size) + int(patch_size)
+    staged_total = fota_align_up(staged_raw, 8)
+    image_bytes = fota_align_up(new_size, page_size)
+
+    out = {
+        'image_bytes': image_bytes,
+        'staged_total': staged_total,
+        'staged_raw': staged_raw,
+        'staging_off': None,
+        'headroom': int(slot_size) - image_bytes - staged_total,
+        'ok': False,
+        'reason': '',
+    }
+
+    if patch_size <= 0:
+        out['reason'] = 'patch_size is zero'
+        return out
+    if new_size <= 0:
+        out['reason'] = 'new_size is zero'
+        return out
+    if slot_size % 8 != 0:
+        # 暂存区基址 = slot_size - staged_total，两者都要 8 字节对齐才能
+        # 满足 STM32G0 的双字编程前置条件。槽容量不是 8 的倍数说明配置本身
+        # 有问题（正常是 2 KB 的倍数），宁可直接拒绝。
+        out['reason'] = 'slot_size %d is not a multiple of 8' % (slot_size,)
+        return out
+
+    staging_off = int(slot_size) - staged_total
+    if staging_off < 0:
+        out['reason'] = 'staged patch (%d B) does not fit in the slot' % (staged_total,)
+        return out
+    if image_bytes + staged_total > int(slot_size):
+        out['reason'] = ('image %d B + staged %d B > slot %d B'
+                         % (image_bytes, staged_total, slot_size))
+        return out
+    if staging_off % 8 != 0:
+        out['reason'] = 'staging offset %d is not 8-byte aligned' % (staging_off,)
+        return out
+
+    out['staging_off'] = staging_off
+    out['ok'] = True
+    return out
+
+
+# FOTA 元数据的持久状态取值（写进 Flash 记录里的 `state` 字段）。
+#
+# 刻意与 drv_fota 的运行期枚举 `fota_state_t` 取值对齐：两套取值不重合时，
+# "把持久状态赋给运行期状态"这类误用会静默变成另一个语义（v1 §9.1 的
+# 位图设计就吃过这个亏）。但**它们仍然是两个东西**，不要互相赋值 ——
+# 引导器只认 Flash 里那一份。
+FOTA_META_STATE_IDLE = 0
+FOTA_META_STATE_RECEIVING = 1
+FOTA_META_STATE_READY = 2      # 收齐且 CRC 通过，等应用
+FOTA_META_STATE_APPLYING = 3
+FOTA_META_STATE_DONE = 4       # 已应用，等引导器确认
+FOTA_META_STATE_ERROR = 5
+
+
+def fota_meta_for_templates(boot_config: dict) -> dict:
+    """Flash 元数据页与记录的布局，压成模板可直接用的常量。
+
+    **为什么不是在 C 模板里写死**：页基址由 `bootloader.size_kb` 决定，
+    记录字段偏移来自 `fota_format.json`。两处各写一份时，症状是"改了一个
+    配置之后元数据莫名其妙读不出来"，而且只在特定 size_kb 上出现。
+
+    记录里**只放无法从别处重算的字段**：
+      · `slot`   —— 暂存区地址由它算出，而信封本身就在暂存区里（鸡生蛋）；
+      · `staged` —— 已提交字节数。补丁正文里可以合法出现 0xFF，
+                     所以扫描暂存区**推不出**"写到哪了"；
+      · `state`  —— 决策本身。
+    `new_crc32` / `patch_size` 不存：它们写在暂存区开头那 48 B 信封里，
+    而 START 阶段本来就要逐字段比对来帧信封与暂存信封（判定续传），
+    再存一份只会在两边不一致时制造歧义。
+    """
+    import struct
+
+    spec = load_fota_format()['metadata']
+    fields = spec['fields']
+    magic = int(fields['magic']['value'])
+
+    # 与 image_header 同一约定：value 是 ASCII 字节的 LE 解释。校验它是为了
+    # 让"手改 JSON 时把 hex 与 decimal 改岔"立刻失败，而不是变成一个
+    # 谁都认不出来的魔数。
+    expect = struct.unpack('<I', b'FOTM')[0]
+    if magic != expect:
+        raise ValueError(
+            "metadata.fields.magic 的 value/hex 与 'FOTM' 不一致："
+            "value=%d hex=%s，应为 %d (0x%08X)"
+            % (magic, fields['magic'].get('value_hex'), expect, expect))
+
+    # 没有引导器 ⇒ 没有引导器区 ⇒ 没有元数据页。返回空 dict 而不是一堆 0：
+    # 那几份消费它的模板（`fota_meta.h/.c`）只在**驱动被注入时**才会被渲染，
+    # 而注入条件是 has_bootloader —— 所以空 dict 不会漏进任何产物。
+    # 反过来给一堆 0 才是危险的：万一哪天真被渲染到，"页基址 0x0"会编过、
+    # 会在运行期去擦地址 0（Flash 基址），症状离原因极远。
+    if not boot_config.get('_meta_page_base'):
+        return {}
+
+    # 没有引导器 ⇒ 没有引导器区 ⇒ 没有元数据页。返回空 dict 而不是一堆 0：
+    # 那几份消费它的模板（`fota_meta.h/.c`）只在**驱动被注入时**才会被渲染，
+    # 而注入条件是 has_bootloader —— 所以空 dict 不会漏进任何产物。
+    # 反过来给一堆 0 才是危险的：万一哪天真被渲染到，"页基址 0x0"会编过、
+    # 会在运行期去擦地址 0（Flash 基址），症状离原因极远。
+    if not boot_config.get('_meta_page_base'):
+        return {}
+
+    page_base = int(boot_config['_meta_page_base'])
+    page_size = int(boot_config['_meta_page_size'])
+    rec_size = int(spec['record_size'])
+    rec_count = page_size // rec_size
+
+    if rec_size <= 0 or rec_count < 2:
+        raise ValueError(
+            "元数据页 %d B 装不下至少 2 条 %d B 记录：日志式存储至少要能"
+            "『留着上一条、写下一条』，否则每次追加都得先擦页"
+            % (page_size, rec_size))
+
+    # 页尾余数（2048 % 24 = 8）**明确不参与日志**。这一点要让调用方看得见：
+    # 悄悄把余数当半条记录扫描，会在页刚好写满时读出一段 0xFF 组成的
+    # "记录"，其 magic 恰好为 0xFFFFFFFF 而 seq 也是 0xFFFFFFFF。
+    unused_tail = page_size - rec_count * rec_size
+
+    return {
+        'meta_magic': magic,
+        'meta_page_base': page_base,
+        'meta_page_size': page_size,
+        'meta_record_size': rec_size,
+        'meta_record_count': rec_count,
+        'meta_unused_tail': unused_tail,
+        # 字段偏移（来自真源，模板里不写字面量）
+        'meta_off_magic': int(fields['magic']['offset']),
+        'meta_off_seq': int(fields['seq']['offset']),
+        'meta_off_state': int(fields['state']['offset']),
+        'meta_off_slot': int(fields['slot']['offset']),
+        'meta_off_staged': int(fields['staged']['offset']),
+        'meta_off_crc16': int(fields['crc16']['offset']),
+        # CRC16 只覆盖 crc16 字段之前的部分 —— 否则校验值把自己也算进去，
+        # 变成一个没有不动点的方程。
+        'meta_crc16_len': int(fields['crc16']['offset']),
+        'st_idle': FOTA_META_STATE_IDLE,
+        'st_receiving': FOTA_META_STATE_RECEIVING,
+        'st_ready': FOTA_META_STATE_READY,
+        'st_applying': FOTA_META_STATE_APPLYING,
+        'st_done': FOTA_META_STATE_DONE,
+        'st_error': FOTA_META_STATE_ERROR,
+        # 0 保留给"没有待启动槽"。与 boot_nvm 的 BOOT_SLOT_A/B（0/1）**故意
+        # 不同**：0 与 1 复用是最容易写错的一处 —— 元数据被清零后若 0 被
+        # 解读成"槽 A"，引导器就会在一次擦除后去引导空槽。
+        'slot_none': 0,
+        'slot_a': 1,
+        'slot_b': 2,
+    }
+
+
+def _crc16_ccitt_false(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE。与设备侧 fota_crc16()/fota_delta.c 的同一算法。"""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= (byte << 8)
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else ((crc << 1) & 0xFFFF)
+    return crc
+
+
+def fota_l5_negative_envelopes(boot_config: dict) -> dict:
+    """L5 负例用的信封：**每一份都只违反一条规则**。
+
+    为什么在生成期把字节算好、写死进 C 测试，而不是在 C 里现场拼：
+    信封里的 `hdr_crc16` 必须与设备侧算法一致，在 C 里再实现一遍 CRC16
+    就成了"同一事实两份实现" —— 正是本仓库反复吃亏的那类缺陷。让 Python
+    算（`_crc16_ccitt_false`）而让 C 校验，就顺带得到了**跨实现交叉验证**：
+    两侧不一致时 L5 会立刻红，而不是等到真板上才发现。
+
+    "只违反一条"是这份向量唯一的设计要求。两份负例同时违反两条规则时，
+    测试只能证明"某一条起了作用"，无法证明"被宣称的那一条起了作用" ——
+    于是改错规则照样全绿（这正是 A9 的形态）。
+
+    另外，每份负例都附带**正确的传输层 CRC16**（覆盖整条 48 B）。这样
+    START 帧的传输级校验会通过、测试真的走到格式级分支；否则所有负例都会
+    停在传输级，看似"全都拒绝了"，其实只测了一条规则。
+
+    Returns:
+        dict：键是短名（`too_big` / `over_admission` / `bad_magic` /
+        `bad_hdr_crc16` / `auth_set` / `unknown_flag`），值是
+        `{'env': bytes, 'crc16': int, 'expect': str, 'why': str}`。
+        `expect` 是**设备侧应报的错误码符号名**（如 `FOTA_DELTA_E_ENV_MAGIC`），
+        由 C 编译器去解析 —— Python 侧因此不需要知道那些枚举的数值，
+        也就不会出现"两处各写一份错误码表"。`why` 写明它违反了哪一条。
+    """
+    spec = load_fota_format()
+    env_spec = spec['delta_envelope']
+    ef = env_spec['fields']
+    env_size = env_spec['size']
+    img = spec['image_header']
+
+    page = int(boot_config.get('delta_page_size', 2048))
+    slot_b = boot_config.get('_app_b_size') or 0x40000
+
+    # 一份"处处合法"的底稿。`old_*` 的值在这里不重要：真正用到它们的
+    # `fota_delta_apply()` 只有在补丁被完整收下之后才会看到这些数。
+    def build(new_size, *, flags=0, magic=None, auth_len=0,
+              hdr_crc16=None, patch_sz=64):
+        buf = bytearray(env_size)
+
+        def put_u32(off, val):
+            buf[off:off + 4] = int(val).to_bytes(4, 'little')
+
+        def put_u16(off, val):
+            buf[off:off + 2] = int(val).to_bytes(2, 'little')
+
+        put_u32(ef['magic']['offset'],
+                ef['magic']['value'] if magic is None else magic)
+        put_u16(ef['format_ver']['offset'], ef['format_ver']['value'])
+        put_u16(ef['flags']['offset'], flags)
+        put_u32(ef['old_size']['offset'], img['payload_offset_in_slot'] + 4096)
+        put_u32(ef['old_crc32']['offset'], 0x11111111)
+        put_u32(ef['new_size']['offset'], new_size)
+        put_u32(ef['new_crc32']['offset'], 0x22222222)
+        put_u32(ef['patch_size']['offset'], patch_sz)
+        put_u32(ef['fw_version']['offset'], 7)
+        put_u16(ef['auth_len']['offset'], auth_len)
+        put_u16(ef['hdr_crc16']['offset'],
+                _crc16_ccitt_false(bytes(buf[:ef['hdr_crc16']['offset']]))
+                if hdr_crc16 is None else hdr_crc16)
+        return bytes(buf)
+
+    # 镜像必须装得下头部，否则连"合法性"都无从谈起
+    min_size = int(img['payload_offset_in_slot']) + page
+    normal = min_size + 4096
+
+    # `over_admission` 要卡在**两条规则的缝隙**里，所以边界值必须现算：
+    #   · 格式层用 `new_size > SLOT_B_SIZE` 粗筛 ⇒ new_size 不能超过槽容量；
+    #   · 传输层用 `align_up(new_size, page) + staged_total` 精筛。
+    # 于是取 `new_size = slot_b - staged_total - 100`（100 只是个小于一页的
+    # 余量）：**声明值**看着装得下，但按整页对齐后就装不下。
+    #
+    # ⚠️ 用 `slot_b - page` 之类的"差不多"值是不行的：那个值其实装得下补丁，
+    # 用例会走在正向路径上，准入公式改坏了也不会红 —— 一个看似在测准入、
+    # 实际什么也没测的用例。
+    patch_sz = 64
+    staged_total = fota_align_up(env_size + patch_sz, 8)
+    over_admission_size = slot_b - staged_total - 100
+
+    cases = {
+        # ── 格式层（fota_delta_parse_env）应当拒绝的 ──────────────────────
+        'bad_magic':      (build(normal, magic=ef['magic']['value'] ^ 1),
+                           'FOTA_DELTA_E_ENV_MAGIC', 'magic 不是 H2CD 的魔数'),
+        'bad_hdr_crc16':  (build(normal, hdr_crc16=0x0000),
+                           'FOTA_DELTA_E_ENV_CRC16', '前 32 B 的头 CRC16 被写坏'),
+        'auth_set':       (build(normal, auth_len=16),
+                           'FOTA_DELTA_E_AUTH', '声明了签名但本版不支持'),
+        'unknown_flag':   (build(normal, flags=0x0002),
+                           'FOTA_DELTA_E_ENV_FLAGS', 'flags 里出现未知位'),
+        'too_big':        (build(slot_b + page),
+                           'FOTA_DELTA_E_TOO_BIG', 'new_size 超过槽容量（格式层的粗筛）'),
+        # ── 格式层通过、必须由**传输层准入公式**拦住的 ──────────────────
+        'over_admission': (build(over_admission_size),
+                           'FOTA_E_STAGING_FULL',
+                           '声明长度装得下、按整页对齐后装不下（准入公式）'),
+    }
+
+    out = {}
+    for name, (env, expect, why) in cases.items():
+        out[name] = {
+            'env': env,
+            'crc16': _crc16_ccitt_false(env),
+            'expect': expect,
+            'why': why,
+        }
+    return out
+
+
+def fota_transport_for_templates() -> dict:
+    """传输层（drv_fota）与主机侧发送端共用的帧约定，取自格式真源。
+
+    真源里写的是"一帧长什么样"，这里换成 C 模板直接能用的常量。任何在模板里
+    出现的字面量（`0xA5` / `51` / `1024`）都会与 Python 侧构成第二份定义 ——
+    A3 类缺陷的成因就是这个，所以一个都不留。
+    """
+    spec = load_fota_format()
+    t = spec['transport']
+    env = spec['delta_envelope']
+
+    start = t['start']
+    data = t['data']
+    finish = t['finish']
+
+    # data 帧的两个定长字段（seq / len）与尾校验的相对位置
+    data_hdr = 0
+    for fld in data['fields']:
+        if fld['name'] in ('seq', 'len'):
+            data_hdr += fld['size']
+    crc16_size = 2
+    for fld in data['fields']:
+        if fld['name'] == 'crc16':
+            crc16_size = fld['size']
+
+    out = {
+        'frame_start': start['value'],
+        'frame_data': data['value'],
+        'frame_finish': finish['value'],
+        'ack': t['ack']['value'],
+        'nak': t['nak']['value'],
+        'chunk_size': t['chunk_size'],
+        'ack_timeout_ms': t['ack_timeout_ms'],
+        'start_total': start['total_size'],
+        'finish_total': finish['total_size'],
+        'data_hdr_size': data_hdr,
+        'data_crc16_size': crc16_size,
+        'ack_total': t['ack']['total_size'],
+        'resp_seq_size': 2,
+        # 一次能收下的最长帧（DATA）与最短帧（ACK/NAK）—— 接收缓冲区按最大帧开
+        'max_frame': data_hdr + t['chunk_size'] + crc16_size + 1,
+        'min_frame': 1 + t['ack']['total_size'],
+    }
+    # 帧标记必须互不相等，否则解析器无法只靠首字节分派；这是"格式正确性"里
+    # 唯一能在此处静态检查的一条，其余由 L5 主机测试覆盖。
+    marks = [out['frame_start'], out['frame_data'], out['frame_finish']]
+    if len(set(marks)) != len(marks):
+        raise ValueError("transport frame markers collide: %r" % (marks,))
+    if out['start_total'] != env['size'] + crc16_size + t['frame_marker_size']:
+        raise ValueError("transport START total_size disagrees with the envelope size")
+    return out
+
+
 def get_boot_led_pin(pins: list) -> dict:
     """
     Extract LED pin info from YAML pins list.
@@ -209,11 +558,45 @@ def build_boot_config(bootloader_raw: dict,
         boot_config['_app_a_size'] = bo - ao
         boot_config['_app_b_size'] = flash_bytes - bo
 
+        # ---- 元数据页：引导器区的**最后一页**（规划 §9.1 的落地替代方案）----
+        #
+        # 原方案把 FOTA 元数据放进 TAMP 的 BKP5R..BKP9R，前提是 §9.1 那句
+        # "G0 的 TAMP 有 BKP0R..BKP31R"。**这句是错的**：RM0444 §31.1 写明
+        # "5 backup registers"，§31.6.8 的偏移公式是 0x100 + 4*x, x = 0..4,
+        # vendored 的 stm32g0b1xx.h 里 TAMP_TypeDef 也正好止于 BKP4R。
+        # 而 BKP0R..BKP3R 归 boot_nvm、BKP4R 归 boot_main 的旧 FOTA 标志 ——
+        # 一个不剩。写不存在的寄存器在编译期就报错，绕过编译则静默不持久。
+        #
+        # 换成 Flash 页还有个更根本的好处：备份域没有 V_BAT 电池时 VDD 一掉
+        # 就丢，而 §7.2 "掉电免重传"正是靠这份元数据；Flash 只在擦除时丢。
+        meta_page = int(load_fota_format()['metadata']['page_size'])
+        delta_page = int(boot_config.get('delta_page_size', meta_page))
+        if delta_page != meta_page:
+            raise ValueError(
+                "delta_page_size=%d 与 fota_format.json 的 metadata.page_size=%d "
+                "不一致：两者都是'器件的擦除粒度'，必须相等"
+                % (delta_page, meta_page))
+
+        boot_size = int(boot_config['size_kb']) * 1024
+        boot_code_size = boot_size - meta_page
+        # 引导器代码必须明显小于"区域 - 一页"，否则这个配置本身就不成立。
+        # 1 KB 是个很低的下限（实测引导器约 1.6 KB，见链接期 ASSERT），
+        # 这里只在配置层面拦住荒谬的值；真正的护栏是链接脚本的 ASSERT。
+        if boot_code_size < 1024:
+            raise ValueError(
+                "bootloader.size_kb=%s 太小：扣掉 %d B 元数据页后只剩 %d B 给引导器代码"
+                % (boot_config['size_kb'], meta_page, boot_code_size))
+
+        boot_config['_meta_page_size'] = meta_page
+        boot_config['_meta_page_base'] = flash_base + boot_size - meta_page
+        boot_config['_boot_code_size'] = boot_code_size
+
     return (boot_config, has_bootloader)
 
 
 def inject_bootloader_drivers(has_bootloader: bool, has_uart: bool,
-                               boot_config: dict, uart_name: str) -> dict:
+                               boot_config: dict, uart_name: str,
+                               has_cli: bool = False) -> dict:
     """
     Auto-inject IWDG driver (bootloader) and FOTA drivers (bootloader + UART).
 
@@ -222,12 +605,15 @@ def inject_bootloader_drivers(has_bootloader: bool, has_uart: bool,
         has_uart: whether any UART peripheral is present.
         boot_config: bootloader config dict with defaults already applied.
         uart_name: name of the primary UART peripheral for FOTA.
+        has_cli: whether a CLI driver exists (it owns the UART byte stream).
 
     Returns:
-        dict with drivers_additions (list), has_fota (bool), hal_additions (list).
+        dict with drivers_additions (list), has_fota (bool), has_fota_receive
+        (bool), hal_additions (list).
     """
     drivers_additions = []
     has_fota = False
+    has_fota_receive = False
     hal_additions = []
 
     # IWDG driver is auto-injected when bootloader is enabled
@@ -265,24 +651,47 @@ def inject_bootloader_drivers(has_bootloader: bool, has_uart: bool,
         })
         hal_additions.extend(['stm32g0xx_hal_flash.c', 'stm32g0xx_hal_flash_ex.c'])
 
-    # ⚠️ 接收侧（`drv_fota`）**暂不注入**：它当前**编不过**，而且协议本身要按
-    # 规划 §10 重写（START/FINISH 帧、尾仓暂存、BKP5R..BKP9R），那是 P3 的工作。
+        # ── 元数据存储（引导器与 App **共用同一份**）────────────────────────
+        # 它是"引导器的启动决策"与"App 的传输进度"之间的唯一共享状态，
+        # 两侧必须对布局有完全一致的理解。所以只生成**一份** .c，放在
+        # src/drivers/ 下，引导器的 CMake 用 ../src/drivers/fota_meta.c 引用它
+        # —— 生成两份就等于给"两侧布局悄悄分叉"留了门。
+        drivers_additions.append({
+            'name': 'fota_meta',
+            'template': 'drivers/fota_meta.c.j2',
+            'header_template': 'drivers/fota_meta.h.j2',
+            'model': {'type': 'Internal_FOTA'},
+            'peripheral': {'name': 'fota_meta'},
+        })
+
+    # ── 接收侧（规划 P3）────────────────────────────────────────────────────
+    # P3 之前这里恒为 False：`drv_fota` 当时编不过（它调用的是 `drv_uart.c`
+    # 里并不存在的 `UART_StartRx_IT` 等接口），而且协议本身要按 §10 重写。
+    # 现在它已被重写为帧解析 + 尾仓暂存 + 元数据 + 应用编排，可以真的接进去了。
     #
-    # 为什么之前没人发现：它调用 `UART_IsRxComplete` / `UART_StartRx_IT` /
-    # `UART_GetRxCount` / `UART_SendByte`，而这四个函数是 `drv_uart.c` 里的
-    # **static** 函数 —— 跨翻译单元根本不可见；它 include 的还是
-    # `drv_<uart_name>.h`（如 `drv_usart2.h`），与 `drv_uart` 也不是同一个文件。
-    # 更要紧的是：此前**没有任何示例开启 bootloader**，所以这个文件从未被渲染、
-    # 从未被编译，缺陷也就从未暴露（fota_demo 一出现就立刻暴露了）。
-    #
-    # 现在把 `has_bootloader` 的工程做成"能编译、能验证引导与差分应用"的状态，
-    # 接收路径等 P3 重写后再打开，而不是继续留一个编不过的文件在树里。
+    # ⚠️ 前置条件：**必须有 CLI**。理由见 drv_cli.h 里 `cli_rx_sink_t` 的说明 ——
+    # UART 的字节流在 App 里只有一个消费者（CLI 的行编辑器），FOTA 靠
+    # `fota recv` 命令显式接管它。没有 CLI 就没有字节来源，硬生成只会得到一个
+    # "编译通过、永远收不到东西"的工程 —— 正是本项目反复踩的那类坑。
+    # 因此这里**显式要求** has_cli，而不是默认开启。
+    if has_bootloader and has_uart and has_cli:
+        drivers_additions.append({
+            'name': 'fota',
+            'template': 'drivers/drv_fota.c.j2',
+            'header_template': 'drivers/drv_fota.h.j2',
+            'model': {'type': 'Internal_FOTA'},
+            'peripheral': {
+                'name': 'fota',
+                'uart_name': uart_name,
+            },
+        })
+        has_fota_receive = True
+
     has_fota = has_bootloader and has_uart
 
     return {
         'drivers_additions': drivers_additions,
         'has_fota': has_fota,
-        # 接收侧协议尚未就绪：驱动与其单测都先不生成
-        'has_fota_receive': False,
+        'has_fota_receive': has_fota_receive,
         'hal_additions': hal_additions
     }

@@ -84,10 +84,27 @@ typedef struct {
     uint32_t _reserved3;
     __IO uint32_t SCR2;
     uint32_t _reserved4[16];
+    /* BKP0R..BKP4R —— **只有 5 个**，与真实硅片一致。
+     *
+     * RM0444 §31.1: "5 backup registers"；§31.6.8: 偏移 0x100 + 4*x, x = 0..4。
+     * vendored 的 `stm32g0b1xx.h` 里 `TAMP_TypeDef` 也正好止于 BKP4R。
+     *
+     * ⚠️ 这里**曾经**开满到 BKP31R，并附了一段"开满更安全"的理由 —— 那段
+     * 理由方向搞反了：mock 凭空造出硅片上不存在的寄存器，等于让被测代码
+     * 与替身共享同一个错误假设。P3 的 `drv_fota` 往 BKP5R..BKP9R 写元数据，
+     * 主机上全绿（字段齐全、读写都对），目标上直接编不过；若绕过编译，
+     * 这些地址落在保留区，写入**静默不生效**，只有跨复位才看得出来。
+     * 这正是 A9（mock 让测试失效）最贵的一种：它让"测试通过"与"能用"
+     * 彻底脱钩。开满不设防，只把缺陷推后。
+     *
+     * 护栏：`generator/tests/test_bootloader_host_tests.py` 的
+     * `test_mock_tamp_matches_vendored_cmsis` 会解析两侧头文件，
+     * 断言备份寄存器数量一致。 */
     __IO uint32_t BKP0R;
     __IO uint32_t BKP1R;
     __IO uint32_t BKP2R;
     __IO uint32_t BKP3R;
+    __IO uint32_t BKP4R;
 } TAMP_TypeDef;
 
 #define TAMP_BASE   (0x4000B000UL)
@@ -443,28 +460,160 @@ HAL_StatusTypeDef HAL_IWDG_Init(IWDG_HandleTypeDef *hiwdg);
 HAL_StatusTypeDef HAL_IWDG_Refresh(IWDG_HandleTypeDef *hiwdg);
 
 /* ======================================================================
- * Flash stubs (for FOTA)
+ * Flash register model + 512 KB RAM 镜像 (FOTA / bootloader)
+ *
+ * 为什么要有寄存器模型与真实语义，而不是几个 no-op 函数：
+ * 原先 HAL_FLASH_Program / HAL_FLASHEx_Erase 只做计数、什么也不写。于是
+ * "尾仓到底写没写对""擦除有没有擦到该擦的那一页""忘了先擦除就编程"这类
+ * 问题在主机上**结构上无法被发现** —— 又一个 A9（mock 太宽容 ⇒ 测试无效）。
+ *
+ * 现在模型带真语义：
+ *   · 擦除 → 整页写 0xFF；
+ *   · 双字编程 → 按位 1→0（`cur & want`），若要求写的位置已经是 0 就报错
+ *     （真实硬件会置 PGERR 并留下中间结果，这正是"未擦写"的现场）；
+ *   · 未解锁 / 非双字类型 / 非 8 字节对齐 / 越界 → 一律报错。
+ * 计数器接口保留，现有用例不受影响。
  * ====================================================================== */
-#define FLASH_TYPEPROGRAM_DOUBLEWORD  0x02U
+
+#define MOCK_FLASH_BASE        0x08000000UL
+#define MOCK_FLASH_PAGE_SIZE   2048U
+#define MOCK_FLASH_MAX_KB      512U
+
+/* CMSIS 也定义了同名宏；主机侧用同一数值，便于被测代码不加分支。 */
+#ifndef FLASH_BASE
+#define FLASH_BASE             MOCK_FLASH_BASE
+#endif
+
+typedef struct {
+    __IO uint32_t ACR;
+    __IO uint32_t _reserved0[3];
+    __IO uint32_t KEYR;
+    __IO uint32_t OPTR;
+    __IO uint32_t SR;
+    __IO uint32_t CR;
+} FLASH_TypeDef;
+extern volatile FLASH_TypeDef *FLASH;
+
+/* DBANK 选项位。名字与位号**必须**与 vendored 的 `stm32g0b1xx.h` 一致：
+ *
+ *     FLASH_OPTR_DUAL_BANK_Pos = 21U
+ *     FLASH_OPTR_DUAL_BANK_Msk = 0x1UL << 21
+ *
+ * 早先这里写的是 `FLASH_OPTR_DBANK_BIT (1UL << 15)`，注释还断言"CMSIS 头
+ * 没有给这一位起名字"—— **两句都是错的**。真实的头既有名字、位号也是 21
+ * （HAL 自己也用 `FLASH_OPTR_DUAL_BANK` 作 `OB_DUAL_BANK_VALUE` 的掩码）。
+ * 于是生成码在主机上读 bit15（保留位，恒 0）→ 永远判定单 bank，
+ * 而目标上根本编不过（2026-09-17 的编译自检才把它暴露出来）。
+ *
+ * 为什么会错到这里：mock 是"主机上一份独立实现"，它一旦自己发明宏名与位号，
+ * 就与被测代码共享了同一个错误假设，测试全绿而目标编不过 —— A9 的典型形态。
+ * 护栏：`generator/tests/test_bootloader_host_tests.py` 里的
+ * `test_mock_derived_macros_match_vendored_cmsis` 会解析两侧源文件并逐位比对。
+ *
+ * ⚠️ 读的是**运行期器件状态**而不是猜配置：双 bank 与否由选项字节决定，
+ * 运行时读它才能两种页号布局都对。 */
+#define FLASH_OPTR_DUAL_BANK_Pos  21U
+#define FLASH_OPTR_DUAL_BANK_Msk  (0x1UL << FLASH_OPTR_DUAL_BANK_Pos)
+#define FLASH_OPTR_DUAL_BANK      FLASH_OPTR_DUAL_BANK_Msk
+
+/* 器件容量（对应 CMSIS 的 FLASHSIZE 寄存器）。主机上用一个可写变量顶替
+ * 只读地址 —— 语义相同（"读器件容量"），只是存储位置不同。 */
+extern uint32_t mock_flash_size_kb;
+#define FLASH_SIZE             ((uint32_t)mock_flash_size_kb << 10)
+
+/* 与真实 HAL 对齐：`stm32g0xx_hal_flash.h` 里
+ *     #define FLASH_TYPEPROGRAM_DOUBLEWORD  FLASH_CR_PG
+ * 而 `FLASH_CR_PG` 是 bit0（= 0x1）。这里**曾经**写 0x02U：mock 的
+ * `HAL_FLASH_Program` 只拿它跟自己比，所以"自洽但都错"，主机上看不出来，
+ * 目标上则因为生成码把它直接传给真 HAL 而语义偏离（真 HAL 用它当 CR 位掩码）。
+ * 与上面 DBANK 位号是同一类问题，见那条注释与护栏测试。 */
+#define FLASH_TYPEPROGRAM_DOUBLEWORD  0x00000001U
+
+/* FLASH_CR 的 LOCK 位（bit31）。**必须与 CMSIS 一致**，因为它不是 mock 的内部
+ * 记账，而是"当前 Flash 控制器是否上锁"这个**真实可读的运行期状态**：
+ * HAL_FLASH_Unlock() 自己就是靠读这一位判断"要不要写密钥序列"的，
+ * 而元数据模块（fota_meta.c）靠它做到"不改动调用方的锁状态"。
+ * 位号/位掩码的命名与 true real 的 `stm32g0b1xx.h` 逐字对齐，
+ * 护栏见 test_bootloader_host_tests.py::test_mock_flash_bit_names_exist_in_vendored_cmsis。 */
+#define FLASH_CR_LOCK_Pos             31U
+#define FLASH_CR_LOCK_Msk             (0x1UL << FLASH_CR_LOCK_Pos)
+#define FLASH_CR_LOCK                 FLASH_CR_LOCK_Msk
 #define FLASH_FLAG_EOP                0x00000001U
 #define FLASH_FLAG_WRPERR             0x00000010U
 #define FLASH_FLAG_PGERR              0x00000004U
 
+/* 与 CMSIS 一致：FLASH_BANK_1 = FLASH_CR_MER1(bit2)、FLASH_BANK_2 = FLASH_CR_MER2(bit15) */
+#define FLASH_BANK_1                  0x00000004U
+#define FLASH_BANK_2                  0x00008000U
+
 typedef struct {
     uint32_t TypeErase;
+    uint32_t Banks;
     uint32_t Page;
     uint32_t NbPages;
 } FLASH_EraseInitTypeDef;
 
 #define FLASH_TYPEERASE_PAGES     0x00U
+#define FLASH_TYPEERASE_MASS      0x01U
+
+/* 查询 Flash 控制器当前是否上锁（真实硬件上就是 FLASH_CR 的 LOCK 位）。
+ * 用途：让"某个函数不该改动静悄悄地锁状态"成为可断言的性质，
+ * 而不是靠"反正后面还能写进去"间接推断。 */
+bool mock_flash_is_locked(void);
 
 HAL_StatusTypeDef HAL_FLASH_Unlock(void);
 HAL_StatusTypeDef HAL_FLASH_Lock(void);
 HAL_StatusTypeDef HAL_FLASH_Program(uint32_t TypeProgram, uint32_t Address, uint64_t Data);
-void HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t *PageError);
+HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t *PageError);
+
+/* ---- 测试用观察 / 注入接口 ---- */
+
+/** 复位：镜像整片 0xFF、计数器归零、重新上锁、DBANK 回默认、容量回 512 KB。 */
 void mock_flash_reset(void);
-bool mock_flash_get_erase_called(void);
+
+/**
+ * @brief 把 512 KB Flash 存储建立**在它真实的地址上**（0x08000000）。
+ *
+ * 真机上 Flash 是内存映射的，所以生成码里 `memcpy(dst, (const void*)addr, n)`
+ * 是正确写法（`drv_fota` 的读回路径正是如此）。主机上那块地址默认没有东西，
+ * 同一行代码会直接段错误。把模型的存储放到真实地址，生成码就一行都不用为
+ * 测试改 —— 这是"替身只替换介质、不改语义"的要求。
+ *
+ * 惰性调用：任何一次 `mock_flash_*` 访问都会先建立它，因此多数测试不需要
+ * 显式调用。**依赖"按地址直接取 Flash"的测试必须显式调用并检查返回值** ——
+ * 失败时访问器仍可用（退回内部数组），但直接按地址取会崩。
+ *
+ * @return 1 = 已映射到真实地址；0 = 该地址不可用（退回了内部数组）。
+ */
+int mock_flash_map(void);
+
+/** @brief 存储是否真的位于 0x08000000（见 mock_flash_map）。 */
+int mock_flash_is_mapped(void);
+
+/** 512 KB 镜像起点（直接读写，用于逐字节比对）。 */
+uint8_t *mock_flash_base(void);
+
+/** 读一个字节（越界返回 0xFF）。 */
+uint8_t mock_flash_peek(uint32_t addr);
+
+/** 绕过 Flash 语义直接埋数据 —— 用来构造"非擦除态"等前置条件。 */
+void mock_flash_poke(uint32_t addr, uint8_t val);
+
+/** 设置 DBANK 选项位（1 = 双 bank 布局，0 = 单 bank）。 */
+void mock_flash_set_dbank(uint32_t enabled);
+
+/** 当前 DBANK 状态。 */
+uint32_t mock_flash_get_dbank(void);
+
+/** 覆盖器件容量（KB），用于模拟非 512 KB 的型号。 */
+void mock_flash_set_size_kb(uint32_t kb);
+
+bool     mock_flash_get_erase_called(void);
 uint32_t mock_flash_get_program_count(void);
+uint32_t mock_flash_get_erase_count(void);
+/** 累计失败的编程 / 擦除次数 —— "操作被拒绝"与"操作成功"必须能区分。 */
+uint32_t mock_flash_get_program_fail(void);
+uint32_t mock_flash_get_erase_fail(void);
 
 /* ======================================================================
  * Common HAL constants
@@ -667,11 +816,26 @@ typedef struct {
     uint16_t           RxXferCount;
 } UART_HandleTypeDef;
 
+/* 下面 UART 段里还有一组同名宏（多一个 HAL_BUSY）。这里全部用 `#ifndef`
+ * 兜住：同一个头文件把同一个常量定义两遍时，只有一个值生效，而**哪个生效
+ * 取决于先后顺序** —— 改一次段落顺序就会静默改掉 HAL_TIMEOUT 的值
+ * （两处原本就写着 2 和 3）。让它们显式地从属于上面那一份，顺序就不再
+ * 决定语义。 */
+#ifndef HAL_MAX_DELAY
 #define HAL_MAX_DELAY        0xFFFFFFFFUL
+#endif
+#ifndef HAL_OK
 #define HAL_OK               0x00
+#endif
+#ifndef HAL_ERROR
 #define HAL_ERROR            0x01
+#endif
+#ifndef HAL_BUSY
 #define HAL_BUSY             0x02
+#endif
+#ifndef HAL_TIMEOUT
 #define HAL_TIMEOUT          0x03
+#endif
 
 #define UART_WORDLENGTH_8B       0
 #define UART_STOPBITS_1          0

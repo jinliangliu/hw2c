@@ -129,6 +129,10 @@ class ProjectIR(IRObject):
     fota_delta_page_size: int = 2048
     fota_delta_cache_size: int = 2048
     fota_delta_dict_size: int = 4096
+    # 传输层帧约定（START/DATA/FINISH/ACK/NAK、分片长度、超时）与
+    # TAMP 元数据位域。同样由真源展开；模板里不得出现字面量 0xA5 / 1024。
+    fota_transport: dict = field(default_factory=dict)
+    fota_meta: dict = field(default_factory=dict)
 
     # ---------- EXTI ----------
     exti: ExtiIR = field(default_factory=ExtiIR)

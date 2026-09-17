@@ -1,7 +1,13 @@
 #include "mock_hal.h"
-#include "unity.h"
 #include <string.h>
 #include <stdlib.h>
+
+/* 这里**刻意不** include "unity.h"。
+ *
+ * mock_hal 是"主机的 HAL 替身"，它对测试框架一无所知也不该知道：一旦它
+ * 依赖 unity.h，任何不用 Unity 的主机测试台（例如 FOTA 的 L5 协议测试台）
+ * 都得为了编它而额外准备一条包含路径 —— 而那个头文件根本没被用到。
+ * 一个"只在某一种测试框架下可用"的替身，等于把替身绑死在框架上。 */
 
 /* ========== CMSIS register mocks (static storage) ========== */
 static volatile CRC_TypeDef  mock_crc_regs;
@@ -494,43 +500,322 @@ void mock_HAL_IWDG_reset(void) {
     iwdg_init_fail = false;
 }
 
-/* ========== Flash mock (FOTA) ========== */
-static bool flash_erase_called = false;
-static bool flash_locked = true;
+/* ========== Flash mock：512 KB RAM 镜像 + 真语义 ========== */
+/*
+ * 见 mock_hal.h 的说明。要点：
+ *   · 擦除整页写 0xFF；
+ *   · 双字编程按位 1→0；若目标位已经是 0 就报错（= 未擦除就编程）；
+ *   · 未解锁 / 类型错 / 非 8 字节对齐 / 越界 → 报错并计数；
+ *   · 页号语义按运行期 DBANK 位决定（单 bank 为全局页号，双 bank 为 bank 内页号），
+ *     与 HAL_FLASHEx_Erase 的行为一致。
+ */
+static uint8_t  mock_flash_fallback[MOCK_FLASH_MAX_KB * 1024U];
+static uint8_t *mock_flash_mem = NULL;      /* 惰性建立，见 flash_mem() */
+static int      mock_flash_mapped = 0;
+
+/* ---------------------------------------------------------------------------
+ * 把 Flash 存储**放到它真实的地址上**
+ *
+ * 真机上 Flash 是内存映射的：`memcpy(dst, (const void *)0x08040000, n)` 是
+ * 完全正确的写法，`drv_fota` 的读回路径就是这么干的。而主机上 0x08000000
+ * 什么都没有 —— 同一行代码会直接段错误（本仓库第一次跑 L5 协议测试台时
+ * 就是这么崩的，而且因为 stdout 有缓冲，连"崩在哪一条用例"都看不到）。
+ *
+ * 两种修法里这一个是更好的那个：让**模型的存储**位于真实地址，而不是让
+ * 被测代码加 `#ifdef TEST` 绕开。理由与"不做语义替身"一致 —— 一旦生成码里
+ * 出现 test-only 分支，主机上跑的就不再是目标上跑的那份代码了（A9 的形态）。
+ *
+ * 失败（地址被占用）时退回内部数组，`mock_flash_*` 访问器照常工作；但"按
+ * 地址直接取 Flash"的代码不能工作，所以 `mock_flash_is_mapped()` 必须被
+ * 依赖它的测试显式检查 —— 宁可报"映射不可用"，也不要一个段错误。
+ * ------------------------------------------------------------------------ */
+
+#if defined(_WIN32)
+/*
+ * ⚠️ 这里**刻意不** `#include <windows.h>`。
+ *
+ * 那个头会定义 `interface` / `small` / `near` / `ERROR` 等一大票短名字宏，
+ * 而 mock_hal.h 本身就把 CMSIS 的 `__I` / `__IO` 定义成了宏 —— MinGW 的
+ * <windows.h> 会拉进一批 SSE/AVX intrinsics 头，它们用 `__I` 当形参名，
+ * 于是 `__I` 被展开成 `volatile`，报出一串
+ *
+ *     error: expected expression before 'volatile'
+ *     mock_hal.h:12:20: note: in expansion of macro '__I'
+ *
+ * 位置指在**宏定义那一行**，完全看不出根因（第一次撞上时排查了很久）。
+ * 本文件只需要一个 Win32 原语，直接声明它比引入整套 Windows 宏干净得多。
+ */
+#ifndef MOCK_VIRTUALALLOC_DECLARED
+#define MOCK_VIRTUALALLOC_DECLARED
+__declspec(dllimport) void *__stdcall VirtualAlloc(void *lpAddress,
+                                                   size_t dwSize,
+                                                   unsigned long flAllocationType,
+                                                   unsigned long flProtect);
+#endif
+#define MOCK_MEM_RESERVE      0x00002000UL
+#define MOCK_MEM_COMMIT       0x00001000UL
+#define MOCK_PAGE_READWRITE   0x04UL
+
+static int mock_flash_map_at(uint8_t **out)
+{
+    void *p = VirtualAlloc((void *)(uintptr_t)MOCK_FLASH_BASE,
+                           (size_t)(MOCK_FLASH_MAX_KB * 1024U),
+                           MOCK_MEM_RESERVE | MOCK_MEM_COMMIT,
+                           MOCK_PAGE_READWRITE);
+    if (p == NULL) {
+        return 0;
+    }
+    *out = (uint8_t *)p;
+    return 1;
+}
+#else
+#include <sys/mman.h>
+static int mock_flash_map_at(uint8_t **out)
+{
+    void *p = mmap((void *)(uintptr_t)MOCK_FLASH_BASE,
+                   (size_t)(MOCK_FLASH_MAX_KB * 1024U),
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (p == MAP_FAILED) {
+        return 0;
+    }
+    *out = (uint8_t *)p;
+    return 1;
+}
+#endif
+
+int mock_flash_map(void)
+{
+    if (mock_flash_mem != NULL) {
+        return mock_flash_mapped;
+    }
+    if (mock_flash_map_at(&mock_flash_mem) != 0) {
+        mock_flash_mapped = 1;
+        /* 刚映射出来的页面是 0x00，不是擦除态 —— 立刻整片置 0xFF，
+         * 保证"映射成功"与"退回数组"两条路径的初值一致。 */
+        memset(mock_flash_mem, 0xFF, (size_t)(MOCK_FLASH_MAX_KB * 1024U));
+        return 1;
+    }
+    mock_flash_mem    = mock_flash_fallback;
+    mock_flash_mapped = 0;
+    memset(mock_flash_mem, 0xFF, (size_t)(MOCK_FLASH_MAX_KB * 1024U));
+    return 0;
+}
+
+int mock_flash_is_mapped(void) { return mock_flash_mapped; }
+
+/* 惰性解析：任何一次 Flash 访问之前都会把存储准备好。 */
+static uint8_t *flash_mem(void)
+{
+    if (mock_flash_mem == NULL) {
+        (void)mock_flash_map();
+    }
+    return mock_flash_mem;
+}
+static volatile FLASH_TypeDef mock_flash_regs;
+volatile FLASH_TypeDef *FLASH = &mock_flash_regs;
+
+uint32_t mock_flash_size_kb = MOCK_FLASH_MAX_KB;
+
+static bool     flash_erase_called  = false;
+/* ⚠️ 锁状态**不再**是独立变量，而是 `FLASH->CR` 的 LOCK 位。
+ *
+ * 独立变量与寄存器分家的形态很隐蔽：mock 认为"已上锁"，而 `FLASH->CR`
+ * 读出来是 0，于是"读 FLASH->CR 判断锁状态"的代码（真实的 HAL 就是这么做的）
+ * 在主机上得到与目标相反的结论。让寄存器本身成为唯一真源，
+ * 这类"mock 与硅片语义不一致"就没有存在的余地。 */
+#define flash_locked                ((FLASH->CR & FLASH_CR_LOCK) != 0U)
 static uint32_t flash_program_count = 0;
+static uint32_t flash_erase_count   = 0;
+static uint32_t flash_program_fail  = 0;
+static uint32_t flash_erase_fail    = 0;
+
+static int flash_offset_of(uint32_t addr, uint32_t *off)
+{
+    if (addr < MOCK_FLASH_BASE) {
+        return -1;
+    }
+    *off = addr - MOCK_FLASH_BASE;
+    if (*off >= (uint32_t)(MOCK_FLASH_MAX_KB * 1024U)) {
+        return -1;
+    }
+    return 0;
+}
+
+uint8_t *mock_flash_base(void) { return flash_mem(); }
+
+uint8_t mock_flash_peek(uint32_t addr)
+{
+    uint32_t off;
+    return (flash_offset_of(addr, &off) == 0) ? flash_mem()[off] : 0xFFU;
+}
+
+void mock_flash_poke(uint32_t addr, uint8_t val)
+{
+    uint32_t off;
+    if (flash_offset_of(addr, &off) == 0) {
+        flash_mem()[off] = val;
+    }
+}
+
+void mock_flash_set_dbank(uint32_t enabled)
+{
+    if (enabled != 0U) {
+        FLASH->OPTR |= FLASH_OPTR_DUAL_BANK;
+    } else {
+        FLASH->OPTR &= ~FLASH_OPTR_DUAL_BANK;
+    }
+}
+
+uint32_t mock_flash_get_dbank(void)
+{
+    return (FLASH->OPTR & FLASH_OPTR_DUAL_BANK) ? 1U : 0U;
+}
+
+void mock_flash_set_size_kb(uint32_t kb) { mock_flash_size_kb = kb; }
 
 HAL_StatusTypeDef HAL_FLASH_Unlock(void) {
-    flash_locked = false;
+    /* 与真机 HAL 一致：已经是解锁态时直接返回 HAL_OK（幂等）。
+     * 这一点很重要 —— 调用方"重复解锁"是常见写法，若这里返回错误，
+     * 主机上会失败而目标上不会。 */
+    FLASH->CR &= ~((uint32_t)FLASH_CR_LOCK);
     return HAL_OK;
 }
 
 HAL_StatusTypeDef HAL_FLASH_Lock(void) {
-    flash_locked = true;
+    FLASH->CR |= (uint32_t)FLASH_CR_LOCK;
     return HAL_OK;
 }
 
 HAL_StatusTypeDef HAL_FLASH_Program(uint32_t TypeProgram, uint32_t Address, uint64_t Data) {
-    (void)TypeProgram;
-    (void)Address;
-    (void)Data;
+    uint32_t off;
+    uint32_t i;
+
     flash_program_count++;
+
+    if (flash_locked) {
+        flash_program_fail++;
+        return HAL_ERROR;
+    }
+    if (TypeProgram != FLASH_TYPEPROGRAM_DOUBLEWORD) {
+        flash_program_fail++;
+        return HAL_ERROR;
+    }
+    if ((Address & 0x7U) != 0U) {
+        flash_program_fail++;                       /* STM32G0 只支持双字编程 */
+        return HAL_ERROR;
+    }
+    if (flash_offset_of(Address, &off) != 0
+        || (off + 8U) > (uint32_t)(MOCK_FLASH_MAX_KB * 1024U)) {
+        flash_program_fail++;
+        return HAL_ERROR;
+    }
+
+    for (i = 0U; i < 8U; i++) {
+        uint8_t want = (uint8_t)((Data >> (8U * i)) & 0xFFU);
+        uint8_t cur  = flash_mem()[off + i];
+        if ((uint8_t)(cur & want) != want) {
+            /* Flash 只能 1→0。要求把 0 写回 1（典型场景：忘了先擦除）时
+             * 真实硬件置 PGERR 并留下中间结果 —— 这里如实报错。 */
+            flash_program_fail++;
+            return HAL_ERROR;
+        }
+        flash_mem()[off + i] = (uint8_t)(cur & want);
+    }
     return HAL_OK;
 }
 
-void HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t *PageError) {
-    (void)pEraseInit;
-    if (PageError) *PageError = 0xFFFFFFFF;
+HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t *PageError) {
+    uint32_t dbank;
+    uint32_t total;
+    uint32_t bank_size;
+    uint32_t base;
+    uint32_t index;
+    uint32_t pages_in_unit;
+
     flash_erase_called = true;
+    flash_erase_count++;
+    if (PageError) {
+        *PageError = 0xFFFFFFFFU;
+    }
+
+    if (pEraseInit == NULL
+        || pEraseInit->TypeErase != FLASH_TYPEERASE_PAGES
+        || pEraseInit->NbPages == 0U) {
+        flash_erase_fail++;
+        return HAL_ERROR;
+    }
+    if (flash_locked) {
+        flash_erase_fail++;
+        return HAL_ERROR;
+    }
+
+    total     = mock_flash_size_kb * 1024U;
+    dbank     = mock_flash_get_dbank();
+
+    if (dbank != 0U) {
+        bank_size = total / 2U;
+        if (pEraseInit->Banks == FLASH_BANK_2) {
+            base = bank_size;
+        } else if (pEraseInit->Banks == FLASH_BANK_1) {
+            base = 0U;
+        } else {
+            flash_erase_fail++;
+            return HAL_ERROR;
+        }
+        pages_in_unit = bank_size / MOCK_FLASH_PAGE_SIZE;
+    } else {
+        /* 单 bank：只有 Bank1 合法，页号是**全局**的（与 HAL 在非双 bank
+         * 器件上强制 Banks = FLASH_BANK_1 的行为一致）。 */
+        if (pEraseInit->Banks != FLASH_BANK_1) {
+            flash_erase_fail++;
+            return HAL_ERROR;
+        }
+        base          = 0U;
+        pages_in_unit = total / MOCK_FLASH_PAGE_SIZE;
+    }
+
+    if ((pEraseInit->Page >= pages_in_unit)
+        || (pEraseInit->NbPages > (pages_in_unit - pEraseInit->Page))) {
+        if (PageError) { *PageError = pEraseInit->Page; }
+        flash_erase_fail++;
+        return HAL_ERROR;
+    }
+
+    for (index = pEraseInit->Page;
+         index < (pEraseInit->Page + pEraseInit->NbPages);
+         index++) {
+        uint32_t off = base + (index * MOCK_FLASH_PAGE_SIZE);
+        if ((off + MOCK_FLASH_PAGE_SIZE) > (uint32_t)(MOCK_FLASH_MAX_KB * 1024U)) {
+            if (PageError) { *PageError = index; }
+            flash_erase_fail++;
+            return HAL_ERROR;
+        }
+        memset(&flash_mem()[off], 0xFF, MOCK_FLASH_PAGE_SIZE);
+    }
+    return HAL_OK;
 }
 
 void mock_flash_reset(void) {
-    flash_erase_called = false;
-    flash_locked = true;
+    (void)mock_flash_map();
+    memset(flash_mem(), 0xFF, (size_t)(MOCK_FLASH_MAX_KB * 1024U));
+    flash_erase_called  = false;
     flash_program_count = 0;
+    flash_erase_count   = 0;
+    flash_program_fail  = 0;
+    flash_erase_fail    = 0;
+    mock_flash_size_kb  = MOCK_FLASH_MAX_KB;
+    FLASH->OPTR         = 0U;      /* 默认单 bank；用例可显式切成双 bank */
+    FLASH->SR           = 0U;
+    FLASH->CR           = (uint32_t)FLASH_CR_LOCK;   /* 复位后 Flash 是上锁的 */
 }
 
-bool mock_flash_get_erase_called(void) { return flash_erase_called; }
+bool     mock_flash_get_erase_called(void)  { return flash_erase_called; }
 uint32_t mock_flash_get_program_count(void) { return flash_program_count; }
+uint32_t mock_flash_get_erase_count(void)   { return flash_erase_count; }
+bool     mock_flash_is_locked(void)         { return flash_locked; }
+uint32_t mock_flash_get_program_fail(void)  { return flash_program_fail; }
+uint32_t mock_flash_get_erase_fail(void)    { return flash_erase_fail; }
 
 /* ========== FreeRTOS stubs ========== */
 /*
