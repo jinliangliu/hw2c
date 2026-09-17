@@ -86,13 +86,17 @@ cmake --build build; ./build/test_component_sil
 # 5) 生成器/解析器 Python 测试
 python -m pytest generator/tests tests -q
 
-# 6) 烧录 + 串口验证（需要 DAP-Link）
-#    ⚠️ 本机 OpenOCD 驱动不了这块 DAP-Link（CMSIS-DAP v2 / WinUSB），用 pyOCD
+# 6) 烧录 + 串口验证
+#    ⚠️ 本机 OpenOCD 驱动不了 DAP-Link（CMSIS-DAP v2 / WinUSB），用 pyOCD
 #    ⚠️ 必须在沙箱之外跑，否则 USB 枚举为空、会误判成"没插调试器"
 PYOCD=C:/Users/pc/.workbuddy/binaries/python/envs/default/Scripts/pyocd.exe
-$PYOCD flash output/<demo>/build/<demo>.bin --target stm32g0b1retx -O reset_type=hw
-$PYOCD reset  --target stm32g0b1retx -O reset_type=hw   # 保证抓到完整启动
-python flash_capture.py                                  # COM4 @115200 抓日志/CLI
+#    带 bootloader 的示例要烧 **combined.bin**（引导器 + Slot A）到 0x08000000，
+#    烧 <demo>.bin（应用镜像、按 0x08002000 链接）会覆盖引导器 → 变砖
+$PYOCD flash output/<demo>/build/combined.bin --target stm32g0b1vetx -e chip --no-reset
+$PYOCD cmd  --target stm32g0b1vetx -c halt -c "read32 0x08000000 16"   # 回读校验
+$PYOCD reset --target stm32g0b1vetx                                   # 再复位启动
+python .workbuddy/tmp/serial_capture.py --out <log> --trigger "starting scheduler" \
+       --script "version|uptime|free|fota status|sysinfo"             # 先开监听，再 reset
 ```
 
 ## 环境事实（本机 Windows）
@@ -104,13 +108,19 @@ python flash_capture.py                                  # COM4 @115200 抓日�
   **驱动不了本机这块 DAP-Link**（该构建只编入 `hid` 后端，无 libusb）
 - **pyOCD（上板首选）**：`C:/Users/pc/.workbuddy/binaries/python/envs/default/Scripts/pyocd.exe`
   （0.45.1 + `libusb-package`，走 WinUSB 批量接口）；
-  **目标名 `stm32g0b1retx`**（依赖 `pyocd pack install STM32G0B1RETx` 装的
-  `Keil.STM32G0xx_DFP` 2.1.0；pyOCD 内置目标里没有 STM32G0）
-- 调试器：`VID_0D28&PID_0204` 的 **DAP-Link，CMSIS-DAP v2**：
-  `MI_00`=WinUSB `[001] CMSIS-DAP`、`MI_01`=CDC(**COM3**)、`MI_03`=HID。
-  **无 MSC 接口 → 不能用 U 盘拖拽烧录**
-- 串口：**COM4**=CP210x（接 USART2 PA2/PA3，日志/CLI 实际走这个）、COM3=DAPLink CDC
-- 串口调试脚本（保留本地、不提交）：`cmd_capture.py`、`flash_capture.py`
+  **目标名 `stm32g0b1retx` / `stm32g0b1vetx`**（同一 die，按封装选；依赖
+  `pyocd pack install STM32G0B1RETx` 装的 `Keil.STM32G0xx_DFP` 2.1.0；
+  pyOCD 内置目标里没有 STM32G0）。`pyocd list --targets | grep -i g0b1` 可列全。
+- 调试探针**换过**，两种都能用（2026-09-17 起是 ST-Link）：
+  - **ST-Link**：`STM32 STLink`，pyOCD 原生支持，无需 `reset_type` 参数
+  - **DAP-Link**：`VID_0D28&PID_0204` 的 CMSIS-DAP v2：`MI_00`=WinUSB、
+    `MI_01`=CDC(**COM3**)、`MI_03`=HID。**无 MSC 接口 → 不能拖拽烧录**
+- 串口也换过：
+  - **COM5 = FTDI FT232R**（`VID_0403&PID_6001`，SER=A5069RR4A）—— 2026-09-17 在用
+  - **COM4 = CP210x**（接 USART2 PA2/PA3）—— 09-15 在用，当前 Disconnected
+  - `pnputil /enum-devices /class Ports` 可以看清"哪个适配器真的插着"
+- 串口调试脚本（保留本地、不提交）：`cmd_capture.py`、`flash_capture.py`、
+  `.workbuddy/tmp/serial_capture.py`（带速率自检，见教训 12）
 
 ## 关键设计决策与教训（重要）
 
@@ -212,6 +222,29 @@ python flash_capture.py                                  # COM4 @115200 抓日�
       即可排除「失效安全捕获 / 复位循环」，把问题限定为纯挂死。
     - `pyocd cmd` 连接后**不会自动停机**，读寄存器前必须先 `-c halt`。
     - `read32 <addr> <count>` 的 count 单位是**字节**，不是字。
+12. **看到"串口刷屏 / 同一段被重复几十次"先怀疑主机侧，别先改固件**（2026-09-17）。
+    本机 FTDI(COM5) 会进入**陈旧缓冲反复回放**状态：把驱动/FIFO 里的旧内容按 USB
+    轮询节奏重复交付，表现为 200+ KB/s 的固定片段刷屏，还会伪装成"启动横幅被打了
+    72 次"这种看着特别像固件缺陷的现象。**三条判据**（任一条成立即可定性）：
+    - **速率判据**：字节率不得超过 `baud/10`（115200 8N1 → 11.52 KB/s）。超了就是
+      主机侧。更强的形式是换个波特率（9600/115200/230400）再看：**内容与速率都不变**
+      ⇒ 这批数据根本没经过 UART 接收。
+    - **因果判据**：用 pyOCD 的 **Python API 在同一进程里** `halt` 并保持会话，再采样；
+      核停了还在流 ⇒ 与固件无关。（用 `pyocd cmd` 子进程做会因退出时自动 resume 而失真。）
+    - **写入量判据**：固件的每个 UART 字节都只来自 `lwrb_read()`（TXE ISR 或
+      `log_flush()`），**取走即删除** ⇒ 发出的字节数 ≤ 入队字节数。所以在
+      `main` 里 `bl log_raw` 的**下一条**下断点，读 `log_ringbuf`
+      （`templates/drivers/drv_log.c.j2` 里的 static，符号在 .bss 里查得到：
+      `buff/size/r_ptr/w_ptr/evt_fn/arg` 六个字），`w_ptr` 就是本次入队字节数；
+      与源码算出的字符串长度（含 `log_raw` 额外补的 CRLF）相等即证明只写了一次。
+      再顺带 dump 缓冲内容，能直接看到"只有一份"。
+    处置：`reset_input_buffer()` 有时能救；彻底恢复要**物理重插**（软件复位需管理员：
+    `pnputil /restart-device "<instanceid>"`，非提升权限会 `Access is denied`）。
+    **抓取脚本必须自带速率自检**（超限即告警并再 purge），否则会把主机故障当成固件回归。
+    **pyOCD 断点两个坑**：① `resume()` 之后 `get_state()` 会短暂仍报 `HALTED`，
+    于是把同一个现场当成新命中 → 判定条件要写成"停在**不同于**上次的位置"；
+    ② 从断点地址本身 `resume` 会原地再次触发（且实测 `target.step()` 不前进），
+    **优先只打断点一次、读完就走**，不要入口/返回各打一个。
 12. **新增"第二条投递通道"时，别抄第一份的约定**（YMODEM 通道，2026-09-17）。
    FOTA 接收现在有两条传输通道（HWC 帧协议 `fota recv`、YMODEM `fota ymodem`），
    它们**只允许在"字节怎么进来"上不同**：定长分片 + 显式序号 + 停等 ACK，还是

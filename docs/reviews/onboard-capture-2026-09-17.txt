@@ -1,0 +1,146 @@
+hw2c 上板验证原始记录 — 2026-09-17
+目标：STM32G0B1VET6 @ 16 MHz HSI
+固件：output/mhde_mainboard/build/combined.bin（126192 B = 引导器 2280 B + Slot A 应用镜像）
+本次任务：编译 → 烧录 → 监听串口
+
+与 2026-09-15 那次（docs/reviews/onboard-capture-2026-09-15.txt）的硬件差异：
+  · 调试探针改为 **ST-Link**（`STM32 STLink`，UID 30FF6B063446363027151557），不再是 DAP-Link
+  · 串口改为 **COM5 = FTDI FT232R**（`USB\VID_0403&PID_6001`，SER=A5069RR4A）；
+    原来的 CP210x(COM4) 当前处于 Disconnected
+  · pyOCD 目标名用 **stm32g0b1vetx**（与板上 VET6 封装一致；retx 亦可，同 die）
+
+================================================================
+[1] 烧录
+================================================================
+$ pyocd flash output/mhde_mainboard/build/combined.bin \
+        -t stm32g0b1vetx -e chip --no-reset
+0001618 I Loading ...build\combined.bin [load_cmd]
+0001623 I Erasing... [loader]
+0001711 I Programming... [loader]
+0007448 I Erased chip, programmed 121856 bytes (119 pages),
+          identical 5120 bytes (5 pages) at 21.29 kB/s [loader]
+
+# 用 --no-reset 让核停在停机态，随后再单独复位 —— 这样"开监听"与"启动"能严格对齐。
+
+[2] 回读校验（SWD）
+$ pyocd cmd -t stm32g0b1vetx -c halt -c "read32 0x08000000 16"
+08000000:  20024000 08000569 080005b9 080005b9    | .@....i........|
+# 与 combined.bin 前 16 字节逐字节一致：SP=0x20024000、复位向量=0x08000569（引导器）
+# 0x0801ED00 为 0xFF（超出 0x1ECF0 镜像长度）—— 符合预期
+
+[3] 复位并抓取启动日志
+$ pyocd reset -t stm32g0b1vetx
+
+    	    _/    _/  _/          _/    _/_/      _/_/_/
+    	   _/    _/  _/          _/  _/    _/  _/
+    	  _/_/_/_/  _/    _/    _/      _/    _/
+    	 _/    _/    _/  _/  _/      _/      _/
+    	_/    _/      _/  _/      _/_/_/_/    _/_/_/
+
+[2000-00-00 00:00:00.999] [INF] mhde_mainboard v1.0 — Hardware2Code | STM32G0B1VET6 @ 16 MHz
+[2000-00-00 00:00:00.999] [INF] MX_GPIO_Init() OK
+[2000-00-00 00:00:00.999] [INF] EventMgr_Init() OK
+[2000-00-00 00:00:00.999] [INF] statemachine_init() OK
+[2000-00-00 00:00:00.999] [INF] RTC clock source: LSE (32.768kHz)
+[2026-09-17 10:00:00.002] [INF] temp_sensor_init() OK
+[2026-09-17 10:00:00.004] [INF] RTC_Init() OK
+[2026-09-17 10:00:00.006] [INF] FOTA subsystem initialized
+[2026-09-17 10:00:00.009] [INF] component_init_all: 3/3 OK
+[2026-09-17 10:00:00.011] [INF] component_bus initialized (4 topics)
+[2026-09-17 10:00:00.013] [INF] param_registry initialized (10 params)
+[2026-09-17 10:00:00.016] [INF] PowerMgr: init, default=STOP1
+[2026-09-17 10:00:00.018] [INF] power_mgr initialized (default: STOP1)
+[2026-09-17 10:00:00.060] [INF] IWDG armed (timeout 5000 ms)
+[2026-09-17 10:00:00.116] [INF] System ready — 3 components, 11336 B heap free, starting scheduler
+
+# 横幅那 5 行取自 SWD 断点处读到的环形缓冲原始字节（见 [5]），
+# 比串口抓到的更可信；串口抓取里横幅首行因适配器故障被污染。
+# 注意：RTC 前 6 行时间戳为 2000-00-00（LSE 未起振前的占位），
+#       LSE 就绪后跳变为真实时间 2026-09-17 10:00 —— 与 09-15 记录一致。
+
+================================================================
+[4] CLI 交互（复位后约 12 s，等 `starting scheduler` 出现再发）
+================================================================
+$ version
+Firmware version: 1.0.0
+Build: Sep 17 2026 12:51:04
+$ uptime
+Uptime: 0:00:03
+$ free
+Free heap: 760 bytes
+$ tasks
+cli            	X	4	222	1
+comp_step      	R	2	446	4
+fota           	R	1	481	3
+IDLE           	R	0	85	5
+Tmr Svc        	B	3	          ← 输出被下一条命令截断（注入间隔 2 s 偏短）
+$ fota status
+FOTA state: IDLE
+  pending slot: 0  staged: 0 bytes
+  last error: 0
+$ sysinfo
+Temperature : 32.0 C
+Heap        : 12552 / 13312 bytes (used / total)
+Flash       : 116928 / 524288 bytes (used / total)
+
+判定：`System ready` 出现、`help` 列出 13 个命令（含
+`fota - FOTA firmware update (recv/ymodem)`）、`fota status` 正常应答 ⇒ 本次 YMODEM 固件上板可用。
+
+================================================================
+[5] 异常定位：串口出现"刷屏/横幅重复几十次" —— 主机侧适配器故障，非固件缺陷
+================================================================
+
+现象（第一轮抓取）：
+  · 复位前约 11 s，线路持续吐 0x40（'@'）约 114 KB
+  · 复位后启动横幅的首行 `_/  _/ … _/_/_/` 被重复 64~72 次，且夹着一行
+    由**两条不同横幅行拼成**的畸形文本（`\t   _/    _/` 后直接接第 4 行内容）
+  · 另一轮里"串口"以 200+ KB/s 反复输出 `=== End PowerMgr ===` 片段
+
+四条证据（全部指向主机侧）：
+
+  1) 物理速率上限。9600 / 115200 / 230400 三种波特率下，收到的**内容完全相同**
+     且速率都是 ~215~250 KB/s。115200 8N1 的物理上限是 11.52 KB/s 字节率，
+     不可能被真实 UART 超越；波特率改到 9600 内容却不变，更说明它没经过 UART 接收。
+  2) 因果否定。用 pyOCD 的 Python API **在同一进程里把核 halt 住并保持会话**，
+     再采样串口：仍然 216354 B/s；`resume` 后 219202 B/s。**CPU 已停**，
+     它不可能在发送。（若用 `pyocd cmd` 子进程做这个实验，进程退出可能自动
+     resume，结论会不可信。）
+  3) 设备侧直接否决。停机时读固件的日志环形缓冲 `log_ringbuf`：
+     `size=1024 r_ptr=1003 w_ptr=1003 pending=0`，**5 秒内 r/w 指针一个字节都没动**。
+     若固件真在以数百 KB/s 往外推，"写指针必然飞驰"。同时 PC 采样全部落在
+     `prvIdleTask` / `xTaskResumeAll` / `vPortEnterCritical` / `vListInsert` ——
+     系统处于空闲，不在打印路径上。
+  4) 写入量断言。在 `main` 里 `bl log_raw` 的下一条（0x0800975C）下断点，
+     复位后命中时读环形缓冲：`w_ptr = 225`，缓冲内容为
+     **一份**横幅 + `\r\n`，其后全是 0x00。
+     横幅字符数按源码算是 223，+ CRLF = **225**，与实测**恰好相等**。
+     固件的每个 UART 字节都只来自 `lwrb_read()`（TXE ISR 或 `log_flush()`），
+     **取走即删除** ⇒ 发出的字节数 ≤ 入队字节数。
+     所以机器上不可能出现几十个横幅。
+
+结论：`output/mhde_mainboard` 的日志子系统与固件功能均正常。
+本次观察到的重复/刷屏全部来自 **FTDI(COM5) 适配器进入了"陈旧缓冲反复回放"的
+卡死状态**（RX FIFO/驱动读取指针不前进，驱动按 USB 轮询节奏重复交付同一段内容）。
+
+现场数据点：设备状态本身是正常的 ——
+  `pnputil /enum-devices /class Ports` 显示 FTDI 为 `Status: Started`，
+  没有黄叹号；但行为已不正常。
+
+处置：
+  · 软件侧复位设备需要管理员权限，本会话尝试失败：
+    `pnputil /restart-device "FTDIBUS\VID_0403+PID_6001+A5069RR4A\0000"`
+    → `Access is denied.`
+  · **需要物理重新插拔 USB 适配器**（或以管理员身份重启该设备）。
+  · 重插后再复跑 [3][4] 即可拿到干净日志。
+  · 抓取脚本已加入自检与自愈：开工先 `reset_input_buffer()`；运行中若字节率
+    超过 `baud/10 × 1.5` 即判定为主机侧回放，写告警并再 purge 一次
+    （本轮触发了 11 次）。工具留在 `.workbuddy/tmp/serial_capture.py`。
+
+================================================================
+[6] 待办
+================================================================
+· 重插 FTDI 后重跑干净抓取（本轮日志已可用，但横幅首行不完整）
+· pt.4 里 `tasks` 输出被截断：命令注入间隔应 ≥ 3 s（CLI 输出较长时）
+· **YMODEM 真机端到端** 仍未做：本机 Tera Term / `lrzsz sb` 实发一次 `.h2cd`，
+  才算验证过"CRC 用 XMODEM 而非 CCITT-FALSE"这条判据（主机全绿不能替代）
+· 引导决策表（P4）
