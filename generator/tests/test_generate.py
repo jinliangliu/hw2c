@@ -184,6 +184,50 @@ project:
         "merge() 对 project 块里的未知键保持沉默 —— 写错层的配置又被静默吞掉了")
 
 
+def test_no_shipped_example_declares_a_dead_project_key(caplog):
+    """仓库里随附的每个示例都不许在 project 块里放 merge() 不认的键。
+
+    上面那条护栏只能证明「机制在」，证明不了「存量已清干净」。实测清扫第一遍时
+    只处理了 4 个示例，剩下 6 个（mpu6050 / thermo_pid / spi_flash / modbus /
+    pwm / solenoid_valve）依旧把 `heap_size` 写在 project 块里 —— 生成时会各刷
+    一条 WARNING，长期淹没在日志里就没人看了。这条扫的是真实目录，不是构造
+    YAML，所以能挡住「新示例又照着老示例抄」。
+    """
+    import logging
+    from pathlib import Path
+
+    from generator.mapper import merge
+
+    repo_root = Path(__file__).resolve().parents[2]
+    examples = sorted(repo_root.glob("examples/*/task.yaml"))
+    assert len(examples) >= 8, (
+        "只找到 %d 个示例 —— 路径推导错了，这条护栏会变成空转" % len(examples))
+
+    offenders: list[str] = []
+    with caplog.at_level(logging.WARNING, logger="hw2c.mapper"):
+        for task_path in examples:
+            hw_path = task_path.with_name("hardware.yaml")
+            merge(
+                hw_path.read_text(encoding="utf-8") if hw_path.is_file() else "",
+                task_path.read_text(encoding="utf-8"),
+                "",
+            )
+    offenders = [
+        r.getMessage() for r in caplog.records
+        if "project" in r.getMessage() and "忽略" in r.getMessage()
+    ]
+    assert not offenders, (
+        "这些随仓库发布的示例在 project 块里写了不生效的键，示例本身就是文档，"
+        "放死配置等于教用户写错层：\n  " + "\n  ".join(offenders))
+
+    # 正控：确认这次扫描真的能看见告警，否则上面的断言可能只是没接上 logger。
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="hw2c.mapper"):
+        merge("", 'project:\n  name: probe\n  heap_size: 16384\n', "")
+    assert any("忽略" in r.getMessage() for r in caplog.records), (
+        "正控失败：merge() 对错层键已经不出声了，本用例的断言失去意义")
+
+
 if __name__ == "__main__":
     test_generate_with_mock_validator()
     test_generate_with_mock_context_builder()

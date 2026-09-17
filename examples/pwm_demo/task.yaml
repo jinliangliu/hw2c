@@ -5,7 +5,6 @@
 project:
   name: pwm_demo
   version: "1.0.0"
-  heap_size: 16384
 
 event_task:
   name: events_process_task
