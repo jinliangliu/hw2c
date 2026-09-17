@@ -1,17 +1,64 @@
-/* test_spi_api.c.j2 - SPI bus API unit tests (CS + register protocol) */
+{#
+test_spi_api.c.j2 - SPI bus API unit tests (CS + register protocol)
+
+## 为什么总线名必须派生
+
+`spi_api.c` 里的总线表是从 `peripherals` 派生的：
+
+    for p in peripherals if 'SPI' in p.model.interface → p.bus → "spi2"
+
+而本文件曾把 `spi1` / `hspi1` **写死**。板子的 SPI 挂在 SPI2 上时，
+`spi_api.c` 引用的是 `hspi2`，测试定义的却是 `hspi1`
+⇒ 链接期 `undefined reference to 'hspi2'`（2026-09-17 mhde_mainboard 实测）。
+写死的一方只要跟派生的一方不一致就必然崩，而且**只在总线不是 spi1 时才暴露**。
+
+所以这里：总线名、`hspiN` 定义、被测 BUS 字符串全部从 peripherals 派生。
+
+Auto-generated — do not edit manually.
+#}
+/* test_spi_api.c - SPI bus API unit tests (CS + register protocol) */
 #include "unity.h"
 #include "mock_hal.h"
 #include <string.h>
 
-{% set spi_peri = peripherals | selectattr('model.interface', 'eq', 'SPI') | first %}
-{% set spi_cs_id = spi_peri.get('cs_pin', spi_peri.get('extra', {}).get('chip_select_pin', '')) %}
-{% set spi_cs_obj = pins | selectattr('id', 'eq', spi_cs_id) | first %}
-{% set cs_label = (spi_cs_obj.get('label', spi_cs_id) | lower) if spi_cs_obj else (spi_cs_id | lower) %}
+{% set spi_buses = [] %}
+{% for p in peripherals if 'SPI' in p.model.interface %}
+{% if p.bus not in spi_buses %}
+{% set _ = spi_buses.append(p.bus) %}
+{% endif %}
+{% endfor %}
 
-/* spi_api references hspi1 via extern (declared in main.c) */
-SPI_HandleTypeDef hspi1;
+{# 片选：取第一个"带 CS 脚"的 SPI 器件，按引脚 label 取名（spi_api 用名字查 gpio） #}
+{% set cs_ns = namespace(label='') %}
+{% for p in peripherals if 'SPI' in p.model.interface %}
+{% if cs_ns.label == '' %}
+{% set cs_id = p.get('cs_pin', p.get('extra', {}).get('chip_select_pin', '')) %}
+{% if cs_id %}
+{% set cs_obj = pins | selectattr('id', 'eq', cs_id) | first %}
+{% set cs_ns.label = ((cs_obj.get('label', cs_id) if cs_obj else cs_id) | lower) %}
+{% endif %}
+{% endif %}
+{% endfor %}
+{% set cs_label = cs_ns.label %}
+{% set primary_bus = (spi_buses[0] | lower) if spi_buses | length > 0 else '' %}
+
+{% if spi_buses | length > 0 %}
+/* spi_api.c 里每个总线都是 `extern SPI_HandleTypeDef hspiN;`（真定义在 main.c）。
+ * 本用例不含 main.c，所以在这里把每个真实总线各补一份定义。
+ * 总线名派生自 peripherals —— 写死 spi1 会在总线是 spi2 的板子上链接失败。 */
+{% for bus in spi_buses %}
+SPI_HandleTypeDef hspi{{ bus[-1] }};
+{% endfor %}
+{% else %}
+/* 本配置没有 SPI 器件：spi_api.c 的总线表为空，不需要任何 hspi 定义。 */
+{% endif %}
+
 #include "../src/drivers/gpio_api.c"
 #include "../src/drivers/spi_api.c"
+
+/* 保证不存在的总线名：真实总线名一律形如 spiN，绝不会是这个词 */
+#define BUS_ABSENT  "nobus"
+#define BUS_PRIMARY "{{ primary_bus }}"
 
 void setUp(void)
 {
@@ -22,77 +69,107 @@ void tearDown(void) {}
 
 void test_open_known_bus_returns_handle(void)
 {
-    spi_handle_t h = spi_open("spi1", NULL);
+{% if primary_bus %}
+    spi_handle_t h = spi_open(BUS_PRIMARY, NULL);
     TEST_ASSERT_NOT_NULL(h);
+{% else %}
+    TEST_IGNORE_MESSAGE("本配置没有 SPI 器件");
+{% endif %}
 }
 
 void test_open_is_idempotent_for_shared_bus(void)
 {
-    spi_handle_t h1 = spi_open("spi1", NULL);
-    spi_handle_t h2 = spi_open("spi1", NULL);
+{% if primary_bus %}
+    spi_handle_t h1 = spi_open(BUS_PRIMARY, NULL);
+    spi_handle_t h2 = spi_open(BUS_PRIMARY, NULL);
     TEST_ASSERT_NOT_NULL(h1);
     TEST_ASSERT_EQUAL_PTR(h1, h2);
+{% else %}
+    TEST_IGNORE_MESSAGE("本配置没有 SPI 器件");
+{% endif %}
 }
 
 void test_open_unknown_bus_returns_null(void)
 {
-    TEST_ASSERT_NULL(spi_open("spi9", NULL));
+    TEST_ASSERT_NULL(spi_open(BUS_ABSENT, NULL));
     TEST_ASSERT_NULL(spi_open(NULL, NULL));
 }
 
 void test_read_reg_uses_rw_bit_and_mock_model(void)
 {
+{% if primary_bus and cs_label %}
     uint8_t b = 0;
-    spi_handle_t h = spi_open("spi1", NULL);
+    spi_handle_t h = spi_open(BUS_PRIMARY, NULL);
 
     mock_spi_set_reg(0x75, 0x70);              /* WHO_AM_I */
     TEST_ASSERT_EQUAL_INT(0, spi_read_reg(h, "{{ cs_label }}", 0x75, &b, 1, 0));
     TEST_ASSERT_EQUAL_UINT8(0x70, b);
     TEST_ASSERT_EQUAL_UINT32(1, mock_spi_read_count());
+{% else %}
+    TEST_IGNORE_MESSAGE("本配置没有带片选脚的 SPI 器件");
+{% endif %}
 }
 
 void test_write_reg_updates_mock_model(void)
 {
+{% if primary_bus and cs_label %}
     uint8_t val = 0x42;
-    spi_handle_t h = spi_open("spi1", NULL);
+    spi_handle_t h = spi_open(BUS_PRIMARY, NULL);
 
     mock_spi_set_reg(0x00, 0x00);            /* mark device present */
     TEST_ASSERT_EQUAL_INT(0, spi_write_reg(h, "{{ cs_label }}", 0x1B, &val, 1, 0));
     TEST_ASSERT_EQUAL_UINT8(0x42, mock_spi_get_reg(0x1B));
     TEST_ASSERT_EQUAL_UINT32(1, mock_spi_write_count());
+{% else %}
+    TEST_IGNORE_MESSAGE("本配置没有带片选脚的 SPI 器件");
+{% endif %}
 }
 
 void test_multi_byte_read_autoincrements(void)
 {
+{% if primary_bus and cs_label %}
     uint8_t out[4] = {0};
     uint8_t img[8] = {0x01, 0x02, 0x03, 0x04};
-    spi_handle_t h = spi_open("spi1", NULL);
+    spi_handle_t h = spi_open(BUS_PRIMARY, NULL);
 
     mock_spi_load_image(img, sizeof(img));
     TEST_ASSERT_EQUAL_INT(0, spi_read_reg(h, "{{ cs_label }}", 0x00, out, 4, 0));
     TEST_ASSERT_EQUAL_UINT8_ARRAY(img, out, 4);
+{% else %}
+    TEST_IGNORE_MESSAGE("本配置没有带片选脚的 SPI 器件");
+{% endif %}
 }
 
 void test_raw_transfer_roundtrip(void)
 {
+{% if primary_bus and cs_label %}
     uint8_t tx[3] = {0x80, 0x00, 0x00};
     uint8_t rx[3] = {0};
-    spi_handle_t h = spi_open("spi1", NULL);
+    spi_handle_t h = spi_open(BUS_PRIMARY, NULL);
 
     mock_spi_set_reg(0x00, 0xAA);
     TEST_ASSERT_EQUAL_INT(0, spi_transfer(h, "{{ cs_label }}", tx, rx, 3, 0));
     TEST_ASSERT_EQUAL_UINT8(0x00, rx[0]);
     TEST_ASSERT_EQUAL_UINT8(0xAA, rx[1]);
+{% else %}
+    TEST_IGNORE_MESSAGE("本配置没有带片选脚的 SPI 器件");
+{% endif %}
 }
 
 void test_api_rejects_bad_args(void)
 {
+{% if primary_bus and cs_label %}
     uint8_t b;
     TEST_ASSERT_NOT_EQUAL(0, spi_read_reg(NULL, "{{ cs_label }}", 0x00, &b, 1, 0));
-    TEST_ASSERT_NOT_EQUAL(0, spi_read_reg(spi_open("spi1", NULL), "{{ cs_label }}",
+    TEST_ASSERT_NOT_EQUAL(0, spi_read_reg(spi_open(BUS_PRIMARY, NULL), "{{ cs_label }}",
                                           0x00, NULL, 0, 0));
-    TEST_ASSERT_NOT_EQUAL(0, spi_read_reg(spi_open("spi1", NULL), "nopin",
+    TEST_ASSERT_NOT_EQUAL(0, spi_read_reg(spi_open(BUS_PRIMARY, NULL), "nopin",
                                           0x00, &b, 1, 0));
+{% else %}
+    uint8_t b;
+    /* 没有器件时仍要能拒绝空句柄与空名 */
+    TEST_ASSERT_NOT_EQUAL(0, spi_read_reg(NULL, "nopin", 0x00, &b, 1, 0));
+{% endif %}
 }
 
 int main(void)

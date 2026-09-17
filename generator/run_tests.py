@@ -2,6 +2,9 @@
 """
 Hardware2Code Unit Test Runner (with optional coverage support)
 Compiles and runs all test executables using native gcc.
+
+Runs every test before reporting: a single compile/run failure no longer
+hides the rest (see the comment in main()).
 Usage: python run_tests.py [--coverage] [--gcc-path PATH]
 GCC path can be set via:
   1. --gcc-path command line argument
@@ -150,16 +153,31 @@ def main():
         print("No test_*.c files found.")
         sys.exit(1)
 
+    # 跑完全部用例再汇总失败清单。
+    #
+    # 早先这里是"遇到第一个失败就 sys.exit(1)"，结果是：一个工程里同时坏了
+    # 三个用例时，只看这个脚本会让人以为"只有一个问题"。修掉第一个之后
+    # 以为完事了，第二个才浮出来 —— 排查成本被这个"提前退出"放大了好几倍。
+    results = []
     for test in tests:
         if not compile_test(test, coverage=args.coverage):
-            sys.exit(1)
-        if not run_test(test):
-            sys.exit(1)
+            results.append((test, "compile-failed"))
+            continue
+        results.append((test, "ok" if run_test(test) else "run-failed"))
 
     if args.coverage:
         generate_coverage_report()
 
-    print("All tests passed.")
+    failed = [(name, status) for name, status in results if status != "ok"]
+    if failed:
+        print("=" * 64)
+        print(f"{len(failed)}/{len(results)} 个测试未通过：")
+        for name, status in failed:
+            print(f"  - {name}: {status}")
+        print("=" * 64)
+        sys.exit(1)
+
+    print(f"All {len(results)} tests passed.")
 
 
 if __name__ == "__main__":

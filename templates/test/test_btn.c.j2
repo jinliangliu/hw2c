@@ -30,6 +30,85 @@ Auto-generated — do not edit manually.
 
 /* ---- Stubs needed by included component sources ---- */
 uint32_t rtc_uptime_sec = 0;
+{% if has_persistent_params %}
+#include <string.h>
+#include "../src/drivers/nvm_param.h"
+
+/* ---- nvm_param 持久化层替身 ----
+ *
+ * param_registry.c 在"有 persistent 参数"时会调 nvm_param_load/save，真链是
+ *     param_registry → nvm_param → spi_flash（NOR 模型）
+ * 本用例只测按键手势，不测持久化，所以在这里给一个 RAM 版替身。
+ * 不这么做的话，测试根本链接不过（undefined reference to 'nvm_param_load'）。
+ *
+ * 语义必须与真实实现一致，**不能**做成"永远 NOT_FOUND"的空壳 —— 那样
+ * "存下来还能读回"这条路径在本用例里就永远没有意义（见 test_nvm_stub_*）：
+ *   · 没存过的 key          → NVM_PARAM_E_NOT_FOUND（param_init 于是保持编译期默认值）
+ *   · save 之后 load 同 key → 取回同样的字节
+ */
+#define NVM_STUB_SLOTS  16
+#define NVM_STUB_MAXLEN 16
+
+static struct {
+    uint16_t key;
+    uint16_t len;
+    uint8_t  used;
+    uint8_t  buf[NVM_STUB_MAXLEN];
+} g_nvm_stub[NVM_STUB_SLOTS];
+
+static void nvm_stub_reset(void)
+{
+    memset(g_nvm_stub, 0, sizeof(g_nvm_stub));
+}
+
+int nvm_param_load(uint16_t key, uint8_t *out, uint16_t max_len, uint16_t *out_len)
+{
+    if (out == NULL) {
+        return NVM_PARAM_E_ARG;
+    }
+    for (uint32_t i = 0; i < NVM_STUB_SLOTS; i++) {
+        if (g_nvm_stub[i].used && g_nvm_stub[i].key == key) {
+            if (g_nvm_stub[i].len > max_len) {
+                return NVM_PARAM_E_SIZE;
+            }
+            memcpy(out, g_nvm_stub[i].buf, g_nvm_stub[i].len);
+            if (out_len != NULL) {
+                *out_len = g_nvm_stub[i].len;
+            }
+            return NVM_PARAM_OK;
+        }
+    }
+    return NVM_PARAM_E_NOT_FOUND;
+}
+
+int nvm_param_save(uint16_t key, const uint8_t *data, uint16_t len)
+{
+    if (data == NULL || len == 0U) {
+        return NVM_PARAM_E_ARG;
+    }
+    if (len > NVM_STUB_MAXLEN) {
+        return NVM_PARAM_E_SIZE;
+    }
+    uint32_t slot = NVM_STUB_SLOTS;
+    for (uint32_t i = 0; i < NVM_STUB_SLOTS; i++) {
+        if (g_nvm_stub[i].used && g_nvm_stub[i].key == key) {
+            slot = i;            /* 同 key 覆盖写 */
+            break;
+        }
+        if (!g_nvm_stub[i].used && slot == NVM_STUB_SLOTS) {
+            slot = i;            /* 记住第一个空位，但继续找同 key */
+        }
+    }
+    if (slot == NVM_STUB_SLOTS) {
+        return NVM_PARAM_E_IO;   /* 槽位耗尽 */
+    }
+    g_nvm_stub[slot].key  = key;
+    g_nvm_stub[slot].len  = len;
+    g_nvm_stub[slot].used = 1U;
+    memcpy(g_nvm_stub[slot].buf, data, len);
+    return NVM_PARAM_OK;
+}
+{% endif %}
 
 /* ---- event_queue / btn_queue — defined here for btn_component.c ---- */
 QueueHandle_t event_queue = NULL;
@@ -62,6 +141,11 @@ void setUp(void)
     event_queue = (QueueHandle_t)0x1000;
     btn_queue    = (QueueHandle_t)0x2000;
 {% if has_params %}
+{% if has_persistent_params %}
+    /* 每个用例都从"空 NVM"起步，否则持久化参数会跨用例串味；
+     * 必须在 param_init()（它会 load）之前清。 */
+    nvm_stub_reset();
+{% endif %}
     param_init();
 {% endif %}
 }
@@ -245,6 +329,44 @@ void test_btn_terminate_clears_context(void)
     btn_terminate(&btn_comp);
     /* Context should have been cleared */
 }
+{% if has_persistent_params %}
+
+/* --------------------------------------------------------------------------
+ * 持久化层替身自检
+ *
+ * 这两条**不是**在测按键，而是钉住替身的语义：如果哪天有人把替身改成
+ * "永远返回 NOT_FOUND"的空壳，或者干脆删掉 save，这里会立刻变红 ——
+ * 否则替身退化了也没人知道，而 param_init() 的 load 分支就再没被走过。
+ * -------------------------------------------------------------------------- */
+
+void test_nvm_stub_load_of_absent_key_reports_not_found(void)
+{
+    uint8_t r[4] = {0};
+    uint16_t n = 0;
+    TEST_ASSERT_EQUAL_INT(NVM_PARAM_E_NOT_FOUND, nvm_param_load(0x1234U, r, sizeof(r), &n));
+}
+
+void test_nvm_stub_save_then_load_round_trips(void)
+{
+    uint8_t w[4] = {0x11, 0x22, 0x33, 0x44};
+    uint8_t r[4] = {0};
+    uint16_t n = 0;
+
+    TEST_ASSERT_EQUAL_INT(NVM_PARAM_OK, nvm_param_save(0x1234U, w, sizeof(w)));
+    TEST_ASSERT_EQUAL_INT(NVM_PARAM_OK, nvm_param_load(0x1234U, r, sizeof(r), &n));
+    TEST_ASSERT_EQUAL_UINT16(sizeof(w), n);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(w, r, sizeof(w));
+
+    /* 同 key 覆盖写：取回的必须是后写的值 */
+    uint8_t w2[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    TEST_ASSERT_EQUAL_INT(NVM_PARAM_OK, nvm_param_save(0x1234U, w2, sizeof(w2)));
+    TEST_ASSERT_EQUAL_INT(NVM_PARAM_OK, nvm_param_load(0x1234U, r, sizeof(r), &n));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(w2, r, sizeof(w2));
+
+    /* 另一个 key 不能读到它 */
+    TEST_ASSERT_EQUAL_INT(NVM_PARAM_E_NOT_FOUND, nvm_param_load(0x5678U, r, sizeof(r), &n));
+}
+{% endif %}
 
 /* --------------------------------------------------------------------------
  * Test runner
@@ -265,6 +387,10 @@ int main(void)
 
     RUN_TEST(test_btn_step_with_empty_queue_does_not_crash);
     RUN_TEST(test_btn_terminate_clears_context);
+{% if has_persistent_params %}
+    RUN_TEST(test_nvm_stub_load_of_absent_key_reports_not_found);
+    RUN_TEST(test_nvm_stub_save_then_load_round_trips);
+{% endif %}
 
     return UNITY_END();
 }

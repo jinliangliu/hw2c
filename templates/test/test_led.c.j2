@@ -4,6 +4,19 @@ test_led.c.j2 - LED component unit tests
 Tests multi-instance LED pattern driving, GPIO output correctness,
 and the full component lifecycle (init/step/terminate).
 
+## 观测契约：为什么"被测实例"必须是最后被写的那个
+
+`led_step()` 会按 0..LED_INSTANCE_COUNT-1 的顺序给**每个**实例写一次
+GPIO，而 mock 只能报告**全局最后一次写**（`mock_HAL_GPIO_WritePin_get_last_state()`）。
+所以"把图案设到实例 0，再读最后一次写"是错的：读到的是最后一个实例。
+
+更坏的是这个错**只在多 LED 板子上才暴露** —— 其它示例都只有 1 个 LED，
+"最后一次写"恰好就是实例 0，于是这条错位的断言一路都是绿的。
+（2026-09-17：mhde_mainboard 有 6 个 LED，4 条断言当场变红。）
+
+因此本文件一律用 PROBE_INDEX = LED_INSTANCE_COUNT-1（最后被写的那个实例）
+做图案设置与观测，并用它的极性推导 ON/OFF 电平。
+
 Auto-generated — do not edit manually.
 #}
 /**
@@ -12,12 +25,30 @@ Auto-generated — do not edit manually.
  *
  * Includes led_component.c via SIL pattern. Uses mock HAL GPIO to
  * verify that WritePin calls match expected patterns.
+ *
+ * 观测粒度提示：led_step() 依次写所有实例，而 mock 只记得**最后一次写**，
+ * 所以本文件用 PROBE_INDEX（最后一个实例）作探针。要测别的位置需要给 mock
+ * 加"按 (端口, 引脚) 锁存"的观测能力（真实 GPIO 的 ODR 就是按脚锁存的）。
  */
 
 #include "unity.h"
 #include "mock_hal.h"
+#include <string.h>
 #include "../src/component_registry.h"
 #include "../src/led_component.h"
+
+{% set led_count = led_pins | length %}
+{% set probe_index = led_count - 1 if led_count > 0 else 0 %}
+{% if led_count > 0 %}
+{% set probe = led_pins[probe_index] %}
+{% set probe_label = probe.label %}
+{% set probe_on  = 'GPIO_PIN_RESET' if probe.get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_SET' %}
+{% set probe_off = 'GPIO_PIN_SET' if probe.get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_RESET' %}
+{% else %}
+{% set probe_label = '' %}
+{% set probe_on  = 'GPIO_PIN_RESET' %}
+{% set probe_off = 'GPIO_PIN_SET' %}
+{% endif %}
 
 /* ---- Provide stubs needed by component_registry.h symbols used in led_component.c ---- */
 uint32_t rtc_uptime_sec = 0;
@@ -27,6 +58,12 @@ uint32_t rtc_uptime_sec = 0;
 
 /* ---- Test context ---- */
 static component_t led_comp;
+
+/* 被测实例：最后一个（见文件头"观测契约"） */
+#define PROBE_INDEX  (LED_INSTANCE_COUNT - 1u)
+#define PROBE_NAME   "{{ probe_label }}"
+#define PROBE_ON     ({{ probe_on }})
+#define PROBE_OFF    ({{ probe_off }})
 
 void setUp(void)
 {
@@ -46,28 +83,28 @@ void test_led_init_registers_all_instances(void)
     int ret = led_init(&led_comp, NULL);
     TEST_ASSERT_EQUAL_INT(0, ret);
     TEST_ASSERT_NOT_NULL(led_comp.ctx);
-{% set led_count = led_pins | length %}
-    TEST_ASSERT_EQUAL_UINT32({{ led_count }}, mock_HAL_GPIO_Init_get_count());
+    /* 实例表的长度以头里的宏为准：init 必须逐个初始化，一个都不能少 */
+    TEST_ASSERT_GREATER_THAN_UINT32(0, LED_INSTANCE_COUNT);
+    TEST_ASSERT_EQUAL_UINT32(LED_INSTANCE_COUNT, mock_HAL_GPIO_Init_get_count());
 }
 
 void test_led_init_sets_output_mode(void)
 {
     led_init(&led_comp, NULL);
-{% for _ in led_pins %}
-    TEST_ASSERT_EQUAL_UINT32(GPIO_MODE_OUTPUT_PP, mock_HAL_GPIO_Init_get_mode({{ loop.index0 }}));
-{% endfor %}
+    for (uint32_t i = 0; i < LED_INSTANCE_COUNT; i++) {
+        TEST_ASSERT_EQUAL_UINT32(GPIO_MODE_OUTPUT_PP, mock_HAL_GPIO_Init_get_mode(i));
+    }
 }
 
 void test_led_init_turns_all_off(void)
 {
     mock_HAL_GPIO_WritePin_reset();
     led_init(&led_comp, NULL);
-    /* After init, each LED should be written with OFF state */
-    TEST_ASSERT_GREATER_THAN_UINT32(0, mock_HAL_GPIO_WritePin_get_count());
-{% for lp in led_pins %}
-{% set off_state = 'GPIO_PIN_SET' if lp.get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_RESET' %}
-    /* Verify {{ lp.label }} was initialized */
-{% endfor %}
+
+    /* init 要逐个把 LED 写到灭态：写次数 = 实例数 */
+    TEST_ASSERT_EQUAL_UINT32(LED_INSTANCE_COUNT, mock_HAL_GPIO_WritePin_get_count());
+    /* 最后一次写落在探针实例上，其电平必须是该实例的灭态 */
+    TEST_ASSERT_EQUAL_UINT32(PROBE_OFF, mock_HAL_GPIO_WritePin_get_last_state());
 }
 
 /* --------------------------------------------------------------------------
@@ -77,29 +114,55 @@ void test_led_init_turns_all_off(void)
 void test_led_set_pattern_by_index_valid(void)
 {
     led_init(&led_comp, NULL);
-    led_set_pattern_by_index(0, LED_PATTERN_FAST_BLINK);
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_FAST_BLINK);
     /* No GPIO output yet — pattern only takes effect in step() */
     /* Test that out-of-range index is ignored (no crash) */
     led_set_pattern_by_index(99, LED_PATTERN_FAULT);
+    /* 越界索引不得改动任何实例的图案 */
+    mock_HAL_GPIO_WritePin_reset();
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_ON);
+    led_step(&led_comp);
+    TEST_ASSERT_EQUAL_UINT32(PROBE_ON, mock_HAL_GPIO_WritePin_get_last_state());
 }
 
 void test_led_set_pattern_by_name(void)
 {
     led_init(&led_comp, NULL);
-{% if led_pins | length > 0 %}
-    led_set_pattern_by_name("{{ led_pins[0].label }}", LED_PATTERN_SLOW_BLINK);
-{% endif %}
-    /* Test unknown name is ignored */
-    led_set_pattern_by_name("NONEXISTENT", LED_PATTERN_FAST_BLINK);
+    /* 按名字设置必须命中探针实例本身（否则下面观测不到效果） */
+    led_set_pattern_by_name(PROBE_NAME, LED_PATTERN_ON);
+
+    mock_HAL_GPIO_WritePin_reset();
+    led_step(&led_comp);
+    TEST_ASSERT_EQUAL_UINT32(PROBE_ON, mock_HAL_GPIO_WritePin_get_last_state());
+
+    /* Test unknown name is ignored — 图案不该被改动 */
+    led_set_pattern_by_name("NONEXISTENT", LED_PATTERN_OFF);
+    mock_HAL_GPIO_WritePin_reset();
+    led_step(&led_comp);
+    TEST_ASSERT_EQUAL_UINT32(PROBE_ON, mock_HAL_GPIO_WritePin_get_last_state());
 }
 
 void test_led_set_pattern_resets_tick(void)
 {
     led_init(&led_comp, NULL);
-    /* Advance a few steps to build up tick */
-    for (int i = 0; i < 5; i++) led_step(&led_comp);
-    /* Change pattern — tick should reset */
-    led_set_pattern_by_index(0, LED_PATTERN_FAST_BLINK);
+
+    /* 走到 tick=2：FAST_BLINK 在偶数 tick 亮、奇数 tick 灭 */
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_FAST_BLINK);
+    led_step(&led_comp);   /* tick 0 → ON  */
+    led_step(&led_comp);   /* tick 1 → OFF */
+
+    /* 换图案必须把 tick 归零（归零后 tick=0 → ON；没归零则 tick=2 也是 ON，
+     * 所以这里用 FAULT 起手，把 tick 推到非零且相位为灭的位置再切回来） */
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_FAULT);
+    led_step(&led_comp);   /* tick 0 → ON */
+    led_step(&led_comp);   /* tick 1 → ON */
+    led_step(&led_comp);   /* tick 2 → OFF，此处 tick=3 */
+
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_FAST_BLINK);
+    mock_HAL_GPIO_WritePin_reset();
+    led_step(&led_comp);
+    /* tick 未归零的话这里是 tick=3 → 奇数 → OFF */
+    TEST_ASSERT_EQUAL_UINT32(PROBE_ON, mock_HAL_GPIO_WritePin_get_last_state());
 }
 
 /* --------------------------------------------------------------------------
@@ -109,22 +172,19 @@ void test_led_set_pattern_resets_tick(void)
 void test_led_step_off_outputs_low(void)
 {
     led_init(&led_comp, NULL);
-    led_set_pattern_by_index(0, LED_PATTERN_OFF);
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_OFF);
 
     mock_HAL_GPIO_WritePin_reset();
     for (int i = 0; i < 10; i++) led_step(&led_comp);
 
-{% if led_pins | length > 0 %}
-{% set off_state = 'GPIO_PIN_SET' if led_pins[0].get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_RESET' %}
     /* OFF pattern should always write OFF state */
-    TEST_ASSERT_EQUAL_UINT32({{ off_state }}, mock_HAL_GPIO_WritePin_get_last_state());
-{% endif %}
+    TEST_ASSERT_EQUAL_UINT32(PROBE_OFF, mock_HAL_GPIO_WritePin_get_last_state());
 }
 
 void test_led_step_fast_blink_toggles(void)
 {
     led_init(&led_comp, NULL);
-    led_set_pattern_by_index(0, LED_PATTERN_FAST_BLINK);
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_FAST_BLINK);
 
     mock_HAL_GPIO_WritePin_reset();
     led_step(&led_comp);
@@ -135,75 +195,74 @@ void test_led_step_fast_blink_toggles(void)
     uint32_t state1 = mock_HAL_GPIO_WritePin_get_last_state();
 
     /* FAST_BLINK: tick 0 → ON, tick 1 → OFF */
+    TEST_ASSERT_EQUAL_UINT32(PROBE_ON, state0);
+    TEST_ASSERT_EQUAL_UINT32(PROBE_OFF, state1);
     TEST_ASSERT_NOT_EQUAL_UINT32(state0, state1);
 }
 
 void test_led_step_on_stays_on_and_toggle_pattern(void)
 {
     led_init(&led_comp, NULL);
-{% if led_pins | length > 0 %}
-{% set on_state = 'GPIO_PIN_RESET' if led_pins[0].get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_SET' %}
-{% set off_state = 'GPIO_PIN_SET' if led_pins[0].get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_RESET' %}
-    led_set_pattern_by_index(0, LED_PATTERN_ON);
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_ON);
 
     mock_HAL_GPIO_WritePin_reset();
     led_step(&led_comp);
-    TEST_ASSERT_EQUAL_UINT32({{ on_state }}, mock_HAL_GPIO_WritePin_get_last_state());
+    TEST_ASSERT_EQUAL_UINT32(PROBE_ON, mock_HAL_GPIO_WritePin_get_last_state());
     mock_HAL_GPIO_WritePin_reset();
     led_step(&led_comp);
-    TEST_ASSERT_EQUAL_UINT32({{ on_state }}, mock_HAL_GPIO_WritePin_get_last_state());
+    TEST_ASSERT_EQUAL_UINT32(PROBE_ON, mock_HAL_GPIO_WritePin_get_last_state());
 
     /* toggle -> OFF, step stays off */
-    led_toggle_pattern(0);
+    led_toggle_pattern(PROBE_INDEX);
     mock_HAL_GPIO_WritePin_reset();
     led_step(&led_comp);
-    TEST_ASSERT_EQUAL_UINT32({{ off_state }}, mock_HAL_GPIO_WritePin_get_last_state());
-{% endif %}
+    TEST_ASSERT_EQUAL_UINT32(PROBE_OFF, mock_HAL_GPIO_WritePin_get_last_state());
 }
 
 void test_led_step_slow_blink_duty_cycle(void)
 {
     led_init(&led_comp, NULL);
-    led_set_pattern_by_index(0, LED_PATTERN_SLOW_BLINK);
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_SLOW_BLINK);
 
-    /* SLOW_BLINK: 5 ticks ON, 5 ticks OFF */
+    /* SLOW_BLINK: (tick % 10) < 5 → ON，即前 5 tick 亮、后 5 tick 灭 */
     int on_count = 0, off_count = 0;
-{% if led_pins | length > 0 %}
-{% set on_state = 'GPIO_PIN_RESET' if led_pins[0].get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_SET' %}
-{% set off_state = 'GPIO_PIN_SET' if led_pins[0].get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_RESET' %}
     for (int i = 0; i < 10; i++) {
         mock_HAL_GPIO_WritePin_reset();
         led_step(&led_comp);
-        if (mock_HAL_GPIO_WritePin_get_last_state() == {{ on_state }}) on_count++;
+        if (mock_HAL_GPIO_WritePin_get_last_state() == PROBE_ON) on_count++;
         else off_count++;
     }
     TEST_ASSERT_EQUAL_INT(5, on_count);
     TEST_ASSERT_EQUAL_INT(5, off_count);
-{% endif %}
 }
 
 void test_led_step_fault_has_three_short_one_long(void)
 {
     led_init(&led_comp, NULL);
-    led_set_pattern_by_index(0, LED_PATTERN_FAULT);
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_FAULT);
 
     /* FAULT: 32-tick cycle (1600ms). Verify first 32 ticks.
      *   ON:  0-1,  4-5,  8-9  (three short)
      *   ON: 12-21              (one long)
      *   OFF otherwise
      */
-{% if led_pins | length > 0 %}
-{% set on_state = 'GPIO_PIN_RESET' if led_pins[0].get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_SET' %}
-{% set off_state = 'GPIO_PIN_SET' if led_pins[0].get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_RESET' %}
     int on_count = 0;
     for (int i = 0; i < 32; i++) {
         mock_HAL_GPIO_WritePin_reset();
         led_step(&led_comp);
-        if (mock_HAL_GPIO_WritePin_get_last_state() == {{ on_state }}) on_count++;
+        if (mock_HAL_GPIO_WritePin_get_last_state() == PROBE_ON) on_count++;
     }
     /* 3*2 + 1*10 = 16 ON ticks, 16 OFF ticks */
     TEST_ASSERT_EQUAL_INT(16, on_count);
-{% endif %}
+
+    /* 第二圈必须与第一圈完全同相（32 tick 周期） */
+    int on_count_2 = 0;
+    for (int i = 0; i < 32; i++) {
+        mock_HAL_GPIO_WritePin_reset();
+        led_step(&led_comp);
+        if (mock_HAL_GPIO_WritePin_get_last_state() == PROBE_ON) on_count_2++;
+    }
+    TEST_ASSERT_EQUAL_INT(on_count, on_count_2);
 }
 
 /* --------------------------------------------------------------------------
@@ -214,7 +273,7 @@ void test_led_toggle_flips_pin(void)
 {
     led_init(&led_comp, NULL);
     mock_HAL_GPIO_WritePin_reset();
-    led_toggle(0);
+    led_toggle(PROBE_INDEX);
 
     /* Toggle out-of-range index (no crash) */
     led_toggle(99);
@@ -227,16 +286,18 @@ void test_led_toggle_flips_pin(void)
 void test_led_terminate_turns_all_off(void)
 {
     led_init(&led_comp, NULL);
-    led_set_pattern_by_index(0, LED_PATTERN_FAST_BLINK);
+    led_set_pattern_by_index(PROBE_INDEX, LED_PATTERN_FAST_BLINK);
 
     mock_HAL_GPIO_WritePin_reset();
     led_terminate(&led_comp);
 
-{% if led_pins | length > 0 %}
-{% set off_state = 'GPIO_PIN_SET' if led_pins[0].get('active_level', 'high').lower() == 'low' else 'GPIO_PIN_RESET' %}
     /* After terminate, last write should be OFF */
-    TEST_ASSERT_EQUAL_UINT32({{ off_state }}, mock_HAL_GPIO_WritePin_get_last_state());
-{% endif %}
+    TEST_ASSERT_EQUAL_UINT32(PROBE_OFF, mock_HAL_GPIO_WritePin_get_last_state());
+
+    /* terminate 之后 step 不得再驱动任何引脚 */
+    mock_HAL_GPIO_WritePin_reset();
+    led_step(&led_comp);
+    TEST_ASSERT_EQUAL_UINT32(0, mock_HAL_GPIO_WritePin_get_count());
 }
 
 /* --------------------------------------------------------------------------
