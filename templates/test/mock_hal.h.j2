@@ -410,6 +410,21 @@ extern TIM_TypeDef mock_tim2_dev;
 /* ======================================================================
  * IWDG stubs
  * ====================================================================== */
+
+/* 寄存器模型：bootloader 在跳转 App 前会直接写 `IWDG->KR` 刷新看门狗
+ * （它不能用 HAL —— 那一刻 HAL 还未初始化）。因此 IWDG 必须是**真的寄存器
+ * 模型**而不是 `((void *)0)`，否则 boot_jump.c 在 TEST 构建里根本编不过。 */
+typedef struct {
+    __IO uint32_t KR;      /* Key register：0xAAAA 刷新，0x5555 解锁，0xCCCC 启动 */
+    __IO uint32_t PR;      /* Prescaler */
+    __IO uint32_t RLR;     /* Reload */
+    __IO uint32_t SR;      /* Status */
+    __IO uint32_t WINR;    /* Window */
+} IWDG_TypeDef;
+
+#define IWDG_BASE   (0x40003000UL)
+extern volatile IWDG_TypeDef *IWDG;
+
 typedef struct {
     uint32_t Prescaler;
     uint32_t Reload;
@@ -417,11 +432,10 @@ typedef struct {
 } IWDG_InitTypeDef;
 
 typedef struct {
-    void          *Instance;
+    IWDG_TypeDef     *Instance;
     IWDG_InitTypeDef Init;
 } IWDG_HandleTypeDef;
 
-#define IWDG  ((void *)0)
 #define IWDG_PRESCALER_256    6
 #define IWDG_WINDOW_DISABLE   0x0FFF
 

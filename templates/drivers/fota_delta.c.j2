@@ -73,6 +73,16 @@ static uint16_t rd_u16(const uint8_t *p)
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
+/** 小端写入 u32。刻意不用指针强转：镜像头是 4 字节对齐的，但用逐字节写
+ *  既避开了 ARMv6-M 上非对齐访问的坑，也不依赖主机的字节序。 */
+static void wr_u32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFU);
+    p[1] = (uint8_t)((v >> 8) & 0xFFU);
+    p[2] = (uint8_t)((v >> 16) & 0xFFU);
+    p[3] = (uint8_t)((v >> 24) & 0xFFU);
+}
+
 /* CRC-16/CCITT-FALSE：init=0xFFFF，不反射，无终值异或。与 Python 侧一致。 */
 static uint16_t crc16_ccitt_false(const uint8_t *data, uint32_t len)
 {
@@ -245,8 +255,8 @@ static int flush_page(delta_ctx_t *c)
     }
     len = (c->page_fill + 7U) & ~7UL;              /* 双字对齐 */
 
-    /* 头部回填窗口保持擦除态：差分流在那儿放的是 0xFFFFFFFF 占位，
-     * 真正的值由 FLUSH 阶段单独编程（Flash 只能 1→0）。 */
+    /* 头部窗口保持擦除态：整头由 FLUSH 阶段独占写入（Flash 只能 1→0，
+     * 且 image_size/crc32 此时还算不出来）。见 FOTA_HDR_HOLE_* 的注释。 */
     if (c->page_start < FOTA_HDR_HOLE_OFF + FOTA_HDR_HOLE_LEN
         && c->page_start + len > FOTA_HDR_HOLE_OFF) {
         memset(&c->page_buf[FOTA_HDR_HOLE_OFF - c->page_start], 0xFF,
@@ -257,20 +267,27 @@ static int flush_page(delta_ctx_t *c)
     if (rc != 0) {
         return FOTA_DELTA_E_IO;
     }
-    c->page_start += c->page_fill;
+    /* 推进到**编程长度**（含尾部对齐填充），而不是逻辑填充字节数：
+     * program() 的前置条件是 8 字节对齐，下一页必须从对齐边界开始，
+     * 否则只有"最后一页恰好不写第二遍"这一点偶然性在兜底。 */
+    c->page_start += len;
     c->page_fill   = 0U;
     return FOTA_DELTA_OK;
 }
 
 /** 把 [abs, abs+len) 与 CRC 覆盖区的交集喂给 CRC。
  *
- * 覆盖区 = `[magic, payload_end)` = `[0xC8, 0xD0 + code_size)`，即槽内偏移
- * 从 `FOTA_CRC_REGION_START` 到 `new_size`。刻意排除 `image_size`/`crc32`：
- * 它们要事后回填，而 CRC 必须在回填**之前**就能算出 —— 这也让设备可以直接
- * 把这个值当作镜像头的 crc32 字段。 */
+ * 覆盖区 = `[magic, payload_end)` = `[0xC8, 0xD0 + code_size)`。两段来源不同：
+ *
+ *   · **头部尾段** `[magic, payload)`（magic + fw_version）由设备按信封内容
+ *     在解码**之前**一次性喂入（见 feed_header_tail()）—— 因为设备写的头
+ *     就是这个值，头尾两段必须自洽，而不该去读流里那份"同一个逻辑值"的副本。
+ *   · **代码区** `[payload, new_size)` 由流顺序产生，即本函数的窗口。
+ *
+ * 于是本函数只接受 payload 区间；`image_size`/`crc32` 本就不在覆盖区里。 */
 static void feed_crc(delta_ctx_t *c, uint32_t abs, const uint8_t *data, uint32_t len)
 {
-    uint32_t region_start = c->dst_slot + FOTA_CRC_REGION_START;
+    uint32_t region_start = c->dst_slot + FOTA_IMG_PAYLOAD_OFF;
     uint32_t region_end   = c->dst_slot + c->new_size;
     uint32_t skip = 0U;
     uint32_t keep;
@@ -285,6 +302,33 @@ static void feed_crc(delta_ctx_t *c, uint32_t abs, const uint8_t *data, uint32_t
     if (keep > 0U) {
         c->crc = fota_delta_crc32_update(c->crc, data + skip, keep);
     }
+}
+
+/** 喂入覆盖区最前面的头部尾段（magic + fw_version），必须在解码前调用。
+ *
+ * 这 8 个字节是设备自己写的，所以 CRC 里也必须放**设备写的值** ——
+ * 若改成从流里读，就又变回"依赖流里那份副本与信封一致"。
+ *
+ * 下标算式：`FOTA_IMG_OFF_*` 是**头部内**偏移，而 tail[] 装的是
+ * `[FOTA_HDR_TAIL_OFF, FOTA_IMG_PAYLOAD_OFF)` 这一段，所以必须先加回
+ * `FOTA_IMG_HDR_OFF`（头部起点在槽内的偏移）再减去 tail 的起点。
+ * 少这一项会得到负数下标 —— L6 测试台第一次跑就在这里段错误。 */
+static void feed_header_tail(delta_ctx_t *c, uint32_t fw_version)
+{
+    uint8_t tail[FOTA_HDR_TAIL_LEN];
+    uint32_t i;
+
+    if ((uint32_t)sizeof(tail) != (uint32_t)FOTA_HDR_TAIL_LEN) {
+        return;                       /* 尺寸由真源决定，apply 入口已断言 */
+    }
+    for (i = 0U; i < (uint32_t)sizeof(tail); i++) {
+        tail[i] = 0xFFU;              /* 未覆盖的字节不该出现，但别留垃圾 */
+    }
+    (void)wr_u32(&tail[FOTA_IMG_HDR_OFF + FOTA_IMG_OFF_MAGIC - FOTA_HDR_TAIL_OFF],
+                 FOTA_IMG_MAGIC);
+    (void)wr_u32(&tail[FOTA_IMG_HDR_OFF + FOTA_IMG_OFF_FW_VERSION - FOTA_HDR_TAIL_OFF],
+                 fw_version & FOTA_IMG_VERSION_MASK);
+    c->crc = fota_delta_crc32_update(c->crc, tail, (uint32_t)sizeof(tail));
 }
 
 /** HPatchLite 的 write_new：顺序字节 → 页缓冲 + CRC 累积。 */
@@ -411,11 +455,21 @@ int fota_delta_apply(const fota_delta_env_t *env,
     hpi_pos_t           lite_unc_size = 0;
     hpi_size_t          cache_size;
     uint32_t            code_size;
-    uint8_t             hdr[FOTA_IMG_HDR_SIZE];
+    uint8_t             src_hdr[FOTA_IMG_HDR_SIZE];
+    uint8_t             new_hdr[FOTA_HDR_HOLE_LEN];
     int                 rc;
 
     if (env == NULL || io == NULL || io->patch_read == NULL || io->read == NULL
         || io->erase == NULL || io->program == NULL) {
+        if (out_err != NULL) { *out_err = FOTA_DELTA_E_ARG; }
+        return FOTA_DELTA_E_ARG;
+    }
+    /* 设备独占写入的窗口必须**恰好**是整头：否则"掉电后 magic 恒非法"这条
+     * 不变量不再成立（见 drv_fota_delta.h 的 FOTA_HDR_HOLE_* 说明）。 */
+    if ((uint32_t)FOTA_HDR_HOLE_LEN != (uint32_t)FOTA_IMG_HDR_SIZE
+        || (uint32_t)FOTA_HDR_HOLE_OFF != (uint32_t)FOTA_IMG_HDR_OFF
+        || (uint32_t)FOTA_HDR_TAIL_LEN
+           != (uint32_t)(FOTA_IMG_PAYLOAD_OFF - FOTA_HDR_TAIL_OFF)) {
         if (out_err != NULL) { *out_err = FOTA_DELTA_E_ARG; }
         return FOTA_DELTA_E_ARG;
     }
@@ -426,16 +480,21 @@ int fota_delta_apply(const fota_delta_env_t *env,
         if (out_err != NULL) { *out_err = FOTA_DELTA_E_TOO_BIG; }
         return FOTA_DELTA_E_TOO_BIG;
     }
+    if ((env->new_size < FOTA_IMG_PAYLOAD_OFF)
+        || ((env->new_size - FOTA_IMG_PAYLOAD_OFF) % 8U != 0U)) {
+        if (out_err != NULL) { *out_err = FOTA_DELTA_E_TOO_SHORT; }
+        return FOTA_DELTA_E_TOO_SHORT;   /* payload 必须非空且 8 字节对齐 */
+    }
 
     /* ---- 7.1 校验活动槽（不写任何 Flash）--------------------------------- */
-    io->read(io->ctx, src_slot + FOTA_IMG_HDR_OFF, hdr, FOTA_IMG_HDR_SIZE);
-    if (rd_u32(&hdr[FOTA_IMG_OFF_MAGIC]) != FOTA_IMG_MAGIC) {
+    io->read(io->ctx, src_slot + FOTA_IMG_HDR_OFF, src_hdr, FOTA_IMG_HDR_SIZE);
+    if (rd_u32(&src_hdr[FOTA_IMG_OFF_MAGIC]) != FOTA_IMG_MAGIC) {
         if (out_err != NULL) { *out_err = FOTA_DELTA_E_IMAGE_HEAD; }
         return FOTA_DELTA_E_IMAGE_HEAD;
     }
     /* 活动槽实况必须与信封声明一致（长度 + CRC 双重确认），确保补丁是针对
      * "设备上这一版"生成的 —— 拿错版本去差分，产物即使 CRC 自洽也是错的。 */
-    if (rd_u32(&hdr[FOTA_IMG_OFF_IMAGE_SIZE]) + FOTA_IMG_PAYLOAD_OFF != env->old_size) {
+    if (rd_u32(&src_hdr[FOTA_IMG_OFF_IMAGE_SIZE]) + FOTA_IMG_PAYLOAD_OFF != env->old_size) {
         if (out_err != NULL) { *out_err = FOTA_DELTA_E_OLD_SIZE; }
         return FOTA_DELTA_E_OLD_SIZE;
     }
@@ -479,6 +538,15 @@ int fota_delta_apply(const fota_delta_env_t *env,
     c.new_size = env->new_size;
     c.page_buf = s_page_buf;
     c.crc      = FOTA_CRC32_INIT;
+
+    /* 设备独占写入的整头：magic 与 fw_version 现在就定下来（fw_version 来自
+     * 信封），image_size 与 crc32 等解码结束再填。这样"写进去的头"与
+     * "算出来的 CRC"同源，不依赖流里那份副本。 */
+    memset(new_hdr, 0xFF, sizeof(new_hdr));
+    (void)wr_u32(&new_hdr[FOTA_IMG_OFF_MAGIC], FOTA_IMG_MAGIC);
+    (void)wr_u32(&new_hdr[FOTA_IMG_OFF_FW_VERSION],
+                 env->fw_version & FOTA_IMG_VERSION_MASK);
+    feed_header_tail(&c, env->fw_version);
 
     listener = &c.base;
     listener->read_old  = delta_read_old;
@@ -555,8 +623,9 @@ int fota_delta_apply(const fota_delta_env_t *env,
         return rc;
     }
 
-    /* 此刻 c.crc 就是覆盖区的 CRC。它在**回填之前**算出，而覆盖区刻意排除了
-     * image_size/crc32 ⇒ 回填不改变它 ⇒ 可以直接当镜像头的 crc32 字段用。 */
+    /* 此刻 c.crc 覆盖区 CRC 的累计值已经在头尾两段上就位：头部尾段（magic +
+     * fw_version）在解码前由 feed_header_tail() 喂入，代码区由 feed_crc()
+     * 顺序喂入。覆盖区刻意排除 image_size/crc32 ⇒ 现在才写入它们不影响结果。 */
     c.crc ^= FOTA_CRC32_FINAL_XOR;
     if (c.crc != env->new_crc32) {
         if (out_err != NULL) { *out_err = FOTA_DELTA_E_CRC; }
@@ -564,34 +633,32 @@ int fota_delta_apply(const fota_delta_env_t *env,
     }
 
     code_size = env->new_size - FOTA_IMG_PAYLOAD_OFF;
-    {
-        uint8_t hole[FOTA_HDR_HOLE_LEN];
-        hole[0] = (uint8_t)(code_size & 0xFFU);
-        hole[1] = (uint8_t)((code_size >> 8) & 0xFFU);
-        hole[2] = (uint8_t)((code_size >> 16) & 0xFFU);
-        hole[3] = (uint8_t)((code_size >> 24) & 0xFFU);
-        hole[4] = (uint8_t)(env->new_crc32 & 0xFFU);
-        hole[5] = (uint8_t)((env->new_crc32 >> 8) & 0xFFU);
-        hole[6] = (uint8_t)((env->new_crc32 >> 16) & 0xFFU);
-        hole[7] = (uint8_t)((env->new_crc32 >> 24) & 0xFFU);
-        if (io->program(io->ctx, dst_slot + FOTA_HDR_HOLE_OFF,
-                        hole, FOTA_HDR_HOLE_LEN) != 0) {
-            if (out_err != NULL) { *out_err = FOTA_DELTA_E_IO; }
-            return FOTA_DELTA_E_IO;
-        }
+    (void)wr_u32(&new_hdr[FOTA_IMG_OFF_IMAGE_SIZE], code_size);
+    (void)wr_u32(&new_hdr[FOTA_IMG_OFF_CRC32], env->new_crc32);
+
+    /* FLUSH：整头一次写入。**在这一步之前，目标槽头部恒为 0xFFFFFFFF** ——
+     * 于是任何时刻掉电都不会留下一个 magic 合法的目标槽。 */
+    if (io->program(io->ctx, dst_slot + FOTA_HDR_HOLE_OFF,
+                    new_hdr, FOTA_HDR_HOLE_LEN) != 0) {
+        if (out_err != NULL) { *out_err = FOTA_DELTA_E_IO; }
+        return FOTA_DELTA_E_IO;
     }
     if (io->watchdog != NULL) {
         io->watchdog(io->ctx);
     }
 
-    /* fw_version 必须与镜像头里的一致。镜像头由 patch_crc.py 写入（在 new 侧
-     * 参与差分），信封里也有一份 —— 不一致说明补丁是拼错的，
-     * 属于"必须拒绝"而不是"以谁为准"。 */
-    io->read(io->ctx, dst_slot + FOTA_IMG_HDR_OFF, hdr, FOTA_IMG_HDR_SIZE);
-    if ((rd_u32(&hdr[FOTA_IMG_OFF_FW_VERSION]) & FOTA_IMG_VERSION_MASK)
-        != env->fw_version) {
-        if (out_err != NULL) { *out_err = FOTA_DELTA_E_CRC; }
-        return FOTA_DELTA_E_CRC;
+    /* 回读整个头部并逐字段复核：编程是否真的落盘（含总线/页状态异常）。
+     * 这是"写成功"的唯一判据 —— 写入 API 返回 0 只说明它认为自己成功了。 */
+    {
+        uint8_t readback[FOTA_HDR_HOLE_LEN];
+        uint32_t i;
+        io->read(io->ctx, dst_slot + FOTA_HDR_HOLE_OFF, readback, FOTA_HDR_HOLE_LEN);
+        for (i = 0U; i < (uint32_t)FOTA_HDR_HOLE_LEN; i++) {
+            if (readback[i] != new_hdr[i]) {
+                if (out_err != NULL) { *out_err = FOTA_DELTA_E_IO; }
+                return FOTA_DELTA_E_IO;
+            }
+        }
     }
 
     /* ---- 7.6 VERIFY：回读复算（唯一能发现静默损坏的判据）---------------- */

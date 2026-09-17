@@ -5,7 +5,13 @@
  */
 
 #include "boot_jump.h"
+#ifdef TEST
+/* 主机单测：mock_hal.h 提供 NVIC/SCB/SysTick/IWDG 寄存器模型与
+ * __disable_irq/__set_MSP/__DSB/__ISB 空实现（见 test/mock_hal.h）。 */
+#include "mock_hal.h"
+#else
 #include "stm32g0xx.h"
+#endif
 
 /**
  * @brief  跳转到应用程序

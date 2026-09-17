@@ -11,6 +11,7 @@ static volatile TAMP_TypeDef mock_tamp_regs;
 static volatile SCB_TypeDef  mock_scb_regs;
 static volatile NVIC_TypeDef mock_nvic_regs;
 static volatile SysTick_TypeDef mock_systick_regs;
+static volatile IWDG_TypeDef mock_iwdg_regs;
 
 volatile CRC_TypeDef  *CRC  = &mock_crc_regs;
 volatile PWR_TypeDef  *PWR  = &mock_pwr_regs;
@@ -19,6 +20,7 @@ volatile TAMP_TypeDef *TAMP = &mock_tamp_regs;
 volatile SCB_TypeDef  *SCB  = &mock_scb_regs;
 volatile NVIC_TypeDef *NVIC = &mock_nvic_regs;
 volatile SysTick_TypeDef *SysTick = &mock_systick_regs;
+volatile IWDG_TypeDef *IWDG = &mock_iwdg_regs;
 
 void mock_cmsis_reset(void)
 {
@@ -29,6 +31,7 @@ void mock_cmsis_reset(void)
     memset((void *)&mock_scb_regs, 0, sizeof(mock_scb_regs));
     memset((void *)&mock_nvic_regs, 0, sizeof(mock_nvic_regs));
     memset((void *)&mock_systick_regs, 0, sizeof(mock_systick_regs));
+    memset((void *)&mock_iwdg_regs, 0, sizeof(mock_iwdg_regs));
 }
 
 /* External variables */

@@ -132,6 +132,45 @@ def test_crc_region_covers_magic_and_version(img):
 # 2. 链接脚本模板与 boot_crc 都对齐真源
 # ---------------------------------------------------------------------------
 
+def test_device_exclusive_header_window_covers_the_whole_image_header():
+    """设备独占写入的窗口必须**恰好是整个镜像头**（掉电安全的结构性前提）。
+
+    这条不是"顺手加一句断言"，它承载着差分 OTA 的掉电安全论证：
+
+      · 若窗口只覆盖 `image_size`+`crc32`（8 B），magic 就会跟着差分流进来。
+        于是"应用中途掉电"可能留下一个 **magic 合法** 的目标槽 —— 它到底能不能
+        被引导，就完全取决于"引导路径上每一处都必须先验 CRC"这个跨子系统的
+        隐含假设（而 `boot_crc` 的结束校验薄弱、上游 hpatch_lite 的结束校验
+        基本无效，都是已实测过的事实）。
+      · 窗口覆盖整头后，掉电态下目标槽头部恒为擦除态 0xFFFFFFFF ⇒ magic 恒非法
+        ⇒ **结构上不可能被当成可引导镜像**，与任何其它模块的内部检查无关。
+
+    这个退化**不会有任何编译或运行信号**，所以必须由测试钉死。
+    """
+    from generator.context.bootloader_context import fota_format_for_templates
+
+    fmt = fota_format_for_templates()
+    assert fmt["hdr_hole_off"] == fmt["img_hdr_off"], (
+        "设备独占写入窗口的起点不是镜像头起点 —— magic 会从补丁流里进来"
+    )
+    assert fmt["hdr_hole_len"] == fmt["img_hdr_size"], (
+        "设备独占写入窗口没有覆盖整个镜像头（%d != %d）"
+        % (fmt["hdr_hole_len"], fmt["img_hdr_size"])
+    )
+
+    # 头部尾段（magic + fw_version）必须正好是 CRC 覆盖区开头到 payload 起点
+    # （注意：fota_fmt 里的偏移全部是**槽内**偏移，无需再加 img_hdr_off）
+    assert fmt["hdr_tail_off"] == fmt["crc_region_start"]
+    assert fmt["hdr_tail_off"] + fmt["hdr_tail_len"] == fmt["img_payload_off"], (
+        "头部尾段 [%d,+%d) 的终点不是 payload 起点 %d"
+        % (fmt["hdr_tail_off"], fmt["hdr_tail_len"], fmt["img_payload_off"])
+    )
+    # 尾段必须落在窗口内部（否则 feed_header_tail() 会越界写）
+    assert fmt["hdr_hole_off"] <= fmt["hdr_tail_off"]
+    assert (fmt["hdr_tail_off"] + fmt["hdr_tail_len"]
+            <= fmt["hdr_hole_off"] + fmt["hdr_hole_len"])
+
+
 @pytest.mark.parametrize("slot", ["a", "b"])
 def test_slot_linker_declares_header_of_exact_size(slot, img):
     """**渲染后**的 `.app_header` 段必须恰好声明 img['size'] 个 LONG，

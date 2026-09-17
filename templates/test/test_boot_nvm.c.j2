@@ -116,7 +116,14 @@ void test_active_slot_default_a(void)
 void test_swap_active_slot_a_to_b(void)
 {
     TAMP->BKP1R = BOOT_SLOT_A;
+    /* 必须**先**把计数器顶起来，否则下面那句"切换后计数器归零"恒成立
+     * （0 == 0），无论 swap 是否真的归零 —— 那是 A9 式的空转断言。 */
+    boot_nvm_inc_attempt_count();
+    boot_nvm_inc_attempt_count();
+    TEST_ASSERT_EQUAL(2, boot_nvm_get_attempt_count());
+
     boot_nvm_swap_active_slot();
+
     TEST_ASSERT_EQUAL(BOOT_SLOT_B, boot_nvm_get_active_slot());
     /* Counter should be reset */
     TEST_ASSERT_EQUAL(0, boot_nvm_get_attempt_count());
@@ -125,8 +132,15 @@ void test_swap_active_slot_a_to_b(void)
 void test_swap_active_slot_b_to_a(void)
 {
     TAMP->BKP1R = BOOT_SLOT_B;
+    boot_nvm_inc_attempt_count();
+    boot_nvm_inc_attempt_count();
+    boot_nvm_inc_attempt_count();
+    TEST_ASSERT_EQUAL(3, boot_nvm_get_attempt_count());
+
     boot_nvm_swap_active_slot();
+
     TEST_ASSERT_EQUAL(BOOT_SLOT_A, boot_nvm_get_active_slot());
+    TEST_ASSERT_EQUAL(0, boot_nvm_get_attempt_count());
 }
 
 void test_swap_preserves_other_state(void)

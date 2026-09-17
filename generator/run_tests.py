@@ -70,7 +70,11 @@ LDFLAGS = ["-lm"]   # libm for attitude math (atan2f/sqrtf/floorf) in host tests
 INCLUDES = ["-I.", "-I../src", "-I../src/drivers", "-Iunity", "-I../config",
             "-I../../../static/stm32g0/HAL/Inc",
             "-I../../../static/stm32g0/CMSIS/Device/ST/STM32G0xx/Include",
-            "-I../../../static/stm32g0/CMSIS/Core/Include",
+            # 注意：vendored 的 CMSIS Core 头直接放在 Core/ 下，没有 Include/ 子目录
+            # （`ls static/stm32g0/CMSIS/Core/` 可见 core_cm0plus.h）。此前这里写的是
+            # Core/Include，那个目录不存在 —— 路径写错不会报错，只会在有人真的
+            # include CMSIS 时以"core_cm0plus.h: No such file"的形式暴露。
+            "-I../../../static/stm32g0/CMSIS/Core",
             "-I../../../static/hw2c_cli",
             "-I../../../static/third_party/lwrb"]
 UNITY_SRC = "unity/unity.c"

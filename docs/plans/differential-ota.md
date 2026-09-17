@@ -1143,3 +1143,135 @@ L1（Python 结构检查）跑得快但证明不了 cover 编码正确；L2 用 
 ① `requirements.md` FR-14 的 ✅ 与事实不符（整条路径从未被生成/编译/测试）；
 ② 压缩从哪个偏移开始（本实现取 §16.8.1 的方案 (i)：**头明文 + 正文压缩**，已落地）；
 ③ `static/third_party/` 需补进 `AGENTS.md` 的供应商只读清单。
+
+---
+
+## 18. 实施记录：P2' + 引导路径首次进入构建闸门（2026-09-16）
+
+同 §17：只记**实测得到的事实**与**据此做的决定**。与前面各节冲突处，以本节为准。
+
+### 18.1 已落地
+
+| 文件 | 作用 |
+|---|---|
+| `templates/drivers/fota_delta.{c,h}.j2` | 设备侧差分应用层。纯算法 + `fota_delta_backend_t` 注入式 I/O，**同一份源码**编到目标与主机（不用 `#ifdef TEST`）——这是 §5.1 分层的落点，也是 L6 能在主机上跑起来的前提 |
+| `generator/tests/harness/fota_delta_l6_harness.c` | L6 测试台：内存 Flash（真擦除、真双字 1→0 编程、越界/非对齐/长度非法一律报错）+ 掉电注入 + 三条不变量 |
+| `generator/tests/test_fota_delta_l6.py` | L6 驱动：真补丁（走压缩路径）+ 2 条**变异测试**（18.3） |
+| `generator/tests/test_bootloader_host_tests.py` | 3 类结构护栏（18.2 第 2、3 条） |
+| `examples/fota_demo/` | 首个开 `bootloader.enabled` 的示例。**必须先有它**——否则整条引导/差分路径永远在构建闸门之外（这正是 FR-14 被误标 ✅ 的根因） |
+| `templates/test/mock_hal.{h,c}.j2` | 补 `IWDG` 寄存器模型（此前是 `#define IWDG ((void *)0)`） |
+| `generator/run_tests.py` | 修正 `-ICMSIS/Core/Include`（该目录不存在，真实位置是 `CMSIS/Core/`） |
+| `templates/test/test_boot_nvm.c.j2` | 修掉一条空洞断言（18.2 第 3 条） |
+
+`generator/tests` 全绿 **328 条**（§17 结束时 311 条）。四个编译自检目标
+（默认 / `bootloader` / `app` / `combined`）全部通过。
+
+### 18.2 实测确认的事实
+
+1. **引导/差分路径第一次被真的生成 + 编译，一次性暴露 6 处潜伏缺陷。**
+   镜像头落在 `0xBC` 而非 `0xC0`（STM32G0 的 `.isr_vector` 只有 47 项 = 0xBC，
+   `.app_header` 没被钉住）⇒ 引导器拒绝**所有**镜像；`patch_crc.py` 当时是
+   "跟着 magic 走"，于是**默默接受**了这个偏移。修法：链接脚本用
+   `ASSERT(ADDR(.app_header) - ORIGIN(FLASH) == img_hdr_off)` 钉死，
+   `patch_crc.py` 改为 **fail-closed**。另有 ASM 编译标志被当作单个 argv 传入、
+   引导器因 `-u _printf_float` 溢出 8 KB、`build/` 被一起提交导致
+   `CMakeCache.txt` 路径错、编译自检没覆盖三个自定义目标等。
+   > 结论与 §16 一致：**"有模板"不等于"被编译过"**。FR-14 的 ✅ 就建立在这个错觉上。
+
+2. **整头独占写入：把掉电安全从"依赖跨子系统假设"变成"结构性不可能"。**
+   镜像头的 16 B **全部**由设备在 FLUSH 阶段写入（不是只留 `image_size`+`crc32`
+   那 8 B）。差分流天然带着镜像头字节，若让 magic 从流里进来，"中途掉电"就可能留下
+   一个 **magic 合法**的目标槽 —— 它能不能被引导，就取决于"引导路径上每一处都必须
+   先验 CRC"这个跨子系统的隐含假设。改为整头独占后，掉电状态下目标槽头部恒为
+   `0xFFFFFFFF` ⇒ magic 恒非法 ⇒ **与其它模块的内部检查无关**。
+   `fota_format_for_templates()` 里有断言把这条不变量固化（退化不会有编译信号，
+   只能靠断言）。
+
+3. **bootloader 源码从未遵守 TEST/mock 约定 ⇒ 三个 boot 测试从来没编译通过过。**
+   `boot_crc.c`/`boot_jump.c`/`boot_nvm.c` 无条件 `#include "stm32g0xx.h"`，
+   而主机单测是"把被测源码 include 进测试 + 链接 `mock_hal.c`"，
+   `mock_hal.h` 里 `typedef int32_t IRQn_Type;` 与 CMSIS 的枚举**必然冲突**：
+   `error: conflicting types for 'IRQn_Type'` + `core_cm0plus.h: No such file`。
+   而 `mock_hal.h` 里早就做好了 CRC/PWR/RCC/TAMP/SCB/NVIC/SysTick 的寄存器模型和
+   `mock_cmsis_reset()` —— 缺的只是一处约定。修完后 boot 测试真的跑起来了
+   （`test_boot_nvm` 12 条、`test_boot_crc` 4 条）。
+   > 这是 A9 的**镜像版本**：A9 是"mock 太宽容所以查不出缺陷"，这里是
+   > "测试根本编不过，于是没人知道它没跑"。两者都以"有测试"的形式提供虚假安全感。
+
+4. **`test_boot_nvm` 里有一条空洞断言。** `test_swap_active_slot_a_to_b` 断言
+   "切换后尝试计数器归零"，却**从未先把计数器顶起来** ⇒ `0 == 0` 恒成立，
+   删掉实现里的归零语句它也照样 PASS。已补上前置自增（并加断言确认已自增）。
+   实测：去掉 `TAMP->BKP0R = 0;` 后该用例现在报
+   `Expected 0 Was 3`。
+
+5. **L6 的实现形态与 §12 措辞不同（有意为之，记录以免误解）。**
+   §12 写"在**每条指令边界**模拟掉电"，实现是**在每个持久化操作边界**
+   （`patch_read` / `erase` / `program`）注入。理由：纯计算指令不落盘，掉电在
+   其中间不会留下任何可观测的持久状态，"每条指令"只会把成本乘以几千倍而覆盖
+   不到新东西。**真正需要细分的是"覆盖镜像头窗口的那些操作"**——magic 恰好在
+   哪一步之后变得合法完全由它决定——因此对它们**逐个 8 字节前缀全枚举**；
+   对大操作（一次擦除 544 个双字、一次页编程 256 个）抽样 16 点
+   （一个没写完的页无论断在哪里都不会产生合法 magic）。
+   当前向量：15 个持久化操作 → **76 个注入点**。
+   三条不变量逐点成立：① 活动槽逐字节不变；② 目标槽头部 magic 恒为擦除态；
+   ③ 掉电后**重放**同一补丁，目标槽逐字节等于新镜像。
+
+6. **静态 RAM 实测 ≈ 8.5 KB，略超 §14 验收第 2 条的 8 KB。**
+   `arm-none-eabi-size` 于 `drv_fota_delta.c.obj`：`text 4,636 B / bss 8,772 B`。
+   bss 构成：`s_page_buf` 2,048 + `s_temp_cache` 2,048 + `s_tuz_mem` 4,616
+   （= tinyuz 预留 4,104 + 解压输出缓冲 512），余下约 60 B 为其它静态量。
+   超出的原因不是设计走偏，而是**预算函数只算了三条缓冲之和（8,192），
+   没有算 tinyuz 自身的预留开销（`tuz_reserved_mem_size()` = dict_size + 8）
+   与适配层其余静态量**。另有 512 B 是有意的松弛：不压缩路径下
+   `s_temp_cache` 要 2,048 全用，压缩路径只用 1,536。
+   ⇒ 建议把 §14 第 2 条改为"**≤ 9 KB 且与镜像/补丁大小无关**"（后者是结构性的：
+   所有缓冲都是编译期定长，`fota_delta_budget()` 是唯一出处）；
+   若坚持 8 KB，则把 `cache_size` 降到 1,024（实测可降到 ≈7.5 KB，代价是吞吐）。
+
+7. **差分适配层当前会被链接器整个丢掉 —— 这是预期的，不是缺陷。**
+   `drv_fota_delta.c` 编译进了 app，但没有任何调用者（接收侧在 P3），
+   在 `-ffunction-sections --gc-sections` 下被 GC，`fota_demo.elf` 里查不到
+   `fota_delta_*` 符号。⇒ **在 P3 之前，L6 主机测试台是这条路径唯一的执行证据**，
+   这也是 18.3 必须存在的理由。
+
+### 18.3 测试台的可信度：变异测试
+
+> 绿色结论只有在"它能红"的前提下才有意义。第一版 L6 就打印过 `RESULT: OK`，
+> 而它实际只覆盖了 15 个点中的一个（见第 4 条的同源问题）。
+
+因此 `test_fota_delta_l6.py` 除了主用例外，还**主动改坏模板**并断言 L6 必须报错：
+
+| 变异 | 违反 | 期望信号 |
+|---|---|---|
+| 擦除后立刻把 magic 写进头部（而不是等 FLUSH） | 不变量 ② | `target header magic is not erased after power loss` |
+| 提交前擅自动活动槽 | 不变量 ① | `active slot changed` / `active slot was modified` |
+
+变异锚点是模板源码里的具体片段，**模板重构会让锚点断言先失败**，逼着人来更新 ——
+刻意的：一个悄悄失效的变异测试比没有变异测试更糟。
+
+`test_bootloader_host_tests.py` 同样按此思路写成"结构护栏"：
+① bootloader 源码必须走 `#ifdef TEST` 三段式；
+② **mock 必须建模 bootloader 解引用的每一个寄存器块**（正则抽取 `NAME->`，
+   逐个核对 `mock_hal.h.j2` 的指针声明）——这条如果早存在，第 3 条那个缺陷
+   在写的当天就会被抓住；③ `run_tests.py` 里 `static/` 下的 `-I` 路径必须真实存在
+   （gcc 对不存在的 `-I` 目录**不报错**，这类笔误会一直潜伏）。
+三者都做过"还原缺陷 ⇒ 必须变红"的验证。
+
+### 18.4 下一步
+
+按 §16.6 与 §13：
+
+- **P3**（传输与元数据）：`drv_fota` 重写为接收侧状态机，调用 `fota_delta_apply()`；
+  这一步做完，适配层才第一次被真正链接进镜像，§14 第 2 条的 RAM 也才有意义。
+- **P4**（引导决策表 / 16 B 头部落地）。
+- **P5**（HIL 端到端）：`examples/fota_demo/` 已就位，剩下真板 A→B 升级 + 回滚。
+
+待用户点头的清单（在 §17 三条之外新增）：
+
+④ §14 第 2 条的 8 KB 是否改为 9 KB（见 18.2 第 6 条）；
+⑤ `requirements.md` FR-14.4 仍写着"BSDIFF 差分"、实现条目仍列
+  `generator/bsdiff_tool.py` —— 而 §16.6/§11.1 已裁定 `bsdiff_tool.py` 与
+  `fota_bspatch.{c,h}.j2` **直接退役**（现已被 `delta_tool.py` + `fota_delta.{c,h}.j2`
+  取代）。这些文件与 `docs/developer-guide/{architecture-overview,template-development}.md`
+  里对应的章节尚未清理；留着会有"两套 FOTA 实现"的误导风险，建议单独一个
+  commit 做退役清理。

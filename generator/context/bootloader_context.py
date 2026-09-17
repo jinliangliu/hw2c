@@ -23,9 +23,11 @@ def fota_format_for_templates() -> dict:
     不同步，补丁就会"生成成功、装上砖机"。A3 类缺陷正是这样产生的。
     所以 C 头文件里的每个偏移都由 JSON 算出，改格式只需改一处。
 
-    返回值里的 `hdr_hole_off` / `hdr_hole_len` 是设备**事后回填**的那两个字段
-    （`image_size` + `crc32`）：差分流把它们写成了 0xFFFFFFFF 占位，设备编程时
-    必须跳过这 8 字节，留到 FLUSH 阶段单独写入（Flash 只能 1→0）。
+    返回值里的 `hdr_hole_off` / `hdr_hole_len` 是**由设备独占写入**的头部窗口
+    ——即**整个 16 B 镜像头**。差分流天然带着镜像头的全部字节（新镜像原样参与
+    差分），但设备一个字节都不采信：`image_size`/`crc32` 必须等代码区全部生成
+    后才能算出（Flash 只能 1→0），而 magic/fw_version 干脆由设备自己写，
+    这样"中途掉电"永远不可能留下一个 magic 合法的目标槽。
     """
     spec = load_fota_format()
     img = spec["image_header"]
@@ -33,7 +35,7 @@ def fota_format_for_templates() -> dict:
     f = img["fields"]
     ef = env["fields"]
 
-    return {
+    out = {
         # ---- 镜像头 ----
         "img_hdr_off": img["offset_in_slot"],
         "img_hdr_size": img["size"],
@@ -46,10 +48,26 @@ def fota_format_for_templates() -> dict:
         "img_off_fw_version": f["fw_version"]["offset"],
         "crc_region_start": img["crc_region"]["start_offset_in_slot"],
         "crc_region_addend": img["crc_region"]["length_addend"],
-        # 事后回填的 8 字节窗口（相对槽起点）
-        "hdr_hole_off": img["offset_in_slot"] + f["image_size"]["offset"],
-        "hdr_hole_len": f["crc32"]["offset"] + f["crc32"]["size"]
-                        - f["image_size"]["offset"],
+        # 设备**独占**写入的头部窗口（相对槽起点）——整个 16 B 镜像头。
+        #
+        # 为什么是整头而不是只留 image_size+crc32 那 8 字节：
+        # 差分流天然包含镜像头的全部字节（新镜像原样参与差分），若让 magic 从
+        # 流里进来，那么"应用中途掉电"就可能留下一个 **magic 合法** 的目标槽 ——
+        # 它到底能不能被引导，就完全依赖"引导路径上每一处都必须先验 CRC"这个
+        # 跨子系统的隐含假设。把整头改成设备在 FLUSH 阶段独占写入后，掉电状态下
+        # 目标槽头部恒为擦除态（0xFFFFFFFF）⇒ magic 恒非法 ⇒ **结构上不可能
+        # 被当成可引导镜像**，与模块内部其它检查无关。
+        #
+        # 这也正是 drv_fota_delta.h 里对掉电语义的既有承诺（"目标槽的镜像头
+        # magic 尚未写入（它属于 FLUSH 阶段）"）—— 此前代码没做到，本项修齐。
+        "hdr_hole_off": img["offset_in_slot"],
+        "hdr_hole_len": img["size"],
+        # 头部里落在 CRC 覆盖区内的**尾段**（magic + fw_version）。
+        # 覆盖区自 magic 起、payload 起止；这一段由设备按信封内容喂入 CRC，
+        # 不再依赖流里的字节。
+        "hdr_tail_off": img["crc_region"]["start_offset_in_slot"],
+        "hdr_tail_len": img["payload_offset_in_slot"]
+                        - img["crc_region"]["start_offset_in_slot"],
         # ---- 信封 ----
         "env_size": env["size"],
         "env_magic": ef["magic"]["value"],
@@ -67,6 +85,29 @@ def fota_format_for_templates() -> dict:
         "env_off_hdr_crc16": ef["hdr_crc16"]["offset"],
         "env_off_auth_len": ef["auth_len"]["offset"],
     }
+
+    # ---- 不变量：设备独占写入的窗口必须**恰好覆盖整个镜像头** ----
+    #
+    # 这条不变量的作用不是"防止算错"，而是把上面那段论证固化下来：一旦有人把
+    # hdr_hole 改回"只留 image_size+crc32"，掉电安全性就从"结构上不可能引导"
+    # 退化成"依赖引导器先验 CRC"，而那种退化不会有任何编译或测试上的信号。
+    hole = out["hdr_hole_off"]
+    assert hole == img["offset_in_slot"], (
+        "设备独占写入的头部窗口起点 %d 与镜像头偏移 %d 不一致"
+        % (hole, img["offset_in_slot"]))
+    assert out["hdr_hole_len"] == img["size"], (
+        "设备独占写入的头部窗口长度 %d 与镜像头大小 %d 不一致 —— "
+        "整头必须由设备在 FLUSH 阶段写入，见本函数的注释"
+        % (out["hdr_hole_len"], img["size"]))
+    # 头部尾段必须与 CRC 覆盖区的前 hdr_tail_len 字节完全重合
+    assert out["hdr_tail_off"] == img["crc_region"]["start_offset_in_slot"]
+    assert (out["hdr_tail_off"] + out["hdr_tail_len"]
+            == img["payload_offset_in_slot"]), (
+        "头部尾段 [%d, %d) 未恰好填满到 payload 起点 %d"
+        % (out["hdr_tail_off"], out["hdr_tail_off"] + out["hdr_tail_len"],
+           img["payload_offset_in_slot"]))
+
+    return out
 
 
 def fota_delta_budget(boot_config: dict) -> dict:

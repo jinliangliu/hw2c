@@ -244,14 +244,21 @@
 | FR-13.4 | RTC 1 Hz 唤醒心跳 + 10 路定时器（秒/分/小时周期 + 毫秒单次） |
 | FR-13.5 | RTC ISR 最高优先级，保证 STOP 模式可靠唤醒 |
 
-### FR-14 Bootloader 与 FOTA ✅
+### FR-14 Bootloader 与 FOTA ⏳
+
+> 状态说明（2026-09-16 更正）：此前标 ✅ 与事实不符 —— 当时没有任何示例开启
+> `bootloader.enabled`，整条引导/差分路径**从未被生成、编译或测试**。现已由
+> `examples/fota_demo/` 拉进构建闸门：四个编译自检目标全通过，bootloader 主机
+> 单测（crc/nvm/jump）可运行，差分应用层有 L6 掉电注入（含变异测试）。
+> 仍缺：**接收侧传输状态机（`drv_fota`，计划 P3）** 与**真板 HIL 验证（P5）**。
+> 详见 `docs/plans/differential-ota.md` §17、§18。
 
 | ID | 需求 |
 |----|------|
 | FR-14.1 | 双槽位 A/B Bootloader，硬件 CRC32 校验 |
 | FR-14.2 | TAMP 备份寄存器记录启动状态 |
 | FR-14.3 | 启动失败自动回退（`max_retries`） |
-| FR-14.4 | BSDIFF 差分 FOTA，减小 OTA 传输体积，完整性校验 + 回滚 |
+| FR-14.4 | 差分 FOTA：H2CD v1 信封 + HPatchLite 兼容 lite 流 + tinyuz 压缩（`delta_tool.py` 自研写侧），减小 OTA 传输体积，完整性校验 + 幂等重放 |
 
 ### FR-15 调试与可观测性 ✅
 
@@ -500,7 +507,7 @@ hw2c 的处理方式（**不修改 vendor**）：
 | FR-11 协议栈 | `templates/drivers/drv_{modbus,mqtt,cellular,uart}.c.j2`、`examples/modbus_demo/` |
 | FR-12 控制中间件 | `templates/app/pid_*.j2`、`foc_*.j2`、`fall_detect*.j2`、`attitude.c.j2`、`examples/{solenoid_valve,thermo,knob}_*/` |
 | FR-13 低功耗/RTC | `templates/src/{sleep,power_mgr}.c.j2`、`templates/drivers/drv_rtc.c.j2`、`templates/rtos/tickless_idle.c.j2` |
-| FR-14 Bootloader/FOTA | `templates/bootloader/`、`templates/drivers/drv_fota.c.j2`、`generator/bsdiff_tool.py` |
+| FR-14 Bootloader/FOTA | `templates/bootloader/`、`templates/drivers/fota_delta.{c,h}.j2`、`generator/delta_tool.py`、`generator/data/fota_format.json`、`generator/tests/test_fota_delta_l6.py`、`examples/fota_demo/`（旧的 `generator/bsdiff_tool.py` 与 `fota_bspatch.{c,h}.j2` 已退役，见 `docs/plans/differential-ota.md` §11.1 / §16.6） |
 | FR-15 调试可观测 | `templates/drivers/drv_{cli,log}.c.j2`、`templates/src/telemetry.c.j2`、`docs/user-guide/cli-commands.md` |
 | FR-16 测试体系 | `templates/test/`、`generator/run_tests.py`、`generator/tests/`、`tests/`、`parser/tests/` |
 | FR-17 工具链/CI | `templates/project/*`、`templates/vscode/*`、`.github/workflows/build_and_test.yml` |

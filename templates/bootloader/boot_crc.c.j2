@@ -17,7 +17,13 @@
  */
 
 #include "boot_crc.h"
+#ifdef TEST
+/* 主机单测：mock_hal.h 提供 CRC/RCC 的**寄存器模型**（含可复位的静态存储）。
+ * 与真实 CMSIS 头不能共存（两者的 IRQn_Type 定义冲突），因此必须二选一。 */
+#include "mock_hal.h"
+#else
 #include "stm32g0xx.h"
+#endif
 
 /* ---- 镜像头部定义（与 fota_format.json 对齐，由 test_fota_format.py 校验）---- */
 #define APP_HEADER_MAGIC        0x4841436BUL   /* 数值匹配；内存中呈现为 'kCAH' */

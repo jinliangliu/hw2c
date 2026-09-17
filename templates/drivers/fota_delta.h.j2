@@ -45,10 +45,36 @@
 #define FOTA_CRC_REGION_START     {{ fota_fmt.crc_region_start }}U
 #define FOTA_CRC_REGION_ADDEND    {{ fota_fmt.crc_region_addend }}U
 
-/* 事后回填的 8 字节窗口（image_size + crc32）：
- * 差分流把它们写成 0xFFFFFFFF 占位，设备编程时必须跳过、留到 FLUSH 单独写入。 */
+/* ---- 设备独占写入的头部窗口：整个镜像头（16 B）---------------------------
+ *
+ * 差分流里**有**镜像头的全部字节，但设备一个都不采信：
+ *   · image_size / crc32 要等代码区全部生成后才能算出（Flash 只能 1→0）；
+ *   · magic / fw_version 干脆由设备按信封内容自己写（fw_version 来自信封，
+ *     与流里的字节不再构成第二份真源）。
+ * 编程时这一段保持擦除态，到 FLUSH 阶段整头一次写入。
+ *
+ * 这不只是"实现方便"，而是一条掉电安全不变量：
+ * **应用中途掉电 ⇒ 目标槽头部恒为 0xFFFFFFFF ⇒ magic 恒非法 ⇒
+ * 结构上不可能被当成可引导镜像。**
+ * 反过来说，若 magic 从流里进来，掉电后就可能留下一个 magic 合法的目标槽，
+ * 它的安全性将依赖"引导路径上每一处都必须先验 CRC"这个跨子系统假设。
+ *
+ * 因此这一对宏必须**恰好覆盖整个头部**：
+ *   FOTA_HDR_HOLE_OFF == FOTA_IMG_HDR_OFF
+ *   FOTA_HDR_HOLE_LEN == FOTA_IMG_HDR_SIZE
+ * 这一不变量由两处钉住：生成期的断言在
+ * `generator/context/bootloader_context.py::fota_format_for_templates()`，
+ * 回归测试在 `generator/tests/test_fota_format.py::
+ * test_device_exclusive_header_window_covers_the_whole_image_header`。
+ */
 #define FOTA_HDR_HOLE_OFF         {{ fota_fmt.hdr_hole_off }}U
 #define FOTA_HDR_HOLE_LEN         {{ fota_fmt.hdr_hole_len }}U
+
+/* 头部中落在 CRC 覆盖区内的尾段（magic + fw_version）。覆盖区 = [magic, payload)，
+ * 这一段由设备按信封内容喂入 CRC —— 不依赖流里的字节，所以"设备写的头"与
+ * "设备算的 CRC"天然自洽。 */
+#define FOTA_HDR_TAIL_OFF         {{ fota_fmt.hdr_tail_off }}U
+#define FOTA_HDR_TAIL_LEN         {{ fota_fmt.hdr_tail_len }}U
 
 /* 信封（外层）*/
 #define FOTA_ENV_SIZE             {{ fota_fmt.env_size }}U

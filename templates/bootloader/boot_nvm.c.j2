@@ -5,7 +5,13 @@
  */
 
 #include "boot_nvm.h"
+#ifdef TEST
+/* 主机单测：mock_hal.h 提供 TAMP/PWR/RCC 的寄存器模型（含可复位的静态存储），
+ * 于是备份寄存器语义（掉电保持、魔数初始化）可以在主机上被完整验证。 */
+#include "mock_hal.h"
+#else
 #include "stm32g0xx.h"
+#endif
 
 /* TAMP BKP 寄存器分配:
  *   BKP0R = 启动失败计数器
