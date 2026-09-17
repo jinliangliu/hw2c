@@ -8,6 +8,10 @@
 #include "param_registry.h"
 #include <string.h>
 
+{% if has_persistent_params %}
+#include "drivers/nvm_param.h"
+{% endif %}
+
 {% set param_list = params | default([]) %}
 
 /* ---- Parameter default values (compile-time, ROM) ---- */
@@ -33,22 +37,22 @@ static param_t g_params[] = {
         .type       = PARAM_TYPE_{{ p.type | upper }},
         .value_ptr  = &g_{{ p.name }}_val,
 {% if p.type == 'int32' %}
-        .min_i32    = {{ p.min if p.min is not none else '-2147483648' }},
-        .max_i32    = {{ p.max if p.max is not none else '2147483647' }},
+        .min_i32    = {{ p.min if (p.min is defined and p.min is not none) else '-2147483648' }},
+        .max_i32    = {{ p.max if (p.max is defined and p.max is not none) else '2147483647' }},
 {% else %}
         .min_i32    = 0,
         .max_i32    = 0,
 {% endif %}
 {% if p.type == 'uint32' %}
-        .min_u32    = {{ p.min if p.min is not none else '0' }}U,
-        .max_u32    = {{ p.max if p.max is not none else '4294967295' }}U,
+        .min_u32    = {{ p.min if (p.min is defined and p.min is not none) else '0' }}U,
+        .max_u32    = {{ p.max if (p.max is defined and p.max is not none) else '4294967295' }}U,
 {% else %}
         .min_u32    = 0,
         .max_u32    = 0,
 {% endif %}
 {% if p.type == 'float' %}
-        .min_f32    = {{ p.min if p.min is not none else '-3.4028235e38' }}f,
-        .max_f32    = {{ p.max if p.max is not none else '3.4028235e38' }}f,
+        .min_f32    = {{ p.min if (p.min is defined and p.min is not none) else '-3.4028235e38' }}f,
+        .max_f32    = {{ p.max if (p.max is defined and p.max is not none) else '3.4028235e38' }}f,
 {% else %}
         .min_f32    = 0.0f,
         .max_f32    = 0.0f,
@@ -65,10 +69,90 @@ static param_t *g_params = NULL;
 static const uint32_t g_param_count = 0;
 {% endif %}
 
+{% if has_persistent_params %}
+/* ---- Stable 16-bit key from parameter name (djb2 truncated) ---- */
+static uint16_t _param_key_hash(const char *name)
+{
+    uint32_t h = 5381U;
+    while (*name) {
+        h = ((h << 5U) + h) + (uint8_t)*name;
+        name++;
+    }
+    return (uint16_t)(h & 0xFFFFU);
+}
+
+static void _param_load_persistent(param_t *p)
+{
+    uint16_t key = _param_key_hash(p->name);
+    uint8_t buf[16];
+    uint16_t len = 0;
+    int rc = nvm_param_load(key, buf, sizeof(buf), &len);
+    if (rc != NVM_PARAM_OK) {
+        return;  /* keep compile-time default */
+    }
+    switch (p->type) {
+        case PARAM_TYPE_INT32:
+            if (len == sizeof(int32_t)) {
+                memcpy(p->value_ptr, buf, sizeof(int32_t));
+            }
+            break;
+        case PARAM_TYPE_UINT32:
+            if (len == sizeof(uint32_t)) {
+                memcpy(p->value_ptr, buf, sizeof(uint32_t));
+            }
+            break;
+        case PARAM_TYPE_FLOAT:
+            if (len == sizeof(float)) {
+                memcpy(p->value_ptr, buf, sizeof(float));
+            }
+            break;
+        case PARAM_TYPE_BOOL:
+            if (len == sizeof(bool)) {
+                memcpy(p->value_ptr, buf, sizeof(bool));
+            }
+            break;
+    }
+}
+
+static void _param_save_persistent(param_t *p)
+{
+    uint16_t key = _param_key_hash(p->name);
+    uint8_t buf[16];
+    uint16_t len = 0;
+    switch (p->type) {
+        case PARAM_TYPE_INT32:
+            len = sizeof(int32_t);
+            memcpy(buf, p->value_ptr, len);
+            break;
+        case PARAM_TYPE_UINT32:
+            len = sizeof(uint32_t);
+            memcpy(buf, p->value_ptr, len);
+            break;
+        case PARAM_TYPE_FLOAT:
+            len = sizeof(float);
+            memcpy(buf, p->value_ptr, len);
+            break;
+        case PARAM_TYPE_BOOL:
+            len = sizeof(bool);
+            memcpy(buf, p->value_ptr, len);
+            break;
+    }
+    (void)nvm_param_save(key, buf, len);
+}
+{% endif %}
+
 /* ---- param_init ---- */
 void param_init(void)
 {
     /* Values already initialized at compile time via static initializers */
+{% if has_persistent_params %}
+    /* Overwrite persistent parameters with values stored in external NVM */
+    for (uint32_t i = 0; i < g_param_count; i++) {
+        if (g_params[i].persistent) {
+            _param_load_persistent(&g_params[i]);
+        }
+    }
+{% endif %}
 }
 
 /* ---- param_get ---- */
@@ -106,6 +190,11 @@ int param_set_int32(param_t *p, int32_t val)
     if (p->type != PARAM_TYPE_INT32) return PARAM_ERR_TYPE;
     if (val < p->min_i32 || val > p->max_i32) return PARAM_ERR_RANGE;
     *(int32_t *)p->value_ptr = val;
+{% if has_persistent_params %}
+    if (p->persistent) {
+        _param_save_persistent(p);
+    }
+{% endif %}
     return PARAM_OK;
 }
 
@@ -126,6 +215,11 @@ int param_set_uint32(param_t *p, uint32_t val)
     if (p->type != PARAM_TYPE_UINT32) return PARAM_ERR_TYPE;
     if (val < p->min_u32 || val > p->max_u32) return PARAM_ERR_RANGE;
     *(uint32_t *)p->value_ptr = val;
+{% if has_persistent_params %}
+    if (p->persistent) {
+        _param_save_persistent(p);
+    }
+{% endif %}
     return PARAM_OK;
 }
 
@@ -146,6 +240,11 @@ int param_set_float(param_t *p, float val)
     if (p->type != PARAM_TYPE_FLOAT) return PARAM_ERR_TYPE;
     if (val < p->min_f32 || val > p->max_f32) return PARAM_ERR_RANGE;
     *(float *)p->value_ptr = val;
+{% if has_persistent_params %}
+    if (p->persistent) {
+        _param_save_persistent(p);
+    }
+{% endif %}
     return PARAM_OK;
 }
 
@@ -165,6 +264,11 @@ int param_set_bool(param_t *p, bool val)
     if (p->readonly) return PARAM_ERR_READONLY;
     if (p->type != PARAM_TYPE_BOOL) return PARAM_ERR_TYPE;
     *(bool *)p->value_ptr = val;
+{% if has_persistent_params %}
+    if (p->persistent) {
+        _param_save_persistent(p);
+    }
+{% endif %}
     return PARAM_OK;
 }
 
@@ -201,6 +305,15 @@ void param_{{ p.name }}_set({{ ct }} value)
     }
 {% endif %}
     g_{{ p.name }}_val = value;
+{% if has_persistent_params and p.persistent %}
+    {
+        extern param_t *param_get(const char *name);
+        param_t *pp = param_get("{{ p.name }}");
+        if (pp != NULL) {
+            _param_save_persistent(pp);
+        }
+    }
+{% endif %}
 }
 
 {% endfor %}

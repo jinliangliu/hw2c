@@ -63,6 +63,9 @@
 {% if has_spi %}
 #include "spi_api.h"
 {% endif %}
+{% if has_persistent_params %}
+#include "nvm_param.h"
+{% endif %}
 
 {#
     Watchdog policy (P1-2 of docs/reviews/code-review-2026-09-15-misra-c99.md)
@@ -447,6 +450,9 @@ int main(void)
 {% elif 'SPI' in p.model.interface %}
 {% if p.is_spi_flash %}
     spi_flash_init(&hspi{{ p.bus[-1] }});
+{% if has_persistent_params %}
+    nvm_param_init();
+{% endif %}
 {% else %}
 {% set spi_cs_id = p.get('cs_pin', p.get('extra', {}).get('chip_select_pin', '')) %}
 {% set spi_cs_obj = pins | selectattr('id', 'eq', spi_cs_id) | first %}

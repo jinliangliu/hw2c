@@ -1,0 +1,161 @@
+# ============================================================
+# MHDE V2.1 mainboard — hardware description layer
+#
+#   MCU        STM32G0B1VET6 @ 16 MHz (HSI)
+#   Shell      USART2 (PD5/PD6) — CLI + log output @ 115200 baud
+#   SPI Flash  P25Q64H-SSH-IR on SPI2 (PB13/14/15 + PB12 CS)
+#   RTC        LSE 32.768 kHz — 1 s periodic wakeup
+#   LEDs       LED1 (PC0/PC1/PC2 RGB) + LED2 (PA0/PA1/PC3 RGB)
+#   Button     Gear key on PC13 (EXTI13)
+#   ST-Link    SWD (PA13/PA14) + virtual COM routed to PD5/PD6
+# ============================================================
+
+mcu:
+  part: STM32G0B1VET6
+  clock_source: HSI
+  clock_freq_hz: 16000000
+  core_clock_mhz: 16
+  hse_freq: 8000000
+
+pins:
+  # RGB status LEDs (active low on MHDE-V2.1)
+  - id: PC0
+    function: GPIO_Output
+    label: "LED1_B"
+    active_level: low
+  - id: PC1
+    function: GPIO_Output
+    label: "LED"
+    active_level: low
+  - id: PC2
+    function: GPIO_Output
+    label: "LED1_R"
+    active_level: low
+  - id: PA0
+    function: GPIO_Output
+    label: "LED2_G"
+    active_level: low
+  - id: PA1
+    function: GPIO_Output
+    label: "LED2_R"
+    active_level: low
+  - id: PC3
+    function: GPIO_Output
+    label: "LED2_B"
+    active_level: low
+
+  # Gear key /挡位按键
+  - id: PC13
+    function: GPIO_Input
+    label: "BUTTON_GEAR"
+    pull: up
+    exti:
+      enable: true
+      trigger: both
+
+  # Shell UART — user specified PD5/PD6 for ST-Link virtual COM
+  - id: PD5
+    function: USART2_TX
+    af: 0
+  - id: PD6
+    function: USART2_RX
+    af: 0
+
+  # SPI2 for external P25Q64H NOR Flash
+  - id: PB13
+    function: SPI2_SCK
+    af: 0
+  - id: PB14
+    function: SPI2_MISO
+    af: 0
+  - id: PB15
+    function: SPI2_MOSI
+    af: 0
+  - id: PB12
+    function: GPIO_Output
+    label: "SPI2_NSS"
+    active_level: low
+
+peripherals:
+  # Serial transport for the shell / ST-Link VCOM
+  - name: usart2
+    type: UART_Serial
+    instance: USART2
+    interface: uart
+    extra:
+      baudrate: 115200
+
+  # CLI interactive shell
+  - name: shell
+    type: Internal_CLI
+    uart: usart2
+    extra:
+      prompt: "mhde> "
+
+  # RTC (LSE) — 1 s periodic wakeup
+  - name: rtc
+    type: Internal_RTC
+    bus: RTC
+    extra:
+      clock_source: LSE
+      wakeup_interval_ms: 1000
+      initial_time: "2026-09-17 10:00:00"
+      alarms:
+        - type: periodic_sec
+          period_s: 1
+          event: TICK_1S
+        - type: periodic_sec
+          period_s: 15
+          event: TICK_15S
+        - type: periodic_sec
+          period_s: 30
+          event: SECONDS_30
+        - type: periodic_sec
+          period_s: 120
+          event: TICK_2MIN
+        - type: periodic_sec
+          period_s: 300
+          event: MINUTE_5
+        - type: one_shot
+          period_s: 5
+          event: ONE_SHOT_5S
+        - type: one_shot_ms
+          delay_ms: 500
+          event: ONE_SHOT_500MS
+        - type: one_shot_ms
+          delay_ms: 2000
+          event: ONE_SHOT_2S
+
+  # External SPI NOR Flash (P25Q64H-SSH-IR, 8 MB)
+  - name: flash
+    type: SPI_Flash_P25Q64H
+    bus: SPI2
+    cs_pin: "PB12"
+    extra:
+      spi_speed_hz: 1000000
+
+  # On-chip temperature sensor
+  - name: temp_sensor
+    type: Internal_TempSensor
+
+log:
+  enable: true
+  ring_buf_size: 1024
+
+sleep:
+  mode: STOP1
+  tickless: true
+
+# ============================================================
+# Bootloader / differential OTA
+# Layout matches fota_demo; slot sizes fit within 512 KB Flash.
+# ============================================================
+bootloader:
+  enabled: true
+  size_kb: 8
+  app_a_offset: 0x2000
+  app_b_offset: 0x40000
+  crc_method: crc32_hw
+  boot_flag_src: tamp_bkp
+  max_retries: 3
+  wdg_timeout_ms: 5000

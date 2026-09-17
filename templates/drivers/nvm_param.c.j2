@@ -1,0 +1,239 @@
+/**
+ * @file  nvm_param.c
+ * @brief Non-volatile parameter storage over SPI NOR Flash (generated)
+ *
+ * Each persistent parameter owns a fixed-size self-describing slot.
+ * Records are order-independent and identified by a stable 16-bit key.
+ */
+
+#include "nvm_param.h"
+#include "drv_{{ spi_flash_periph_name }}.h"
+
+#include <string.h>
+
+/* --------------------------------------------------------------------------
+ *  Internal state
+ * -------------------------------------------------------------------------- */
+static struct {
+    int      initialized;
+    uint32_t base_addr;
+    uint32_t slot_count;
+    uint32_t slot_size;
+} g_nvm = {0};
+
+/* Sector-sized scratch buffer.  Kept static to avoid blowing the task stack;
+ * access is single-threaded through the CLI/param API in this design. */
+static uint8_t g_nvm_sector_buf[SPI_FLASH_SECTOR_SIZE];
+
+/* --------------------------------------------------------------------------
+ *  CRC-16/CCITT-FALSE  (same polynomial as used by the SPI flash mock)
+ * -------------------------------------------------------------------------- */
+static uint16_t _crc16(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFFU;
+    for (uint16_t i = 0; i < len; i++) {
+        crc ^= ((uint16_t)data[i] << 8U);
+        for (uint8_t b = 0; b < 8; b++) {
+            if (crc & 0x8000U) {
+                crc = (uint16_t)((crc << 1U) ^ 0x1021U);
+            } else {
+                crc <<= 1U;
+            }
+        }
+    }
+    return crc;
+}
+
+/* --------------------------------------------------------------------------
+ *  Slot helpers
+ * -------------------------------------------------------------------------- */
+static uint32_t _slot_addr(uint16_t key)
+{
+    /* Simple direct-mapped address from key.  The generator guarantees that
+     * persistent keys are unique and fit in slot_count, so no probing is
+     * needed.  This keeps the implementation small and deterministic. */
+    uint16_t idx = key % (uint16_t)g_nvm.slot_count;
+    return g_nvm.base_addr + ((uint32_t)idx * g_nvm.slot_size);
+}
+
+static int _read_slot(uint16_t key, uint8_t *slot_buf)
+{
+    int rc = spi_flash_read(_slot_addr(key), slot_buf, (uint32_t)g_nvm.slot_size);
+    if (rc != SPI_FLASH_OK) {
+        return NVM_PARAM_E_IO;
+    }
+    return NVM_PARAM_OK;
+}
+
+static int _decode_slot(const uint8_t *slot_buf, uint16_t key,
+                        uint8_t *out, uint16_t max_len, uint16_t *out_len)
+{
+    uint32_t magic = (uint32_t)slot_buf[0]
+                   | ((uint32_t)slot_buf[1] << 8U)
+                   | ((uint32_t)slot_buf[2] << 16U)
+                   | ((uint32_t)slot_buf[3] << 24U);
+    if (magic != NVM_PARAM_MAGIC) {
+        return NVM_PARAM_E_NOT_FOUND;
+    }
+
+    uint16_t rkey = (uint16_t)slot_buf[4] | ((uint16_t)slot_buf[5] << 8U);
+    if (rkey != key) {
+        return NVM_PARAM_E_NOT_FOUND;
+    }
+
+    uint16_t size = (uint16_t)slot_buf[6] | ((uint16_t)slot_buf[7] << 8U);
+    uint8_t  fmt  = slot_buf[8];
+    if (fmt != NVM_PARAM_FMT_VER) {
+        return NVM_PARAM_E_CRC;  /* treat format mismatch as corrupt record */
+    }
+
+    uint16_t hdr_crc = (uint16_t)slot_buf[10] | ((uint16_t)slot_buf[11] << 8U);
+    if (hdr_crc != _crc16(slot_buf, 10U)) {
+        return NVM_PARAM_E_CRC;
+    }
+
+    if (size > NVM_PARAM_PAYLOAD_MAX_SIZE) {
+        return NVM_PARAM_E_SIZE;
+    }
+    if (size > max_len) {
+        return NVM_PARAM_E_SIZE;
+    }
+
+    uint16_t pay_crc = (uint16_t)slot_buf[NVM_PARAM_HEADER_SIZE + size]
+                     | ((uint16_t)slot_buf[NVM_PARAM_HEADER_SIZE + size + 1U] << 8U);
+    if (pay_crc != _crc16(&slot_buf[NVM_PARAM_HEADER_SIZE], size)) {
+        return NVM_PARAM_E_CRC;
+    }
+
+    if (out != NULL && size > 0) {
+        memcpy(out, &slot_buf[NVM_PARAM_HEADER_SIZE], size);
+    }
+    if (out_len != NULL) {
+        *out_len = size;
+    }
+    return NVM_PARAM_OK;
+}
+
+static int _encode_slot(uint16_t key, const uint8_t *data, uint16_t len,
+                        uint8_t *slot_buf)
+{
+    if (len > NVM_PARAM_PAYLOAD_MAX_SIZE) {
+        return NVM_PARAM_E_SIZE;
+    }
+
+    memset(slot_buf, 0xFFU, g_nvm.slot_size);
+
+    slot_buf[0] = (uint8_t)(NVM_PARAM_MAGIC & 0xFFU);
+    slot_buf[1] = (uint8_t)((NVM_PARAM_MAGIC >> 8U) & 0xFFU);
+    slot_buf[2] = (uint8_t)((NVM_PARAM_MAGIC >> 16U) & 0xFFU);
+    slot_buf[3] = (uint8_t)((NVM_PARAM_MAGIC >> 24U) & 0xFFU);
+    slot_buf[4] = (uint8_t)(key & 0xFFU);
+    slot_buf[5] = (uint8_t)((key >> 8U) & 0xFFU);
+    slot_buf[6] = (uint8_t)(len & 0xFFU);
+    slot_buf[7] = (uint8_t)((len >> 8U) & 0xFFU);
+    slot_buf[8] = NVM_PARAM_FMT_VER;
+    slot_buf[9] = 0xFFU;  /* reserved */
+
+    uint16_t hdr_crc = _crc16(slot_buf, 10U);
+    slot_buf[10] = (uint8_t)(hdr_crc & 0xFFU);
+    slot_buf[11] = (uint8_t)((hdr_crc >> 8U) & 0xFFU);
+
+    if (len > 0 && data != NULL) {
+        memcpy(&slot_buf[NVM_PARAM_HEADER_SIZE], data, len);
+    }
+
+    uint16_t pay_crc = _crc16(&slot_buf[NVM_PARAM_HEADER_SIZE], len);
+    slot_buf[NVM_PARAM_HEADER_SIZE + len] = (uint8_t)(pay_crc & 0xFFU);
+    slot_buf[NVM_PARAM_HEADER_SIZE + len + 1U] = (uint8_t)((pay_crc >> 8U) & 0xFFU);
+
+    return NVM_PARAM_OK;
+}
+
+/* --------------------------------------------------------------------------
+ *  Public API
+ * -------------------------------------------------------------------------- */
+int nvm_param_init(void)
+{
+    g_nvm.base_addr  = NVM_PARAM_BASE_ADDR;
+    g_nvm.slot_count = NVM_PARAM_SLOT_COUNT;
+    g_nvm.slot_size  = NVM_PARAM_SLOT_SIZE;
+    g_nvm.initialized = 1;
+    return NVM_PARAM_OK;
+}
+
+int nvm_param_load(uint16_t key, uint8_t *out, uint16_t max_len, uint16_t *out_len)
+{
+    if (!g_nvm.initialized) {
+        return NVM_PARAM_E_NO_INIT;
+    }
+    if (out == NULL || max_len == 0) {
+        return NVM_PARAM_E_ARG;
+    }
+
+    uint8_t slot_buf[NVM_PARAM_SLOT_SIZE];
+    int rc = _read_slot(key, slot_buf);
+    if (rc != NVM_PARAM_OK) {
+        return rc;
+    }
+
+    return _decode_slot(slot_buf, key, out, max_len, out_len);
+}
+
+int nvm_param_save(uint16_t key, const uint8_t *data, uint16_t len)
+{
+    if (!g_nvm.initialized) {
+        return NVM_PARAM_E_NO_INIT;
+    }
+    if (data == NULL || len == 0) {
+        return NVM_PARAM_E_ARG;
+    }
+    if (len > NVM_PARAM_PAYLOAD_MAX_SIZE) {
+        return NVM_PARAM_E_SIZE;
+    }
+
+    uint8_t slot_buf[NVM_PARAM_SLOT_SIZE];
+    int rc = _encode_slot(key, data, len, slot_buf);
+    if (rc != NVM_PARAM_OK) {
+        return rc;
+    }
+
+    uint32_t addr = _slot_addr(key);
+    uint32_t sector_addr = addr & ~((uint32_t)(SPI_FLASH_SECTOR_SIZE - 1U));
+
+    /* NOR flash program can only turn 1s into 0s.  We must erase the covering
+     * sector, but that would destroy neighbouring slots.  Read the whole sector
+     * into the static scratch buffer, patch our slot, erase, and write back. */
+    rc = spi_flash_read(sector_addr, g_nvm_sector_buf, SPI_FLASH_SECTOR_SIZE);
+    if (rc != SPI_FLASH_OK) {
+        return NVM_PARAM_E_IO;
+    }
+
+    uint32_t offset_in_sector = addr - sector_addr;
+    memcpy(&g_nvm_sector_buf[offset_in_sector], slot_buf, NVM_PARAM_SLOT_SIZE);
+
+    rc = spi_flash_erase_range(sector_addr, SPI_FLASH_SECTOR_SIZE);
+    if (rc != SPI_FLASH_OK) {
+        return NVM_PARAM_E_IO;
+    }
+
+    rc = spi_flash_write(sector_addr, g_nvm_sector_buf, SPI_FLASH_SECTOR_SIZE);
+    if (rc != SPI_FLASH_OK) {
+        return NVM_PARAM_E_IO;
+    }
+
+    return NVM_PARAM_OK;
+}
+
+int nvm_param_erase_all(void)
+{
+    if (!g_nvm.initialized) {
+        return NVM_PARAM_E_NO_INIT;
+    }
+
+    uint32_t total = g_nvm.slot_count * g_nvm.slot_size;
+    int rc = spi_flash_erase_range(g_nvm.base_addr, total);
+    if (rc != SPI_FLASH_OK) {
+        return NVM_PARAM_E_IO;
+    }
+    return NVM_PARAM_OK;
+}

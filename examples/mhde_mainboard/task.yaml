@@ -1,0 +1,50 @@
+# ============================================================
+# MHDE mainboard — software tasks layer
+# ============================================================
+
+project:
+  name: mhde_mainboard
+  version: "1.0.0"
+  heap_size: 24576
+
+event_task:
+  name: events_process_task
+  entry: vEventTask
+  priority: 3
+  stack_size: 512
+  queue_depth: 16
+
+# Gear key gesture -> LED pattern mapping
+behavior:
+  initial_state: IDLE
+  states:
+    - name: IDLE
+      transitions:
+        - event: BUTTON_SHORT_PRESS
+          target: IDLE
+          actions:
+            - led_pattern fast_blink
+            - 'log "gear: SHORT_PRESS"'
+            - shell_temp
+        - event: BUTTON_DOUBLE_PRESS
+          target: IDLE
+          actions:
+            - led_pattern slow_blink
+            - 'log "gear: DOUBLE_PRESS"'
+            - shell_temp
+        - event: BUTTON_LONG_PRESS
+          target: IDLE
+          actions:
+            - led_pattern fault
+            - 'log "gear: LONG_PRESS"'
+            - shell_temp
+
+# Periodic RTC alarm events
+periodic_events:
+  - event: SECONDS_30
+    actions:
+      - telemetry_snapshot
+      - power_status
+  - event: MINUTE_5
+    actions:
+      - telemetry_snapshot

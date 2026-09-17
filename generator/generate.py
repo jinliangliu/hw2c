@@ -43,6 +43,14 @@ _code_merger = CSTCodeMerger()
 _MERGE_EXTENSIONS = {".c", ".h"}
 
 
+def _djb2_hash_16(name: str) -> int:
+    """Stable 16-bit hash used for NVM parameter keys."""
+    h = 5381
+    for c in name:
+        h = ((h << 5) + h) + ord(c)
+    return h & 0xFFFF
+
+
 def _setup_logging(verbose: bool = False):
     """Configure logging with level based on --verbose flag."""
     level = logging.DEBUG if verbose else logging.INFO
@@ -555,6 +563,32 @@ def render_templates(env: Environment, context: dict, output_dir: str,
 
     if context.get("has_spi_flash"):
         test_templates["test/test_spi_flash.c.j2"] = os.path.join(test_dir, "test_spi_flash.c")
+
+    # ---------- NVM parameter persistence ----------
+    if context.get("has_persistent_params"):
+        nvm_templates = {
+            "drivers/nvm_param.h.j2": os.path.join(output_dir, "src", "drivers", "nvm_param.h"),
+            "drivers/nvm_param.c.j2": os.path.join(output_dir, "src", "drivers", "nvm_param.c"),
+        }
+        for tmpl_name, out_path in nvm_templates.items():
+            template = env.get_template(tmpl_name)
+            rendered = template.render(context)
+            _write_file(out_path, rendered, dry_run, show_diff)
+        # Emit machine-readable NVM layout manifest
+        nvm_layout = {
+            "spi_flash_periph": context.get("spi_flash_periph_name", "flash"),
+            "base_addr": context["nvm_config"]["base_addr"],
+            "slot_size": context["nvm_config"]["slot_size"],
+            "slot_count": context["nvm_config"]["slot_count"],
+            "sector_size": context["nvm_config"]["sector_size"],
+            "params": context.get("persistent_param_keys", []),
+        }
+        layout_path = os.path.join(output_dir, "nvm_layout.json")
+        if not dry_run:
+            os.makedirs(os.path.dirname(layout_path), exist_ok=True)
+            with open(layout_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(nvm_layout, f, indent=2)
+            logger.info(f"Generated: {layout_path}")
 
     if context.get("has_pwm"):
         test_templates["test/test_pwm.c.j2"] = os.path.join(test_dir, "test_pwm.c")
@@ -1184,6 +1218,42 @@ def generate_project(
         else:
             context["params"] = []
         context["has_params"] = bool(context.get("params"))
+
+        # Persistent parameter backend over SPI NOR
+        persistent_params = [p for p in context.get("params", []) if p.get("persistent")]
+        context["has_persistent_params"] = bool(persistent_params) and context.get("has_spi_flash")
+        if context["has_persistent_params"]:
+            slot_size = 64  # bytes per parameter record
+            slot_count = max(16, len(persistent_params) + 4)
+            # Round slot_count up so the total area is a whole number of sectors
+            sector_size = 4096
+            total_min = slot_count * slot_size
+            sector_count = (total_min + sector_size - 1) // sector_size
+            slot_count = (sector_count * sector_size) // slot_size
+            # Base address: tail of SPI flash, aligned to sector boundary
+            spi_total = 8 * 1024 * 1024  # default P25Q64H size
+            for p in context.get("peripherals", []):
+                if p.get("is_spi_flash"):
+                    spi_total = p.get("model", {}).get("total_size", spi_total)
+                    break
+            base_addr = (spi_total - (slot_count * slot_size)) & ~(sector_size - 1)
+            context["nvm_config"] = {
+                "slot_size": slot_size,
+                "slot_count": slot_count,
+                "base_addr": base_addr,
+                "sector_size": sector_size,
+            }
+            context["spi_flash_periph_name"] = context.get("spi_flash_name", "flash")
+            context["persistent_param_keys"] = [
+                {
+                    "name": p["name"],
+                    "type": p["type"],
+                    "key": _djb2_hash_16(p["name"]),
+                    "slot_index": i,
+                    "slot_addr": base_addr + i * slot_size,
+                }
+                for i, p in enumerate(persistent_params)
+            ]
 
         logger.info("[OK] Context built successfully")
 

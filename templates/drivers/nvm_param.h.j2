@@ -1,0 +1,91 @@
+#ifndef __NVM_PARAM_H
+#define __NVM_PARAM_H
+
+{#
+    nvm_param.h.j2 - Non-volatile parameter storage over SPI NOR Flash
+
+    Generated layer that persists `persistent: true` parameters across
+    power cycles and firmware upgrades.  Each parameter owns one fixed-size
+    self-describing slot, addressed by a stable 16-bit key derived from the
+    parameter name.  Slots are independent of declaration order: a deleted
+    parameter leaves a tombstone, and new parameters are appended without
+    shifting existing keys.
+#}
+
+#ifdef TEST
+#include "mock_hal.h"
+#else
+#include "stm32g0xx_hal.h"
+#endif
+
+#include <stdint.h>
+
+/* ==========================================================================
+ *  Layout (must match the generator-side manifest in nvm_layout.json)
+ * ========================================================================== */
+#define NVM_PARAM_MAGIC              0x4E564D52U   /* 'NVMR' little-endian */
+#define NVM_PARAM_FMT_VER            1U
+#define NVM_PARAM_SLOT_SIZE          {{ nvm_config.slot_size }}U
+#define NVM_PARAM_SLOT_COUNT         {{ nvm_config.slot_count }}U
+#define NVM_PARAM_BASE_ADDR          {{ nvm_config.base_addr }}UL
+
+/* Header = magic(4) + key(2) + size(2) + fmt_ver(1) + reserved(1) + hdr_crc(2) */
+#define NVM_PARAM_HEADER_SIZE        12U
+#define NVM_PARAM_PAYLOAD_MAX_SIZE   (NVM_PARAM_SLOT_SIZE - NVM_PARAM_HEADER_SIZE - 2U)
+
+/* ==========================================================================
+ *  Return codes
+ * ========================================================================== */
+#define NVM_PARAM_OK                  0
+#define NVM_PARAM_E_ARG             (-1)   /* NULL pointer or zero length */
+#define NVM_PARAM_E_NO_INIT         (-2)   /* nvm_param_init() not called or failed */
+#define NVM_PARAM_E_NOT_FOUND       (-3)   /* key has no valid record */
+#define NVM_PARAM_E_CRC             (-4)   /* header or payload CRC mismatch */
+#define NVM_PARAM_E_SIZE            (-5)   /* payload larger than slot capacity */
+#define NVM_PARAM_E_IO              (-6)   /* underlying SPI flash error */
+
+/* ==========================================================================
+ *  API
+ * ========================================================================== */
+
+/**
+ * @brief  Initialize the NVM parameter layer.
+ *
+ * Must be called after the SPI bus and flash driver are ready, but before
+ * param_init() loads persistent values.
+ */
+int nvm_param_init(void);
+
+/**
+ * @brief  Load the payload for a given parameter key.
+ *
+ * If the slot is blank, corrupted, or the key does not match, returns
+ * NVM_PARAM_E_NOT_FOUND / NVM_PARAM_E_CRC so the caller can fall back to
+ * the compile-time default.
+ *
+ * @param  key      16-bit stable key (parameter name hash).
+ * @param  out      Buffer to receive payload.
+ * @param  max_len  Capacity of out (must be >= declared size).
+ * @param  out_len  Optional: actual payload length stored in the record.
+ * @return 0 on success, negative error code on failure.
+ */
+int nvm_param_load(uint16_t key, uint8_t *out, uint16_t max_len, uint16_t *out_len);
+
+/**
+ * @brief  Save a payload for a given parameter key.
+ *
+ * Erases the target sector if necessary, then programs the record.
+ *
+ * @param  key   16-bit stable key.
+ * @param  data  Payload bytes.
+ * @param  len   Payload length (must fit in NVM_PARAM_PAYLOAD_MAX_SIZE).
+ * @return 0 on success, negative error code on failure.
+ */
+int nvm_param_save(uint16_t key, const uint8_t *data, uint16_t len);
+
+/**
+ * @brief  Erase the whole NVM parameter region (all slots).
+ */
+int nvm_param_erase_all(void);
+
+#endif /* __NVM_PARAM_H */

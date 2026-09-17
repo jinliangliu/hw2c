@@ -1,0 +1,29 @@
+components:
+  - name: shell
+    type: shell_cli
+    driver: usart2
+    period_ms: 50
+    sleep_compat: STOP1
+    config:
+      prompt: "mhde> "
+      history_size: 8
+    priority: 3
+    stack_size: 1024
+
+  - name: led
+    type: led
+    driver: gpio
+    period_ms: 50
+    sleep_compat: STOP1
+    config:
+      default_pattern: off
+
+  - name: btn
+    type: btn
+    driver: gpio
+    period_ms: 10
+    sleep_compat: STOP1
+    config:
+      long_press_ms: 3000
+      double_click_ms: 500
+      debounce_ms: 50

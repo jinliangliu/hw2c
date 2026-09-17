@@ -143,6 +143,9 @@ set(APP_SOURCES
 {% if has_spi %}
     src/drivers/spi_api.c
 {% endif %}
+{% if has_persistent_params %}
+    src/drivers/nvm_param.c
+{% endif %}
     src/drivers/gpio_api.c
 {% if has_mpu6050 %}
     src/attitude.c
