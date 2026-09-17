@@ -749,6 +749,199 @@ def test_the_configured_project_version_reaches_the_firmware():
     )
 
 
+# ---------------------------------------------------------------------------
+# Image header fw_version: derived from project.version, never a constant
+# ---------------------------------------------------------------------------
+
+_CMAKE_BLOCK_START = "set(HW2C_FW_VERSION_DERIVED"
+_CMAKE_BLOCK_END = 'message(STATUS "hw2c: firmware version (image header fw_version)'
+
+
+def _render_cmake_lists(version, packed, has_bootloader=True):
+    """Render project/CMakeLists.txt.j2 for a project, with the version forced.
+
+    `packed=None` simulates the context losing `project_version_packed` — the
+    template is contractually required to refuse that, not to generate a broken
+    project.
+    """
+    from generator.context.builder import build_context
+
+    hardware = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [
+            {"id": "PA2", "function": "USART2_TX", "af": 1},
+            {"id": "PA3", "function": "USART2_RX", "af": 1},
+        ],
+        "peripherals": [
+            {"name": "usart2", "type": "UART_Serial", "instance": "USART2",
+             "interface": "uart", "extra": {"baudrate": 115200}},
+        ],
+        "bootloader": {"enabled": has_bootloader},
+    }
+    context = build_context(hardware, "cmake-version-guard")
+    context["project_version"] = version
+    if packed is None:
+        context.pop("project_version_packed", None)
+    else:
+        context["project_version_packed"] = packed
+    return _make_env().get_template("project/CMakeLists.txt.j2").render(context)
+
+
+def _version_resolution_block(cmake_text):
+    """Cut the fw_version resolution logic out of the rendered CMakeLists.
+
+    That slice is plain script-mode CMake — no project, no targets, no
+    toolchain — so `cmake -P` can execute it.  Running the real thing beats
+    pattern-matching the source: 'the default is derived' is a claim about the
+    decision CMake makes, including which of the three sources wins.
+    """
+    start = cmake_text.index(_CMAKE_BLOCK_START)
+    end = cmake_text.index(_CMAKE_BLOCK_END, start)
+    end = cmake_text.index("\n", end) + 1
+    return cmake_text[start:end]
+
+
+def _resolve_fw_version(cmake_text, tmp_path, name="probe", env=None,
+                        defines=()):
+    """Run the extracted block under `cmake -P`; return (value, source)."""
+    import os
+    import shutil
+    import subprocess
+
+    cmake = None
+    for cand in (os.environ.get("H2C_CMAKE_PATH"), shutil.which("cmake"),
+                 "C:/mingw64/bin/cmake.exe"):
+        if cand and shutil.which(cand):
+            cmake = cand
+            break
+    if cmake is None:
+        import pytest
+        pytest.skip("cmake not available")
+
+    script = tmp_path / ("fw_version_%s.cmake" % name)
+    script.write_text(
+        _version_resolution_block(cmake_text)
+        + '\nmessage(STATUS "H2C_RESOLVED=${FW_VERSION}|'
+          '${HW2C_FW_VERSION_SOURCE}")\n',
+        encoding="utf-8", newline="\n")
+
+    run_env = dict(os.environ)
+    # A developer machine with FOTA_VERSION exported would otherwise win over
+    # the case under test and make this probe answer the wrong question.
+    run_env.pop("FOTA_VERSION", None)
+    if env:
+        run_env.update(env)
+
+    proc = subprocess.run([cmake, *defines, "-P", str(script)],
+                          capture_output=True, text=True, env=run_env,
+                          cwd=str(tmp_path))
+    assert proc.returncode == 0, (
+        "cmake -P rejected the rendered fw_version block:\n%s\n%s"
+        % (proc.stdout, proc.stderr))
+    for line in proc.stdout.splitlines():
+        if "H2C_RESOLVED=" in line:
+            value, _, source = line.split("H2C_RESOLVED=", 1)[1].partition("|")
+            return value.strip(), source.strip()
+    raise AssertionError("probe produced no decision:\n%s" % proc.stdout)
+
+
+def test_image_header_version_is_derived_from_project_version(tmp_path):
+    """FR-14.7: what the bootloader compares must be derived, not a constant.
+
+    This is the other half of
+    `test_the_configured_project_version_reaches_the_firmware`: that one pins
+    what the firmware **prints**, this one pins what the image header
+    **carries**.  They used to disagree — CMake wrote the constant `1` into
+    every image header while the banner printed `1.0.0` for every project — and
+    the disagreement is invisible until you try to tell two firmware versions
+    apart, which is exactly what "did the OTA work?" rests on.
+
+    Assertions are differential on purpose: a single-version assertion passes on
+    a hardcoded value.
+    """
+    cmake_a = _render_cmake_lists("1.0.0", 0x010000)
+    cmake_b = _render_cmake_lists("1.0.1", 0x010001)
+
+    # 1. Default (no override) = packed project.version, and it moves when the
+    #    configured version moves.
+    value_a, source_a = _resolve_fw_version(cmake_a, tmp_path, name="a")
+    value_b, source_b = _resolve_fw_version(cmake_b, tmp_path, name="b")
+    assert value_b == str(0x010001), (
+        "the image header version is not derived from project.version "
+        "(got %r, want 65537)" % (value_b,))
+    assert value_a != value_b, (
+        "two different project versions produced the same image header "
+        "version — the default is a constant again")
+    assert "1.0.1" in source_b, (
+        "the chosen source is not reported, so an override that silently won "
+        "cannot be told apart from the derived default")
+
+    # 2. It must actually reach patch_crc.py, otherwise the header stays 0.
+    assert "--version ${FW_VERSION}" in cmake_b, (
+        "patch_crc.py no longer receives the resolved version")
+
+    # 3. ...and it must equal what the firmware reports, or the device cannot
+    #    prove which image it is running (the E_CRC(-19) failure mode).
+    assert "0x010001" in _render_cli_driver(version="1.0.1", packed=0x010001), (
+        "the header version and the version printed by cmd_version() come from "
+        "different numbers")
+
+    # 4. The overrides survive, and the loser of the precedence is visible.
+    assert _resolve_fw_version(cmake_b, tmp_path, name="cli",
+                               defines=("-DFW_VERSION=9",))[0] == "9"
+    assert _resolve_fw_version(cmake_b, tmp_path, name="env",
+                               env={"FOTA_VERSION": "42"})[0] == "42"
+
+    # 5. The legacy constant 1 must be treated as stale, not as "the operator
+    #    asked for it" — otherwise an old build directory keeps writing 1 into
+    #    the header forever.
+    assert _resolve_fw_version(cmake_b, tmp_path, name="legacy",
+                               defines=("-DFW_VERSION=1",))[0] == str(0x010001)
+
+    # 6. The default must not be written to the CMake cache.  A cached default
+    #    goes sticky: reconfigure after bumping project.version and the header
+    #    keeps the old number while the banner prints the new one.
+    #    Comments are stripped first: the block *documents* the old
+    #    `set(FW_VERSION "1" CACHE STRING …)` line, and matching that would make
+    #    this check pass/fail on prose instead of on executed CMake.
+    executable = "\n".join(
+        line for line in cmake_b.splitlines()
+        if not line.lstrip().startswith("#"))
+    assert not re.search(r"set\(FW_VERSION[^\n]*CACHE", executable), (
+        "the fw_version default is written to the CMake cache again — it will "
+        "go sticky and the image header will disagree with the firmware banner")
+
+    # Mutation check: restore the exact regression (constant 1) and confirm the
+    # derived-value assertion fires.
+    mutated = cmake_b.replace("set(HW2C_FW_VERSION_DERIVED 65537)",
+                              "set(HW2C_FW_VERSION_DERIVED 1)")
+    assert mutated != cmake_b, "mutation anchor not found"
+    value_m, _ = _resolve_fw_version(mutated, tmp_path, name="mutated")
+    assert value_m == "1", (
+        "the probe did not observe the injected constant — this check is dead")
+    assert value_m != value_b, (
+        "the mutated default reproduced the failing build and the probe still "
+        "reported the derived value; the probe is not reading the block")
+
+
+def test_missing_project_version_packed_is_refused_at_generation_time():
+    """The derivation input must be mandatory, not optional.
+
+    `project_version_packed` missing from the context used to be survivable: the
+    generated CMakeLists would expand `--version` to nothing and `patch_crc.py`
+    would fail with argparse's `argument --version: expected one argument`,
+    which points nowhere near the real cause.  Refusing during generation keeps
+    the failure where the information is.
+    """
+    cmake = _render_cmake_lists("1.0.0", None)
+
+    assert "FATAL_ERROR" in cmake, (
+        "a project without project_version_packed renders a CMakeLists that "
+        "silently writes no version into the image header")
+    assert "FR-14.7" in cmake, (
+        "the refusal does not point at the requirement it enforces")
+
+
 def test_project_version_is_parsed_strictly():
     """Bad version strings must fail at generation time, not silently degrade.
 

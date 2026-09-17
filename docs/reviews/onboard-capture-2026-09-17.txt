@@ -272,14 +272,13 @@ YMODEM 的数据块超时基准就是那个第二个 'C'；漏掉它，外部发
   → 结果 rc=0 derr=0
      目标槽 vs 新镜像: 逐字节一致（exp=118272）
 
-⚠️ 遗留决策（未改，需你定）：镜像头的 `fw_version` 默认由 CMake 的
-`FW_VERSION=1` 固定（`templates/project/CMakeLists.txt.j2`），**每个工程的
-每个版本都是 1**，v1.0.0 与 v1.0.1 在镜像头里无法区分。当前引导器的槽切换
-不看这个字段（只认元数据 DONE + 目标槽 CRC），所以不影响本次升级；
-但 `boot_read_fw_version()` 已存在却无人使用，显然是为"按版本挑更新槽"留的
-—— 真要用它，常量 1 会让该功能永远不触发。建议默认改为派生的打包语义版本
-（`project_version_packed`），仍保留 `-DFW_VERSION` 覆盖。这属于语义变更，
-按惯例先改 `docs/requirements.md` 再落实现。
+✅ 已落地（2026-09-17 下午，见 §9）：镜像头的 `fw_version` 默认改为**派生自
+`project.version`**（`major<<16|minor<<8|patch`），并保留 `-DFW_VERSION` /
+环境变量 `FOTA_VERSION` 覆盖；需求进了 `docs/requirements.md` FR-14.7。
+
+⚠️ 真实情况比上面那段"建议"更糟：按建议改完默认值之后，真机上版本号**还是不变**。
+因为 `project.version` 从来就没走到 `build_context()` —— 见 §9 的缺陷 D。
+"默认值常量"只是两个独立原因里的第二个；只改它等于什么都没改。
 
 ----------------------------------------------------------------
 [7.4] 串口适配器再次卡死（同 §5）
@@ -304,16 +303,82 @@ YMODEM 的数据块超时基准就是那个第二个 'C'；漏掉它，外部发
   已改为：含换行的块整段留原文 + 原始字节另存 `<transcript>.raw.bin`。
 
 ================================================================
-[8] 待办（本次更新）
+[8] 待办（2026-09-17 收尾状态）
 ================================================================
-· **重插 FTDI 后跑完 YMODEM 真机端到端** —— 命令：
-    pyocd flash output/mhde_mainboard/build/combined.bin -t stm32g0b1vetx -e chip --no-reset
-    pyocd reset -t stm32g0b1vetx
+✅ **YMODEM 真机端到端已跑通** —— 见 §9（判据全部满足：`version` 报 1.0.1、
+Build 时间变成新镜像的、`fota status` = DONE、复位后引导器切到槽 B）。
+· 命令（可复现，注意夹具要先重建）：
+    bash .workbuddy/tmp/rebuild_ota_fixture.sh
+    pyocd flash output/mhde_mainboard/build/combined.bin -t stm32g0b1vetx -e chip
     <受管 venv>/python.exe .workbuddy/tmp/ym_e2e.py \
         .workbuddy/tmp/mhde_v101.h2cd --block 128 --post 45 \
-        --transcript .workbuddy/tmp/ym_e2e_transcript.txt --ymodem-debug
-  判据：升级后 `version` 报 1.0.1、横幅 Build 时间是新的、
-  `fota status` 走完 RECEIVING→READY→APPLYING→DONE、复位后引导器切到槽 B。
-· fw_version 默认值语义（§7.3 末尾）—— 需先改需求文档
+        --transcript .workbuddy/tmp/ym_e2e_v101_transcript.txt --ymodem-debug
+· ⚠️ `output/` 下还堆着历次"原子替换绕法"留下的 `*.older/.bak/.prev` 目录
+  （每个 700 项上下）。它们会让生成器的 `rm -rf *.older` 撞上批量删除守卫、
+  连带 `mv` 失败。绕法：把旧目录 `mv` 到别处再生成。**待清理**。
 · 引导决策表（P4）
 · `cli_task` 那类"整批只判一次状态"的写法值得在其它 RX 路径上再审一遍
+
+================================================================
+[9] 真机端到端通过 + 缺陷 D：`project.version` 从未走到上下文
+================================================================
+
+最终结果（槽 A v1.0.0 → 槽 B v1.0.1，第三方 YMODEM 发送端）：
+  · 传输 2409 B / 4.5 s 成功（`python-ymodem` 发送端返回 success）
+  · 复位后横幅 `mhde_v101 v1.0.1`，`version` = **Firmware version: 1.0.1**
+    （升级前是 1.0.0，Build 14:43:15；升级后 Build 14:43:23 ⇒ 换的确实是新镜像）
+  · `fota status` = DONE / last error 0；再次复位后仍跑 1.0.1（引导器持续选槽 B，
+    状态 DONE 被引导器消费后归 IDLE）
+  · **独立取证**：从设备读回槽 B（`savemem 0x08040000 0x1CE00`）与本地
+    `output/mhde_v101/build/mhde_v101_crc.bin` **sha256 完全一致**
+    （a56071b47cccf96c…），不是"传完了但没应用"。
+  · 两镜像头部各自带着派生的版本：v1.0.0 → `0x010000`(65536)、
+    v1.0.1 → `0x010001`(65537)；信封 `fw_version` 自动取新头部值 65537。
+
+缺陷 D（本次新发现，**比缺陷 C 更靠前**）：`generate.py` 把软件层字段用
+**手写白名单**搬进 `hw`：
+
+    if "app_tasks" in merged:        hw["app_tasks"] = …
+    if "behavior" in merged:         hw["behavior"] = …
+    if "periodic_events" in merged:  hw["periodic_events"] = …
+    if "bind_routings" in merged:    hw["bind_routings"] = …
+
+而 `hw` 在这之前已被 `hw = HardwareModel.model_dump(hw_raw)` **整个换掉**
+（`hw_raw` 只有 hardware.yaml）。`mapper.merge()` 后来开始携带
+`project.name` / `project.version`，没人往白名单里补两行 ⇒ task.yaml 里写的
+`version` 在真实链路里被静默丢弃，`build_context()` 退回
+`DEFAULT_PROJECT_VERSION = "1.0.0"`。
+
+后果与 §7.3 的缺陷 C 叠加：**改默认值本身并不能让版本号动起来**。
+第一次按 §7.3 建议改完默认值后重建夹具，`hw2c: firmware version … = 65536
+[派生自 project.version = 1.0.0]` —— 派生是对的，派生源是错的。
+
+为什么没被测试拦住：既有用例 `test_project_version_survives_the_three_layer_merge`
+验的是 `merge()` → `HardwareModel` 这一段，而丢值发生在**两者之间**那一句。
+典型的"测了通路的两端、没测通路"。
+
+修法：删掉白名单，整体并入 —— `hw_model` 只负责硬件层的校验与规范化，
+`merged` 是硬件层 + 软件层的权威合并视图，硬件层已验证值优先：
+
+    for _merged_key, _merged_value in merged.items():
+        hw.setdefault(_merged_key, _merged_value)
+
+新护栏：`generator/tests/test_generate.py::test_software_layer_fields_survive_the_real_pipeline`
+—— 用 `generate_project()` 的依赖注入在 `build_context_fn` 处**观察真实实参**，
+期望键集合由 `merge()` 现算（不写第二份名单），因此以后 mapper 再加字段也必须
+自动通过。已做变异验证（把整体并入换成 `pass` ⇒ 用例 FAIL）。
+
+缺陷 E（同源，改默认值时发现）：`templates/project/CMakeLists.txt.j2` 里
+派生出的默认值**不能写进 CMake cache**。cache 一旦写入就粘住：改完 task.yaml
+重新 configure 时旧值继续写进镜像头，而 banner / `version` 打的是新渲染出的
+`project.version` ⇒ 同一块板子上两个版本号（正是 C/D 同源的失效模式）。
+覆盖判据也因此按**值**而不是"cache 里有没有这个变量"：旧模板把常量 1 写进过
+cache，而 CMake 对命令行 `-D` 会沿用既有 cache 条目的类型 ⇒ "类型是不是
+UNINITIALIZED"区分不出"用户显式指定"与"旧模板的陈旧值"，真那样写会让旧构建
+目录里的 `-DFW_VERSION=9` 被静默忽略。故 1 一律视为陈旧并清除。
+
+护栏：`generator/tests/test_template_render.py::test_image_header_version_is_derived_from_project_version`
+—— 把渲染出的 CMake 版本解析块用 `cmake -P` **真跑一遍**（不是正则匹配源码），
+四种来源各验一次 + 变异验证；另有
+`test_missing_project_version_packed_is_refused_at_generation_time`（派生输入
+缺失必须在生成期 `FATAL_ERROR`，而不是让 `--version` 展开为空）。

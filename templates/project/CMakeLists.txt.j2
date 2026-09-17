@@ -339,17 +339,57 @@ add_custom_target(coverage
 {% if has_bootloader %}
 # ── 固件版本号（写入槽内镜像头的 fw_version 字段，24-bit）──────────────────────
 #
-# 原实现直接写 `--version $ENV{FOTA_VERSION}`：环境变量没设时它展开为空，
-# 命令行退化成 `patch_crc.py x.bin --version -o y.bin`，argparse 报
-# "argument --version: expected one argument" —— 也就是 `app` / `combined`
-# 两个目标默认**跑不起来**，而报错完全指不到"你没设环境变量"。
-# 现在给一个可覆盖的默认值：-DFW_VERSION=2，或设环境变量 FOTA_VERSION。
+# 这个数同时出现在**两个**地方，而两者必须一致（FR-14.7）：
+#   · 镜像头 +0x0C —— 由这里写进去，引导器用它比较"哪个槽更新"
+#   · 固件 banner / `version` 命令打印的 project.version —— 编译期常量
+# 一旦分叉，"升级后设备报的版本号"就不再能证明镜像头里装的是哪一版；这与
+# `delta_envelope.fw_version` 与镜像头不一致那次真机 E_CRC(-19) 是同源的失效
+# 模式（`docs/reviews/onboard-capture-2026-09-17.txt` §7.3）。
+#
+# 所以默认值**派生自 task.yaml 的 project.version**（major<<16|minor<<8|patch），
+# 不是常量。原先的常量 1 有两个后果：每个工程的每个版本都是 1，
+# `boot_read_fw_version()` 那句"按版本挑更新的槽"永远不触发；而且升级成功也
+# 看不出任何版本变化（v1.0.0 → v1.0.1 在镜像头里无法区分）。
+#
+# 默认值也**不写进 CMake cache**：cache 一旦写入就粘住 —— 改完 task.yaml 重新
+# configure 时旧值仍会写进镜像头，而 banner / `version` 打的是新渲染出的
+# project.version，于是同一块板子上出现两个版本号。
+{% if project_version_packed is not defined %}
+# 渲染期契约：project_version_packed 必须进入模板上下文（generator/context/builder.py）。
+# 它缺失时 `--version` 会展开为空，`patch_crc.py` 的 argparse 报
+# "argument --version: expected one argument"，指向完全无关的地方。
+# 派生值缺失要在**生成期**就炸，别生成一个坏工程（FR-14.7）。
+message(FATAL_ERROR
+    "hw2c: project_version_packed 未进入模板上下文，拒绝生成 —— "
+    "镜像头 fw_version 无法从 project.version 派生（见 FR-14.7）")
+set(HW2C_FW_VERSION_DERIVED 0)
+{% else %}
+set(HW2C_FW_VERSION_DERIVED {{ project_version_packed }})
+{% endif %}
+
+# 覆盖顺序（1、2 是刻意保留的逃生口）：
+#   1) 环境变量 FOTA_VERSION
+#   2) 命令行 -DFW_VERSION=…
+#   3) 全都缺席 → 派生自 project.version
+#
+# ⚠️ 判据是「值」，不是「cache 里有没有这个变量」。原因：旧模板用
+#    `set(FW_VERSION "1" CACHE STRING …)` 把常量 1 写进了 cache，而 CMake 在
+#    命令行给 -D 时**保留既有 cache 条目的类型**（AddCacheEntry 对 UNINITIALIZED
+#    的入参沿用旧类型），所以"类型是不是 UNINITIALIZED"区分不出"用户显式指定"
+#    与"旧模板留下的陈旧值"：真那样写，旧构建目录里 -DFW_VERSION=9 会被静默忽略。
+#    改按值判断：1 既是旧模板的自动默认值、也正是本次要淘汰的取值，一律视为陈旧
+#    并清除，其余取值照常当作显式覆盖。代价是"显式要 1"也被当作陈旧 —— 可接受，
+#    因为 1 正是要消除的那个常量。覆盖来源会打进下面的 STATUS 日志，不静默。
 if(DEFINED ENV{FOTA_VERSION} AND NOT "$ENV{FOTA_VERSION}" STREQUAL "")
-    set(FW_VERSION "$ENV{FOTA_VERSION}" CACHE STRING "固件版本号（24-bit，写入槽内镜像头）" FORCE)
+    set(FW_VERSION "$ENV{FOTA_VERSION}")
+    set(HW2C_FW_VERSION_SOURCE "环境变量 FOTA_VERSION")
+elseif(DEFINED FW_VERSION AND NOT FW_VERSION STREQUAL "" AND NOT FW_VERSION STREQUAL "1")
+    set(HW2C_FW_VERSION_SOURCE "命令行 -DFW_VERSION")
 else()
-    set(FW_VERSION "1" CACHE STRING "固件版本号（24-bit，写入槽内镜像头）")
+    set(FW_VERSION "${HW2C_FW_VERSION_DERIVED}")
+    set(HW2C_FW_VERSION_SOURCE "派生自 project.version = {{ project_version }}")
 endif()
-message(STATUS "hw2c: firmware version (image header fw_version) = ${FW_VERSION}")
+message(STATUS "hw2c: firmware version (image header fw_version) = ${FW_VERSION} [${HW2C_FW_VERSION_SOURCE}]")
 
 # ── Bootloader ───────────────────────────────────────────────────────────────
 # Build via external process (bootloader uses bare-metal, separate linker script)

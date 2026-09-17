@@ -263,6 +263,7 @@
 | FR-14.4 | 差分 FOTA：H2CD v1 信封 + HPatchLite 兼容 lite 流 + tinyuz 压缩（`delta_tool.py` 自研写侧），减小 OTA 传输体积，完整性校验 + 幂等重放 |
 | FR-14.5 | 接收侧传输状态机：帧协议（START/DATA/END/ABORT，带序号与重传）驱动同一个 staging 会话；掉电续传、幂等重放、越界拒绝 |
 | FR-14.6 | **YMODEM 传输通道**：CLI `fota ymodem` 进入接收态后，任何终端软件（Tera Term / SecureCRT / lrzsz `sb`）用**内置的 YMODEM 发送功能**即可完成升级，不需要专用上位机；与帧协议共用同一个 staging 会话与准入判据，不引入第二套 OTA 流程 |
+| FR-14.7 | **镜像头 `fw_version` 默认派生自 `project.version`**（24-bit 打包 `major<<16 \| minor<<8 \| patch`），使同一工程的相邻版本必然得到**不同且单调**的取值；仍可用 `-DFW_VERSION` / 环境变量 `FOTA_VERSION` 覆盖。该默认值**不得**是固定常量、也**不得**写入 CMake cache：常量会让 `boot_read_fw_version()`（"按版本挑更新的槽"）永不触发，且升级后设备上报的版本号不变，等于失去"设备到底跑哪一版"的唯一判据；粘住的 cache 会让**镜像头里的版本与固件内部显示的版本分叉**（同 FR-14.4 那条 `delta_envelope.fw_version` 一致性契约同源的失效模式）。同一配置下，由 `patch_crc.py` 写入镜像头的版本号必须等于 CLI / banner 打印的 `project.version` |
 
 ### FR-15 调试与可观测性 ✅
 

@@ -245,7 +245,7 @@ python .workbuddy/tmp/serial_capture.py --out <log> --trigger "starting schedule
     于是把同一个现场当成新命中 → 判定条件要写成"停在**不同于**上次的位置"；
     ② 从断点地址本身 `resume` 会原地再次触发（且实测 `target.step()` 不前进），
     **优先只打断点一次、读完就走**，不要入口/返回各打一个。
-12. **新增"第二条投递通道"时，别抄第一份的约定**（YMODEM 通道，2026-09-17）。
+13. **新增"第二条投递通道"时，别抄第一份的约定**（YMODEM 通道，2026-09-17）。
    FOTA 接收现在有两条传输通道（HWC 帧协议 `fota recv`、YMODEM `fota ymodem`），
    它们**只允许在"字节怎么进来"上不同**：定长分片 + 显式序号 + 停等 ACK，还是
    128/1024 字节块 + 16 位 CRC。字节进来之后的一切（容量准入公式、暂存区几何、
@@ -279,6 +279,39 @@ python .workbuddy/tmp/serial_capture.py --out <log> --trigger "starting schedule
    ⇒ 给生成源码**新增一个跨模块调用**时，必须跑一次受影响示例的
    `run_tests.py`；并让相关测试 `#include` 进完整的源码集合，
    **不要给它加空桩**（空桩会让"调用了不存在的实现"继续静默）。
+
+14. **"派生值"必须在真链路里断一次，且派生出的默认值不许落 CMake cache**
+   （版本号契约，2026-09-17 真机发现）。
+   `task.yaml: project.version` 同时决定**两个东西**：固件 banner / `version`
+   打印的字符串，和镜像头 `fw_version`（引导器判"哪个槽更新"的单调计数器）。
+   两者必须一致 —— 不一致时唯一症状是"升级成功了但版本号不变"，看起来像升级
+   没生效。彻底修好它需要**同时**动两处，而两处各有一个独立的静默失效方式：
+
+   - `generator/generate.py` 里把软件层字段搬进 `hw` 用的是**手写白名单**
+     （`app_tasks`/`behavior`/`periodic_events`/`bind_routings` 四个 `if`），
+     而 `hw` 在此之前已被 `HardwareModel.model_dump(hw_raw)` 整个换掉。
+     mapper 后来开始携带 `project.name`/`project.version`，没人往白名单补两行
+     ⇒ **配置里写的版本在真实链路里被静默丢弃**，退回默认 `1.0.0`。
+     修法：删掉白名单，整体并入（`for k, v in merged.items(): hw.setdefault(k, v)`）。
+     ⇒ 教训：任何"把合并结果按键搬过去"的代码都是**下一处静默丢失**；
+     要搬就搬全部。
+   - `templates/project/CMakeLists.txt.j2` 的默认值**不得写进 CMake cache**：
+     cache 一旦写入就粘住，改完 YAML 重新 configure 时旧值继续进镜像头，
+     而 banner 打的是新渲染的版本 ⇒ 同一块板子上两个版本号。
+     覆盖判据也要按**值**而不是"cache 里有没有这个变量"：旧模板把常量 1 写进过
+     cache，而 CMake 对命令行 `-D` 会沿用既有 cache 条目的类型，
+     "类型是不是 UNINITIALIZED"区分不出"用户显式指定"与"陈旧自动值"。
+     覆盖优先级：`$FOTA_VERSION` > `-DFW_VERSION` > 派生自 `project.version`，
+     并把**被选中的来源**打进 configure 日志（不静默）。需求见
+     `docs/requirements.md` FR-14.7。
+   - 测试为什么没拦住：既有用例验的是 `merge()` 与 `HardwareModel` **两端**，
+     而丢值发生在这两端**之间**；另一处把 CMake 的常量当"实现细节"跳过。
+     ⇒ 看到"我改了但真机没反应"，先确认**派生到底有没有发生**（把中间值打出来），
+     再怀疑下游。护栏：
+     `test_generate.py::test_software_layer_fields_survive_the_real_pipeline`
+     （在 `build_context_fn` 处观察真实实参，期望键集合由 `merge()` 现算）与
+     `test_template_render.py::test_image_header_version_is_derived_from_project_version`
+     （把渲染出的 CMake 解析块用 `cmake -P` 真跑一遍）。两者都做过变异验证。
 
 ## CI（.github/workflows/build_and_test.yml）
 

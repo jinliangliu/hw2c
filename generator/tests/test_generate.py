@@ -69,6 +69,84 @@ def test_generate_with_mock_context_builder():
         f"Expected ('test_output_mock', False), got {called_builder[0]}"
 
 
+def test_software_layer_fields_survive_the_real_pipeline(tmp_path):
+    """task.yaml's `project.version` must actually reach `build_context()`.
+
+    `generate_project()` re-derives `hw` from hardware.yaml through the Pydantic
+    model and then merged the software layer back through a **hand-written
+    whitelist** (`app_tasks` / `behavior` / `periodic_events` / `bind_routings`).
+    When `mapper.merge()` started carrying `project.name` / `project.version`,
+    nobody added them, so `version: "1.0.1"` written in task.yaml was silently
+    dropped and the firmware fell back to the default `1.0.0`.  Nothing errored
+    at generation time; the symptom was that a successful differential OTA left
+    the reported version unchanged, i.e. looked like "the upgrade did nothing"
+    (FR-14.7).
+
+    The previous unit test stayed green because it checked `merge()` against
+    `HardwareModel` in isolation — the drop happened *between* them.  So this
+    test observes the dict that really reaches the context builder, and it
+    derives the expected key set from `merge()` instead of listing it a second
+    time: any field the mapper starts carrying must survive without anyone
+    remembering to edit the generator.
+    """
+    import yaml
+
+    from generator.generate import generate_project
+    from generator.mapper import merge
+
+    hardware = {"mcu": {"part": "STM32G0B1RET6"}, "peripherals": []}
+    task = {
+        "project": {"name": "ver_probe", "version": "9.8.7"},
+        "app_tasks": [{"name": "probe_task", "priority": 3}],
+        "behavior": {"initial_state": "idle", "states": {}},
+    }
+
+    def load(path):
+        return task if str(path).endswith("task.yaml") else hardware
+
+    seen = {}
+
+    def build_context_fn(hw, name, hil=False):
+        seen.update(hw)
+        # An empty context makes rendering blow up, which is fine: the argument
+        # handed to the builder is the whole subject of this test.
+        return {}
+
+    try:
+        generate_project(
+            yaml_path="hardware.yaml",
+            output_dir=str(tmp_path / "ver_probe_out"),
+            task_yaml_path="task.yaml",
+            validate_fn=lambda hw: [],
+            build_context_fn=build_context_fn,
+            load_yaml_fn=load,
+        )
+    except (SystemExit, Exception):
+        pass
+
+    assert seen, "build_context() was never called — this check is dead"
+
+    expected = merge(yaml.dump(hardware), yaml.dump(task), "")
+    software_keys = sorted(set(expected) - set(hardware))
+    assert software_keys, (
+        "merge() no longer contributes anything beyond hardware.yaml, so this "
+        "test cannot observe the drop it is guarding against")
+
+    missing = [k for k in software_keys if k not in seen]
+    assert not missing, (
+        "these merged software-layer fields never reach build_context(): %s — "
+        "generate.py is dropping them again (a whitelist that nobody extended, "
+        "or a new field added to mapper.merge() without a counterpart in "
+        "generate.py)" % (missing,))
+
+    # The two that were actually lost, pinned by value so a silent fallback to
+    # the default version cannot pass.
+    assert seen["project_version"] == "9.8.7", (
+        "the configured project.version did not survive the pipeline; the "
+        "firmware would report the built-in default instead")
+    assert seen["project_name"] == "ver_probe"
+
+
 if __name__ == "__main__":
     test_generate_with_mock_validator()
     test_generate_with_mock_context_builder()

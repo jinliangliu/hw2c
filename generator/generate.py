@@ -1108,14 +1108,23 @@ def generate_project(
         # Inject merged software fields into hw (needed by business
         # validation AND context building — behavior actions must be
         # validated at generation time, not at runtime).
-        if "app_tasks" in merged:
-            hw["app_tasks"] = merged["app_tasks"]
-        if "behavior" in merged:
-            hw["behavior"] = merged["behavior"]
-        if "periodic_events" in merged:
-            hw["periodic_events"] = merged["periodic_events"]
-        if "bind_routings" in merged:
-            hw["bind_routings"] = merged["bind_routings"]
+        #
+        # ⚠️ 这里曾经是一串**手写白名单**：app_tasks / behavior /
+        # periodic_events / bind_routings 各一个 `if "x" in merged`。
+        # 白名单的失效方式**不报错** —— `mapper.merge()` 后来开始携带
+        # `project.name` / `project.version`，而没人记得往这里补两行，于是
+        # task.yaml 里写的 `version: "1.0.1"` 在真实生成链路里被静默丢掉，
+        # `build_context()` 退回默认的 1.0.0：差分 OTA 升级成功后设备报的版本
+        # 号纹丝不动，看起来像"升级没生效"（FR-14.7）。
+        # 旧测试没拦住，是因为它只验 `merge()` 到 `HardwareModel` 这一段，
+        # 而丢值发生在两者之间的这一步。
+        #
+        # 改成整体并入，别再维护第二份键名单：`hw_model` 只负责**硬件层**的
+        # 校验与规范化，`merged` 才是硬件层 + 软件层的权威合并视图。
+        # 硬件层的已验证值优先（上面那句 model_dump 已经把它们放进 hw 了），
+        # 其余键一律从 merged 补入 —— 新增软件层字段不需要再改这里。
+        for _merged_key, _merged_value in merged.items():
+            hw.setdefault(_merged_key, _merged_value)
         if pubsub_raw and "topics" in pubsub_raw:
             hw["topics"] = pubsub_raw["topics"]
 
