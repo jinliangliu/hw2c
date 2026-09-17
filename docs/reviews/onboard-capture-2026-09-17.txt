@@ -220,18 +220,22 @@ YMODEM 的数据块超时基准就是那个第二个 'C'；漏掉它，外部发
 
 破局办法（不依赖串口，也不依赖板子）：设备侧应用层是"纯逻辑 + 后端注入"
 （无 HAL、无 `#ifdef TEST`），所以把**真机那份** `drv_fota_delta.c` 原样编到
-主机上，喂**真实产物**重放：
+主机上，喂**真实产物**重放。工具已固化进仓库（不再是一次性脚本）：
+`tools/fota_apply_replay/apply_real.c`，用法见文件头注释。现场用的就是它：
 
-  $ gcc -std=c99 -O1 -I output/mhde_mainboard/src/drivers \
-        -I static/third_party/hpatch_lite -I static/third_party/tinyuz/decompress \
-        .workbuddy/tmp/apply_real_harness.c \
+  $ gcc -std=c99 -O1 -Wall -Wextra -Werror \
+        -I output/mhde_mainboard/src/drivers \
+        -I static/third_party/hpatch_lite \
+        -I static/third_party/tinyuz/decompress \
+        tools/fota_apply_replay/apply_real.c \
         output/mhde_mainboard/src/drivers/drv_fota_delta.c \
         static/third_party/hpatch_lite/hpatch_lite.c \
-        static/third_party/tinyuz/decompress/tuz_dec.c -o apply_real.exe
-  $ ./apply_real.exe output/mhde_mainboard/build/mhde_mainboard_crc.bin \
-        .workbuddy/tmp/mhde_v101.h2cd output/mhde_v101/build/mhde_v101_crc.bin
-  → 结果 rc=-19 derr=-19   (E_CRC)
-     槽 A 是否被改动: 未改动 ✓
+        static/third_party/tinyuz/decompress/tuz_dec.c -o apply_real
+  $ ./apply_real output/mhde_mainboard/build/mhde_mainboard_crc.bin \
+        .workbuddy/tmp/mhde_v101.h2cd \
+        output/mhde_v101/build/mhde_v101_crc.bin
+  → 结果 rc=-19 (E_CRC(-19)) derr=-19
+     活动槽是否被改动: 未改动 ✓
 
 定位：设备侧那 10 条校验逐条比对，前 3 条都过：
   · 槽 A 镜像头 magic ✓
