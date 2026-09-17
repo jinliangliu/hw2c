@@ -83,8 +83,10 @@ cd output/<demo>/test/sil
 cmake -B build -G Ninja -DCMAKE_MAKE_PROGRAM="C:/mingw64/bin/ninja.exe" -DCMAKE_C_COMPILER="C:/mingw64/bin/gcc.exe"
 cmake --build build; ./build/test_component_sil
 
-# 5) 生成器/解析器 Python 测试
-python -m pytest generator/tests tests -q
+# 5) 生成器/解析器 Python 测试（三个目录都要给，与 CI 一致）
+python -m pytest tests parser/tests generator/tests -q
+#    ⚠️ 只写 `generator/tests tests` 会静默漏掉 parser/tests 的 139 条
+#    （715 条里少收 139 条，全绿但没测过网表/BOM 解析）
 
 # 6) 烧录 + 串口验证
 #    ⚠️ 本机 OpenOCD 驱动不了 DAP-Link（CMSIS-DAP v2 / WinUSB），用 pyOCD
@@ -344,8 +346,8 @@ python .workbuddy/tmp/serial_capture.py --out <log> --trigger "starting schedule
 
 16. **YAML 里写了、却没有任何代码会去读的键，必须在生成期出声**
    （`project.heap_size`，2026-09-17）。
-   `mapper.merge()` 从 `task.yaml` 的 `project` 块里只取 `name` / `version`；而几个
-   示例都写了 `project.heap_size: 24576`（`knob_demo` 是 16384）—— 作者以为堆配上了，
+   `mapper.merge()` 从 `task.yaml` 的 `project` 块里只取 `name` / `version`；而仓库里
+   **10 个示例无一例外**都写了 `project.heap_size`（24576 / 16384）—— 作者以为堆配上了，
    实际生成的链接脚本一直是默认 `0x200`，FreeRTOS 堆照旧走自动推算。这不是"解析
    失败"，而是**根本没进解析**，所以教训 15 那类 fail-loud 拦不住它。
 
@@ -357,6 +359,16 @@ python .workbuddy/tmp/serial_capture.py --out <log> --trigger "starting schedule
    `hardware.yaml`（进链接脚本，是留给 newlib 的系统堆），FreeRTOS 的堆另起名
    `rtos_heap_size` 放 `task.yaml` 顶层 —— 复用名字会让"放错层"看起来是对的。
    新增配置项时记得同步 `split_legacy()` 的层归属列表（旧单体 YAML 走那条路径）。
+
+   ⚠️ **存量清理必须一次扫全，不能只修"当下 grep 到的那几个"**。第一次改只顺着
+   报错现场清了 4 个示例，剩下 6 个照旧留着死键；生成机制加上告警之后，这 6 个
+   每次生成都会各刷一条 WARNING —— 而长日志里的重复告警很快就会被无视，等于没修。
+   改这类"横向缺陷"的正确顺序是：**先写一条扫全仓库的护栏，再按它的输出清干净**
+   （`test_generate.py::test_no_shipped_example_declares_a_dead_project_key` 遍历真实
+   `examples/*/task.yaml`，带正控防止断言恒真 —— 示例本身就是文档，留死配置等于
+   教用户写错层）。变异脚本 `.workbuddy/tmp/mutate_dead_project_key_guard.py`
+   （4/4 抓到，其中一条用的是从未出现过的新键名 `stack_pool_bytes`，证明挡的是
+   缺陷类别而非字面量 `heap_size`）。
 
    FreeRTOS 堆：缺省由 `compute_heap_size()` 按任务集推算，显式配置优先，非法值
    （非整数 / ≤0 / 非 8 字节对齐 / 超过 RAM 容量）在**生成期报错**（FR-3.16）。
