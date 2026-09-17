@@ -23,6 +23,8 @@ from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ..peripheral_types import SPI_DEVICE_TYPES
+
 
 # =========================================================================
 # 1. Enums
@@ -183,7 +185,11 @@ VALID_PERIPHERAL_TYPES: frozenset[str] = frozenset({
     "UART_Serial",
     "I2C_Sensor_MPU6050", "I2C_EEPROM", "I2C_Pressure", "I2C_TempSensor",
     "NTC_TempSensor",
-    "SPI_Flash_W25Q32", "SPI_Flash_Generic", "SPI_Sensor_MPU6500",
+    # SPI 器件的型号集合来自 peripheral_types.py，不在这里重复列举 ——
+    # 漏加一个型号只会让它在 schema 层被拒（有响声），但如果这里和
+    # 家族的其余消费者（引脚表 / builder / 校验器 / 模板）各写一份，
+    # 漏掉的那份就是静默失效。护栏见 tests/test_peripheral_type_registry.py。
+    *SPI_DEVICE_TYPES,
     "FOC_Motor",
     "RS485", "Cellular_4G",
     "Protocol_Modbus", "Protocol_MQTT",

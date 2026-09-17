@@ -1,15 +1,80 @@
+# ============================================================================
+# W25Q32JV —— Winbond 32 Mbit 串行 NOR Flash
+#
+#   型号       W25Q32JV（SOIC-8，工业级）
+#   手册       W25Q32JV datasheet, Rev. H（Winbond）
+#
+#   已验证事实（可依此复核，不要凭印象改）：
+#     · RDID(0x9F) => EF 40 16   （厂家 0xEF，类型 0x40，容量 0x16）
+#       容量字节 0x16 ⇒ 2^22 = 4,194,304 B = 4 MB
+#     · 均匀 256 B 页编程 / 均匀 4 KB 扇区擦 / 32K·64K 块擦 / 整片擦
+#     · 2.7 ~ 3.6 V，支持 Mode 0 与 Mode 3
+#     · 4 MB 地址空间落在 24 位内 ⇒ 3 字节地址，不需要 4 字节地址模式
+#
+#   几何、命令码、状态位、时序上限与 P25Q64H 是同一套契约 ——
+#   校验见 generator/device_models.py，护栏见 tests/test_device_models.py。
+# ============================================================================
 model: "W25Q32"
+# 注意：`type` 字段历史上并不统一（这里写 "SPI_Flash"，Generic 写
+# "SPI_Flash_Generic"），而 hardware.yaml 的 type 查找键其实是**文件名**。
+# 校验器因此按文件名判家族，不读这个字段。
 type: "SPI_Flash"
 interface: "SPI"
 driver_template: "drivers/drv_spi_flash.c.j2"
 header_template: "drivers/drv_spi_flash.h.j2"
-spi_mode: 0           # CPOL=0, CPHA=0
-max_freq: 4000000
-sector_size: 4096
-total_size: 4194304   # 4 MB
+
+vendor: "Winbond"
+part_number: "W25Q32JV"
+
+spi_mode: 0            # CPOL=0, CPHA=0（器件同时支持 Mode 3）
+max_freq: 4000000      # 保守取值：手册标称 104 MHz，受本板走线与通用性限制
+address_bytes: 3       # 4 MB < 16 MB，3 字节地址即可
+
+# ---- 几何 ----
+page_size: 256         # 页编程粒度
+sector_size: 4096      # 扇区擦除粒度（0x20）
+block_size_32k: 32768  # 块擦除（0x52）
+block_size_64k: 65536  # 块擦除（0xD8）
+total_size: 4194304    # 4 MB
+
+# ---- 器件识别 ----
+jedec_id: [0xEF, 0x40, 0x16]
+
+# ---- 命令集 ----
 commands:
   READ_ID: 0x9F
   READ_DATA: 0x03
-  WRITE_ENABLE: 0x06
-  SECTOR_ERASE: 0x20
+  FAST_READ: 0x0B        # 高速读，1 字节 dummy
+  WRITE_ENABLE: 0x06     # WREN，置 WEL
+  WRITE_DISABLE: 0x04    # WRDI，清 WEL
+  READ_STATUS: 0x05      # RDSR-1，位 0 = WIP
+  PAGE_PROGRAM: 0x02     # PP，写前必须 WREN，跨页会在页内回绕
+  SECTOR_ERASE: 0x20     # SE，4 KB
+  BLOCK_ERASE_32K: 0x52
+  BLOCK_ERASE_64K: 0xD8
   CHIP_ERASE: 0xC7
+  DEEP_POWER_DOWN: 0xB9
+  RELEASE_POWER_DOWN: 0xAB
+
+status_bits:
+  WIP: 0x01
+  WEL: 0x02
+
+# ---- 时序上限（给 WIP 轮询设超时）----
+timing:
+  page_program_ms: 3
+  sector_erase_ms: 45
+  block_erase_32k_ms: 120
+  block_erase_64k_ms: 150
+  chip_erase_ms: 10000
+
+extra_schema:
+  cs_pin:
+    type: "pin"
+    required: true
+  spi_speed_hz:
+    type: "int"
+    required: false
+  total_size:
+    type: "int"
+    required: false

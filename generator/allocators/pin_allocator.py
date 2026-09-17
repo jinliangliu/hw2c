@@ -11,6 +11,7 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..mcu_database import MCUDatabase
+from ..peripheral_types import SPI_DEVICE_SIGNALS, SPI_DEVICE_TYPES
 
 logger = logging.getLogger("hw2c.pin_allocator")
 
@@ -31,15 +32,18 @@ _PERIPHERAL_SIGNALS: Dict[str, List[str]] = {
       "I2C_Pressure":      ["SCL", "SDA"],
       "I2C_TempSensor":    ["SCL", "SDA"],
       "NTC_TempSensor":    [],
-"SPI_Flash_W25Q32":  ["SCK", "MISO", "MOSI", "NSS"],
-"SPI_Flash_Generic": ["SCK", "MISO", "MOSI", "NSS"],
-"SPI_Sensor_MPU6500": ["SCK", "MISO", "MOSI", "NSS"],
 "Internal_PWM":      ["CH1"],
 "FOC_Motor":         [],   # TIM1/ADC/encoder pins are declared manually
 "Internal_ADC":      ["IN0"],
     "Cellular_4G":       ["TX", "RX", "PWR", "RST"],
     "Internal_IR":       ["OUT", "IN"],
 }
+
+# 四线 SPI 器件的信号需求与型号无关，所以从家族集合展开而不是逐个列举：
+# 逐个列举时新增一个型号会静默地不申请引脚（冲突检查随之失效）。
+_PERIPHERAL_SIGNALS.update(
+    {ptype: list(SPI_DEVICE_SIGNALS) for ptype in SPI_DEVICE_TYPES}
+)
 
 # Pin priority hints: prefer these (peripheral, signal) -> pin mappings
 # when multiple candidates are available. Used as tiebreaker in _select_best.

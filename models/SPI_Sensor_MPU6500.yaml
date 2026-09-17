@@ -3,6 +3,11 @@ type: "SPI_Sensor_MPU6500"
 interface: "SPI"
 driver_template: "drivers/drv_mpu6050.c.j2"
 header_template: "drivers/drv_mpu6050.h.j2"
+# SPI 时钟上限：手册允许寄存器读写 1 MHz、突发读传感器数据 20 MHz。
+# 取保守的 1 MHz —— 本驱动走的是"寄存器读 + 逐次读"，吃到的是前一个限制。
+# 缺这个字段时 builder 会退到 1 MHz 的兜底上限，效果相同但**没有出处**；
+# 显式写下来是为了让"为什么是这个数"可追溯。
+max_freq: 1000000
 whoami: 0x70
 registers:
   PWR_MGMT_1: 0x6B

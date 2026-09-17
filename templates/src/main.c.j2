@@ -445,7 +445,7 @@ int main(void)
 {% if 'I2C' in p.model.interface %}
     {{ p.name }}_init(i2c_open("{{ p.bus | lower }}", NULL), {{ '0x%02X' | format(p.get('address', p.model.get('address', p.model.get('i2c_addr', 0x68)))) }});
 {% elif 'SPI' in p.model.interface %}
-{% if p.type in ('SPI_Flash_W25Q32', 'SPI_Flash_Generic') %}
+{% if p.is_spi_flash %}
     spi_flash_init(&hspi{{ p.bus[-1] }});
 {% else %}
 {% set spi_cs_id = p.get('cs_pin', p.get('extra', {}).get('chip_select_pin', '')) %}

@@ -3,7 +3,7 @@
 #include <string.h>
 
 {# SPI Flash driver file is named after the peripheral instance (e.g. drv_flash.c) #}
-{% set spi_flash = peripherals | selectattr('type', 'in', ['SPI_Flash_W25Q32', 'SPI_Flash_Generic']) | first %}
+{% set spi_flash = peripherals | selectattr('is_spi_flash') | first %}
 #include "../src/drivers/drv_{{ spi_flash.name }}.c"
 
 static SPI_HandleTypeDef hspi_inst;

@@ -3,6 +3,8 @@ import os
 import importlib.util
 
 from .paths import MODELS_DIR, EXAMPLES_DIR
+from .peripheral_types import is_spi_device
+from .device_models import validate_model_file
 
 # Load generator/generator_types.py with explicit module name to avoid collision
 # with Python's stdlib 'types' module which is frozen at interpreter startup.
@@ -633,7 +635,7 @@ def validate_hardware(hw: dict) -> list[ValidationError]:
             if p.get('type') in ['I2C_Sensor_MPU6050', 'I2C_EEPROM', 'I2C_Pressure', 'I2C_TempSensor'] and 'bus' not in p:
                 errors.append(f"[ERROR] I2C peripheral '{p.get('name', 'unknown')}' is missing 'bus' field (e.g., 'I2C1').")
 
-            if p.get('type') in ['SPI_Flash_W25Q32', 'SPI_Flash_Generic', 'SPI_Sensor_MPU6500'] and 'bus' not in p:
+            if is_spi_device(p.get('type')) and 'bus' not in p:
                 errors.append(f"[ERROR] SPI peripheral '{p.get('name', 'unknown')}' is missing 'bus' field (e.g., 'SPI1').")
             if p.get('type') == 'SPI_Sensor_MPU6500' and 'cs_pin' not in p:
                 errors.append(f"[ERROR] SPI sensor '{p.get('name', 'unknown')}' is missing 'cs_pin' field (e.g., 'PC4').")
@@ -675,6 +677,12 @@ def validate_hardware(hw: dict) -> list[ValidationError]:
             else:
                 # Validate extra fields against model's extra_schema
                 _validate_extra_fields(p, model_path, errors)
+                # 器件模型自身的自洽性（几何 / 命令码 / JEDEC ID）。
+                # 放在这里而不是只在测试里查：模型写错时生成器**照样能生成
+                # 并能编译**，症状是"按错误的粒度擦写"或"偶发丢数据" ——
+                # 必须在生成期就拒绝，而不是等上板。
+                for msg in validate_model_file(model_path):
+                    errors.append(f"[ERROR] {msg}")
 
     # Sleep mode enum is handled by Pydantic (SleepModel).
     # Bootloader size_kb, max_retries, and offset constraints are handled

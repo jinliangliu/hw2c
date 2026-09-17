@@ -6,6 +6,7 @@ the driver list from the peripheral configuration.
 import os
 import yaml
 from ..paths import MODELS_DIR
+from ..peripheral_types import family_flags
 
 def detect_peripherals(peripherals: list, load_model_func) -> dict:
     """Process peripheral list, load models, detect capability flags.
@@ -23,17 +24,24 @@ def detect_peripherals(peripherals: list, load_model_func) -> dict:
     has_ir = has_cellular = has_cli = False
     has_temp_sensor = has_iwdg = False
     uart_name = rs485_name = cli_uart_name = cli_name = ""
+    spi_flash_name = spi_flash_bus = ""
 
     for p in peripherals:
         model = load_model_func(p['type'])
         p['model'] = model
+        # 家族标志在这里算一次，模板消费标志而不是比较类型字符串 ——
+        # 模板里少一个分支只会静默地不生成代码，是最难发现的一类漏改。
+        # 见 generator/peripheral_types.py 与
+        # tests/test_peripheral_type_registry.py。
+        p.update(family_flags(p['type']))
 
         drivers.append({
             'name': p['name'],
             'template': model.get('driver_template', ''),
             'header_template': model.get('header_template', ''),
             'model': model,
-            'peripheral': p
+            'peripheral': p,
+            'is_spi_flash': p['is_spi_flash'],
         })
 
         iface = model.get('interface', '').upper()
@@ -45,8 +53,10 @@ def detect_peripherals(peripherals: list, load_model_func) -> dict:
             has_rtc = True
         if 'SPI' in iface:
             has_spi = True
-            if p['type'] in ('SPI_Flash_W25Q32', 'SPI_Flash_Generic'):
+            if p['is_spi_flash']:
                 has_spi_flash = True
+                spi_flash_name = p['name']
+                spi_flash_bus = p.get('bus', '')
         if model.get('type') == 'Internal_PWM':
             has_pwm = True
         if model.get('type') == 'Internal_ADC':
@@ -106,4 +116,7 @@ def detect_peripherals(peripherals: list, load_model_func) -> dict:
         "rs485_name": rs485_name,
         "cli_uart_name": cli_uart_name,
         "cli_name": cli_name,
+        # 供模板直接使用，不必自己挑哪个外设是 Flash
+        "spi_flash_name": spi_flash_name,
+        "spi_flash_bus": spi_flash_bus,
     }

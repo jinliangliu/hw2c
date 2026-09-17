@@ -3,7 +3,7 @@
 #include "mock_hal.h"
 #include <string.h>
 
-{% set mpu = peripherals | selectattr('type', 'in', ['I2C_Sensor_MPU6050', 'SPI_Sensor_MPU6500']) | first %}
+{% set mpu = peripherals | selectattr('is_mpu6050') | first %}
 {% set is_spi = mpu.get('model', {}).get('interface', '') == 'SPI' %}
 {% set whoami = mpu.get('extra', {}).get('whoami', mpu.get('model', {}).get('whoami', 0x68)) %}
 {% set addr = mpu.get('address', 0x68) %}

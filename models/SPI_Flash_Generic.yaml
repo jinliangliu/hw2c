@@ -1,19 +1,66 @@
+# ============================================================================
+# SPI_Flash_Generic —— 未绑定具体型号的串行 NOR Flash
+#
+#   用途：板上已经焊了 Flash，但型号不在库里（或客户不告诉我们型号）时的
+#   兜底。**刻意不声明 `jedec_id`** —— 没有型号就没有可校验的 ID，驱动
+#   在上电时跳过型号核对。
+#
+#   代价必须说清楚：**不核对 ID 就等于不核对容量**。这里给的 4 MB 是
+#   "最常见的通用值"。实际器件是 8 MB，后 4 MB 会被 NVM 布局判为越界
+#   （生成期报错，是安全的）；实际器件只有 2 MB，写到 2 MB 之后会**静默
+#   回绕**，读回来看着像数据损坏。生产固件应当声明真实型号。
+#
+#   几何与命令集取所有主流 SPI NOR 的交集（W25Q / P25Q / GD25 系列都符合），
+#   校验见 generator/device_models.py。
+# ============================================================================
 model: "SPI_Flash_Generic"
 type: "SPI_Flash_Generic"
 interface: "SPI"
 driver_template: "drivers/drv_spi_flash.c.j2"
 header_template: "drivers/drv_spi_flash.h.j2"
+
+vendor: "generic"
+part_number: "(unspecified)"
+
 spi_mode: 0
 max_freq: 4000000
-sector_size: 4096
+address_bytes: 3
+
+# ---- 几何（通用值；请按实际器件覆盖）----
 page_size: 256
+sector_size: 4096
+block_size_32k: 32768
+block_size_64k: 65536
 total_size: 4194304
+
+# ---- 命令集（主流 SPI NOR 的交集）----
 commands:
   READ_ID: 0x9F
   READ_DATA: 0x03
+  FAST_READ: 0x0B
   WRITE_ENABLE: 0x06
+  WRITE_DISABLE: 0x04
+  READ_STATUS: 0x05
+  PAGE_PROGRAM: 0x02
   SECTOR_ERASE: 0x20
+  BLOCK_ERASE_32K: 0x52
+  BLOCK_ERASE_64K: 0xD8
   CHIP_ERASE: 0xC7
+  DEEP_POWER_DOWN: 0xB9
+  RELEASE_POWER_DOWN: 0xAB
+
+status_bits:
+  WIP: 0x01
+  WEL: 0x02
+
+# ---- 时序上限（取主流器件的较宽值，宁可多等）----
+timing:
+  page_program_ms: 5
+  sector_erase_ms: 60
+  block_erase_32k_ms: 200
+  block_erase_64k_ms: 300
+  chip_erase_ms: 20000
+
 extra_schema:
   chip_select_pin:
     type: "pin"
