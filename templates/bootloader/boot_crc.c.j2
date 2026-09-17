@@ -18,12 +18,44 @@
 
 #include "boot_crc.h"
 #ifdef TEST
-/* 主机单测：mock_hal.h 提供 CRC/RCC 的**寄存器模型**（含可复位的静态存储）。
+/* 主机单测：mock_hal.h 提供 CRC/RCC 的寄存器模型（含可复位的静态存储）。
  * 与真实 CMSIS 头不能共存（两者的 IRQn_Type 定义冲突），因此必须二选一。 */
 #include "mock_hal.h"
 #else
 #include "stm32g0xx.h"
 #endif
+
+/* ---- CRC 数据通路访问缝 ------------------------------------------------
+ *
+ * 裸寄存器读写没法在主机上被拦截：`CRC->DR = x` 只是一次普通存储，而 mock
+ * 里的 `DR` 只是一个静态变量，**不做任何运算**。于是"用 mock 算出来的值去
+ * 校验被测代码用 mock 算出来的值"就成了恒真断言 —— 无论 REV_IN / REV_OUT /
+ * 终值怎么配，主机上都全绿。这里就栽过一次：配置错成 `REV_IN=0b01` 且漏掉
+ * 终值异或，主机全过、真机永远拒绝镜像。
+ *
+ * 这两个宏把 CRC 数据通路开一个缝：
+ *   目标侧 —— 就是原本的寄存器访问，生成代码与改动前完全一致（零开销）；
+ *   TEST 侧 —— 转发给 mock 的**行为模型**，由它按 CR/POL/INIT 真算一遍。
+ *   守卫 —— `generator/tests/test_boot_crc_guardrails.py` 断言目标侧展开
+ *           后仍是 `CRC->DR`，避免这条缝被人偷偷改成"两边共用一份软件 CRC"。
+ */
+#ifdef TEST
+#define HW2C_CRC_FEED(w)   mock_crc_feed((uint32_t)(w))
+#define HW2C_CRC_READ()    mock_crc_read()
+#else
+#define HW2C_CRC_FEED(w)   (CRC->DR = (uint32_t)(w))
+#define HW2C_CRC_READ()    (CRC->DR)
+#endif
+
+/* ---- Flash 地址转换 ----------------------------------------------------
+ *
+ * 这里多一层 `(uintptr_t)` 不是为了目标，而是为了主机：主机是 64 位，
+ * `(volatile uint32_t *)flash_start` 是 int → pointer 的窄化转换，每编一次
+ * 主机测试就刷 5 条 `-Wint-to-pointer-cast`。目标侧（32 位）没有这个警告，
+ * 所以这类噪声只出现在测试构建里 —— 而"测试构建永远有警告"正是让人开始
+ * 无视警告的第一步。`uintptr_t` 是"这个整数就是一个地址"的标准中间类型，
+ * 目标上与 uint32_t 同宽，机器码逐字节不变。
+ */
 
 /* ---- 镜像头部定义（与 fota_format.json 对齐，由 test_fota_format.py 校验）---- */
 #define APP_HEADER_MAGIC        0x4841436BUL   /* 数值匹配；内存中呈现为 'kCAH' */
@@ -48,7 +80,7 @@ static uint32_t find_header_offset(uint32_t flash_start)
 {
     uint32_t hdr = APP_HEADER_OFFSET;
 
-    if (((volatile uint32_t *)(flash_start + hdr + APP_HEADER_MAGIC_OFF))[0]
+    if (((volatile uint32_t *)(uintptr_t)(flash_start + hdr + APP_HEADER_MAGIC_OFF))[0]
             == APP_HEADER_MAGIC) {
         return hdr;
     }
@@ -57,7 +89,7 @@ static uint32_t find_header_offset(uint32_t flash_start)
         if (off == APP_HEADER_OFFSET) {
             continue;                       /* 上面已判过 */
         }
-        if (((volatile uint32_t *)(flash_start + off + APP_HEADER_MAGIC_OFF))[0]
+        if (((volatile uint32_t *)(uintptr_t)(flash_start + off + APP_HEADER_MAGIC_OFF))[0]
                 == APP_HEADER_MAGIC) {
             return off;
         }
@@ -83,8 +115,8 @@ bool boot_crc_verify(uint32_t flash_start, uint32_t slot_size)
         return false;                       /* 未找到有效头部魔数 */
     }
 
-    uint32_t image_size = ((volatile uint32_t *)(flash_start + hdr))[0];
-    uint32_t stored_crc = ((volatile uint32_t *)(flash_start + hdr + 4U))[0];
+    uint32_t image_size = ((volatile uint32_t *)(uintptr_t)(flash_start + hdr))[0];
+    uint32_t stored_crc = ((volatile uint32_t *)(uintptr_t)(flash_start + hdr + 4U))[0];
 
     /* image_size 合法性：非空、非擦除态、字对齐、且头部 + payload 放得下槽位。
      * 上界必须用调用方给出的 slot_size —— 硬编码 256KB 对 248KB 的 Slot A 是错的。 */
@@ -105,17 +137,39 @@ bool boot_crc_verify(uint32_t flash_start, uint32_t slot_size)
     RCC->AHBENR |= RCC_AHBENR_CRCEN;
 
     /* 配置 CRC 外设以等价于 **CRC-32/ISO-HDLC**（≡ zlib.crc32，与
-     * patch_crc.stm32_crc32 一致）：
-     *   REV_IN=01 : 输入按字节位反转
-     *   REV_OUT=1 : 输出位反转（等价于终值异或 0xFFFFFFFF）
-     *   多项式与初值使用默认值（0x04C11DB7 / 0xFFFFFFFF）
-     *   DATA_WIDTH 默认 32-bit —— 故 crc_len 必须整除 4
+     * patch_crc.stm32_crc32 一致）。三处都对才成立，缺一不可：
      *
-     * ⚠️ 早期注释把这里写成 "CRC-32/MPEG-2"，**是错的**。MPEG-2 变体不反射、
-     * 终值不异或，结果与 ISO-HDLC 不同；照 MPEG-2 配会让引导器拒绝所有镜像，
-     * 且极易误判为"硬件 CRC 外设有问题"。判据：本配置须算出
-     * crc32(b"123456789") == 0xCBF43926。 */
-    CRC->CR |= CRC_CR_REV_IN_0 | CRC_CR_REV_OUT;
+     *   REV_IN = 0b11 : **整个输入字**按位反转（不是 0b01 的按字节反转）
+     *   REV_OUT = 1   : 读 CRC->DR 时输出按位反转
+     *   终值异或 0xFFFFFFFF : **外设没有这个能力，必须在软件里做**
+     *   多项式 / 初值   : 默认 0x04C11DB7 / 0xFFFFFFFF
+     *   DATA_WIDTH      : 默认 32-bit —— 故 crc_len 必须整除 4
+     *
+     * 为什么 REV_IN 必须是 0b11：本外设的 CRC 核是 **MSB-first（不反射）** 的，
+     * 而要复现的是 **反射式** 的 ISO-HDLC。把整个 32-bit 字反转，正好让核按
+     * "byte0 的 bit0 先来" 的顺序吃数据 —— 这就是反射算法的定义。按字节反转
+     * （0b01）只对了字内字节顺序中「字节内部的位序」，字与字之间的次序仍然
+     * 是反的，所以算出来的是另一个 CRC。
+     *
+     * ⚠️ 这一条曾经写成 `REV_IN_0`（0b01）且**漏了终值异或**，结果是引导器
+     * **永远拒绝所有镜像**（包括刚烧进去、校验和正确的那个），表现为上电后
+     * 反复 `soft_reset()`：LED 按 `led_heartbeat()` 的节奏匀速闪、`.data`
+     * 从未被拷贝（应用一次都没起来）、`RCC->CSR` 里 `SFTRSTF` 反复置位。
+     * 实测（STM32G0B1RET6，真实硅片）：同一镜像区域
+     *   0b01 + 无终值异或 → 0x119FE772   （= 旧配置，与镜像头不符）
+     *   0b11 + 终值异或 0xFFFFFFFF → 0x28843CD6  （= 镜像头里的值 ✓）
+     * 本配置已在硅片上对四种 REV_IN 逐一验证（模型与实测一致）。
+     *
+     * 主机侧护栏（两道，都必须存在）：
+     *   ① `templates/test/test_boot_crc.c.j2` 的 KAT 用例 —— 把**本条通路的
+     *      输出**钉在独立算出的 zlib.crc32 常量上（期望值来自 Python zlib，
+     *      不是从被测代码或 mock 里读回来的）。改错 REV_IN / 漏掉终值异或，
+     *      这里立刻 red。
+     *   ② `generator/tests/test_boot_crc_guardrails.py` —— 用 zlib 重算 C 测试
+     *      里的 KAT 常量、并断言目标分支展开后仍是裸寄存器访问。
+     * 前置条件：`mock_hal` 的 CRC 是**行为模型**（它真的按 CR/POL/INIT 做运算），
+     * 否则上面①又会退化成"拿 mock 算的值去校验 mock 算的值"的恒真断言。 */
+    CRC->CR |= CRC_CR_REV_IN_1 | CRC_CR_REV_IN_0 | CRC_CR_REV_OUT;
 
     /* 复位 CRC 模块 */
     CRC->CR |= CRC_CR_RESET;
@@ -123,13 +177,16 @@ bool boot_crc_verify(uint32_t flash_start, uint32_t slot_size)
 
     /* 按 32-bit 字逐字计算 CRC */
     uint32_t word_count = crc_len / 4U;
-    volatile uint32_t *pdata = (volatile uint32_t *)crc_start;
+    volatile uint32_t *pdata = (volatile uint32_t *)(uintptr_t)crc_start;
 
     for (uint32_t i = 0; i < word_count; i++) {
-        CRC->DR = pdata[i];
+        HW2C_CRC_FEED(pdata[i]);
     }
 
-    uint32_t calculated_crc = CRC->DR;
+    /* 终值异或 0xFFFFFFFF —— 外设只能反转，不能异或，只能在这里补。
+     * （ISO-HDLC 的 xorout 是 0xFFFFFFFF；漏掉它等于算成了
+     *  CRC-32/JAMCRC 一类的变体，两边永远对不上。） */
+    uint32_t calculated_crc = HW2C_CRC_READ() ^ 0xFFFFFFFFUL;
 
     return (calculated_crc == stored_crc);
 }
@@ -153,6 +210,6 @@ uint32_t boot_read_fw_version(uint32_t flash_start)
         return 0U;
     }
 
-    uint32_t ver = ((volatile uint32_t *)(flash_start + hdr + APP_HEADER_VERSION_OFF))[0];
+    uint32_t ver = ((volatile uint32_t *)(uintptr_t)(flash_start + hdr + APP_HEADER_VERSION_OFF))[0];
     return (ver & APP_VERSION_MASK);
 }

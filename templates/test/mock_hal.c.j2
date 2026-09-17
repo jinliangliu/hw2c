@@ -38,6 +38,107 @@ void mock_cmsis_reset(void)
     memset((void *)&mock_nvic_regs, 0, sizeof(mock_nvic_regs));
     memset((void *)&mock_systick_regs, 0, sizeof(mock_systick_regs));
     memset((void *)&mock_iwdg_regs, 0, sizeof(mock_iwdg_regs));
+
+    /* 外设复位值 —— 必须与硅片一致，否则生成代码不写这些寄存器时
+     * （CRC 的生成代码正是如此）主机算出的结果与真机必然不同。 */
+    mock_crc_regs.INIT = MOCK_CRC_INIT_RESET_VALUE;   /* 0xFFFFFFFF */
+    mock_crc_regs.POL  = MOCK_CRC_POL_RESET_VALUE;    /* 0x04C11DB7 */
+    mock_crc_reset();
+}
+
+/* ========== CRC behavioural model ==========
+ *
+ * 语义与真实 STM32G0 CRC 外设一致（在 STM32G0B1RET6 上对四种 REV_IN 逐一
+ * 实测核对过）。**这不是寄存器模型**：它真的会算 CRC。
+ * 说明与理由见 mock_hal.h 中 CRC 段的注释。
+ *
+ * 已知的建模限制（诚实记录，不假装）：硬件在 `CRC->CR` 的 RESET 位被写 1 时
+ * 立即把内部状态复位到 INIT 并自清该位；而 `CRC->CR |= RESET; CRC->CR &= ~RESET;`
+ * 对普通 storage 的净效果是"什么都没发生"，mock 拦不到那次写。
+ * 因此这里改成**惰性**语义：距上一次 mock 复位后第一次 feed 时从 INIT 起步 ——
+ * 对"用之前先复位"的正常代码等价。若被测代码漏了复位，主机测不出来：
+ * 这一条要靠上板（`mock_crc_get_raw()` 可用于人工核对）。
+ */
+static uint32_t mock_crc_state;
+
+static uint32_t mock_crc_bitrev(uint32_t v, uint32_t n)
+{
+    uint32_t r = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        r = (r << 1) | (v & 1U);
+        v >>= 1;
+    }
+    return r;
+}
+
+static uint32_t mock_crc_rev_in(uint32_t w)
+{
+    uint32_t rev_in = (mock_crc_regs.CR >> 5) & 0x3U;
+
+    switch (rev_in) {
+    case 0x1U:      /* 按字节位反转 */
+        return (mock_crc_bitrev((w >>  0) & 0xFFU, 8) <<  0) |
+               (mock_crc_bitrev((w >>  8) & 0xFFU, 8) <<  8) |
+               (mock_crc_bitrev((w >> 16) & 0xFFU, 8) << 16) |
+               (mock_crc_bitrev((w >> 24) & 0xFFU, 8) << 24);
+    case 0x2U:      /* 按半字位反转 */
+        return (mock_crc_bitrev((w >> 16) & 0xFFFFU, 16) << 16) |
+               (mock_crc_bitrev((w >>  0) & 0xFFFFU, 16) <<  0);
+    case 0x3U:      /* 整字位反转 */
+        return mock_crc_bitrev(w, 32U);
+    default:        /* 0b00：不变形 */
+        return w;
+    }
+}
+
+void mock_crc_reset(void)
+{
+    mock_crc_state = mock_crc_regs.INIT;
+}
+
+uint32_t mock_crc_feed(uint32_t word)
+{
+    uint32_t poly = mock_crc_regs.POL;
+
+    if (poly == 0U) {
+        poly = MOCK_CRC_POL_RESET_VALUE;
+    }
+
+    mock_crc_state ^= mock_crc_rev_in(word);
+    for (uint32_t i = 0; i < 32U; i++) {
+        if (mock_crc_state & 0x80000000U) {
+            mock_crc_state = (mock_crc_state << 1) ^ poly;
+        } else {
+            mock_crc_state <<= 1;
+        }
+    }
+    return mock_crc_read();
+}
+
+uint32_t mock_crc_read(void)
+{
+    return (mock_crc_regs.CR & CRC_CR_REV_OUT)
+         ? mock_crc_bitrev(mock_crc_state, 32U)
+         : mock_crc_state;
+}
+
+uint32_t mock_crc_get_raw(void)
+{
+    return mock_crc_state;
+}
+
+uint32_t mock_crc_calc(const uint8_t *data, uint32_t len)
+{
+    mock_crc_state = mock_crc_regs.INIT;
+    for (uint32_t i = 0; i + 4U <= len; i += 4U) {
+        uint32_t w = (uint32_t)data[i]
+                   | ((uint32_t)data[i + 1U] << 8)
+                   | ((uint32_t)data[i + 2U] << 16)
+                   | ((uint32_t)data[i + 3U] << 24);
+        (void)mock_crc_feed(w);
+    }
+    /* 外设不做终值异或，软件侧补 —— 与 boot_crc.c 的算法契约一致 */
+    return mock_crc_read() ^ 0xFFFFFFFFU;
 }
 
 /* External variables */

@@ -18,7 +18,27 @@
  * CMSIS register mock structures (for unit-testing bootloader modules)
  * ====================================================================== */
 
-/* --- CRC --- */
+/* --- CRC ---
+ *
+ * ⚠️ 这不是普通寄存器模型，而是**行为模型**：`mock_crc_feed()` 会真的按
+ * CR/POL/INIT 算 CRC，`mock_crc_read()` 会把 REV_OUT 作用在返回值上。
+ *
+ * 为什么必须有行为：`CRC->DR = x` 是一次裸存储，主机上没法拦截，所以
+ * 被测代码若直接写寄存器，就只能在 mock 里"什么都不算"。那样一来
+ * "用 mock 算的期望值 去 校验 被测代码用 mock 算的值"就成了恒真断言 ——
+ * 主机永远全绿。这里栽过一次：`boot_crc.c` 的 REV_IN 错成 0b01 且漏掉
+ * 终值异或，主机测试过、真机上引导器永远拒绝所有镜像。
+ * 所以给 CRC 数据通路开了 `HW2C_CRC_FEED/READ` 缝，接到下面这两个函数上。
+ *
+ * 语义按真实硅片建模（STM32G0B1RET6 上实测四种 REV_IN 逐一核对过）：
+ *   - CRC 核是 **MSB-first（不反射）**；每写一个 32-bit 字先按 REV_IN 变形
+ *   - REV_IN：0b00 不变形 / 0b01 按字节位反转 / 0b10 按半字位反转 / 0b11 整字位反转
+ *   - REV_OUT=1 只影响**读 DR** 的返回值（核心内部状态不变）
+ *   - RESET 位写 1 把内部状态复位到 INIT，且**自清**
+ *   - INIT 复位值 0xFFFFFFFF，POL 复位值 0x04C11DB7（外设默认就是这两个，
+ *     生成代码不写它们；mock 若给 0，主机与真机算出来的 CRC 必然不同）
+ *   - **外设不能做终值异或**，软件侧要自己补
+ */
 typedef struct {
     __IO uint32_t DR;
     __IO uint32_t IDR;
@@ -32,8 +52,24 @@ typedef struct {
 extern volatile CRC_TypeDef *CRC;
 
 #define CRC_CR_RESET      0x00000001U
+#define CRC_CR_POLYSIZE_0 0x00000008U
+#define CRC_CR_POLYSIZE_1 0x00000010U
 #define CRC_CR_REV_IN_0   0x00000020U
+#define CRC_CR_REV_IN_1   0x00000040U
 #define CRC_CR_REV_OUT    0x00000080U
+
+#define MOCK_CRC_INIT_RESET_VALUE  0xFFFFFFFFU
+#define MOCK_CRC_POL_RESET_VALUE   0x04C11DB7U
+
+/* CRC 行为模型：喂一个 32-bit 字；返回按 REV_OUT 处理过的当前值 */
+uint32_t mock_crc_feed(uint32_t word);
+uint32_t mock_crc_read(void);
+/* 把内部状态复位到 INIT（对应硬件 CR.RESET 位的效果，见 mock_hal.c 的建模限制） */
+void     mock_crc_reset(void);
+/* 测试用：绕开 REV_OUT 读内部状态，便于与已知向量对齐 */
+uint32_t mock_crc_get_raw(void);
+/* 对一段字节流做一次完整计算（按 32-bit 小端字读取，补终值异或），供 KAT 期望值使用 */
+uint32_t mock_crc_calc(const uint8_t *data, uint32_t len);
 
 /* --- PWR --- */
 typedef struct {
@@ -64,7 +100,9 @@ extern volatile RCC_TypeDef *RCC;
 
 #define RCC_AHBENR_CRCEN     0x00001000U
 #define RCC_APBENR1_PWREN    0x10000000U
-#define RCC_APBENR1_RTCAPBEN 0x00200000U
+/* RTCAPBEN 是 bit 10 —— 曾错写成 0x00200000（bit 21）。位号错不会让主机测试
+ * 报错（mock 自洽），但任何"断言某时钟位被打开"的用例就在断言一个不存在的位。 */
+#define RCC_APBENR1_RTCAPBEN 0x00000400U
 #define RCC_CSR_LSION        0x00000001U
 #define RCC_CSR_LSIRDY       0x00000002U
 #define RCC_CSR_IWDGRSTF     0x20000000U

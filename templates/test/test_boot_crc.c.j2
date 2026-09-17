@@ -1,9 +1,32 @@
 /**
  * @file    test_boot_crc.c
- * @brief   Unit tests for boot_crc (hardware CRC32 verification)
- *          Tests: null args, magic not found, invalid size.
- *          NOTE: Full CRC match/mismatch tests require 32-bit address space
- *          (uint32_t flash_start parameter). These are skipped on 64-bit hosts.
+ * @brief   boot_crc 的主机单测（含把 CRC 通路钉在 zlib.crc32 上的 KAT）
+ *
+ * ⚠️ 这个文件曾经是"看起来有覆盖、实际一条都没跑"的标本
+ * ------------------------------------------------------
+ * 两件事叠加，让引导器的 CRC 校验配置错了却一路绿灯，直到上板才以
+ * "应用永远起不来（引导器拒绝所有镜像）"的形式暴露：
+ *
+ *   ① `test_verify_crc_match` 把 **被测代码自己算出来的 `CRC->DR`** 当作
+ *      期望值写进镜像头 —— 而当时 mock 的 `DR` 只是个静态变量、根本不做
+ *      CRC 运算。于是无论 REV_IN / REV_OUT / 终值怎么配，两边都"一致"，
+ *      是一条**恒真断言**。
+ *   ② 其余集成用例整段包在 `#if UINTPTR_MAX <= UINT32_MAX` 里，理由写着
+ *      "`flash_start` 是 uint32_t 而主机指针是 64 位"。本机主机 gcc 正是
+ *      64 位 ⇒ 那些用例**一条都没执行过**。
+ *
+ * 现在两条都拆掉了：
+ *   · 期望值改为**独立算出的 zlib.crc32 常量**（见 KAT_* 宏），既不看被测
+ *     代码、也不看 mock；
+ *   · ② 的那个理由是**不成立的**：mock_hal 已经把 512 KB Flash 建立到它的
+ *     真实地址（0x08000000，见 `mock_flash_map()`），于是
+ *     `(volatile uint32_t *)0x080020C0` 在 64 位主机上就是有效指针 ——
+ *     直接用真实槽位地址即可。所以这里**不需要**给生成代码开 test-only 的
+ *     Flash 访问缝（一开，主机上跑的就不再是目标上跑的那份代码了）。
+ *
+ * 本文件的两个 KAT 常量由 `generator/tests/test_boot_crc_guardrails.py`
+ * 用 Python `zlib` 重算并比对 —— 防止"改了 payload 却忘了改期望值"或
+ * "把期望值改成被测代码算出来的那个值"这类退化。
  */
 #include "unity.h"
 #include "mock_hal.h"
@@ -12,151 +35,356 @@
 /* Include the source under test */
 #include "../../bootloader/boot_crc.c"
 
+/* ---- 头部契约（这里**故意重写一遍**，不引用 boot_crc.c 里的宏）----
+ * 若那边的偏移被改动，本文件应当失败，而不是跟着一起变。 */
+#define HDR_OFF        0xC0U
+#define HDR_MAGIC      0x4841436BUL
+#define HDR_PAYLOAD    16U
+
+/* Slot A 的真实位置与容量（与 linker/app_slot_a.ld 一致：0x08002000 / 248 KB）。
+ * 注意不要用名字 FLASH_BASE —— mock_hal.h 已经把它 define 成 MOCK_FLASH_BASE。 */
+#define SLOT_A_BASE    0x08002000U
+#define SLOT_A_SIZE    0x0003E000U
+
+/* ---- KAT 向量（唯一真源）------------------------------------------------
+ * 期望值 = zlib.crc32( magic(LE) || fw_version(LE) || payload(LE) )，
+ * 覆盖范围与 boot_crc.c 的 APP_CRC_REGION_OFF / APP_CRC_LENGTH_ADDEND
+ * 一致：从 magic 起、共 image_size + 8 字节。
+ *
+ * 三个向量刻意取不同的 image_size 与 version，用来同时钉住两件事：
+ *   · CRC 区域的**起点**是 magic（不是 payload，也不是头部起点）；
+ *   · 长度 = image_size + 8（不是 image_size）。
+ * 只测一个向量的话，起点偏 4 字节、或长度少 4 字节，都可能仍然碰巧对上。
+ */
+#define KAT_A_SIZE     12U
+#define KAT_A_VER      0x00000001UL
+#define KAT_A_W0       0x12345678UL
+#define KAT_A_W1       0x9ABCDEF0UL
+#define KAT_A_W2       0xDEADBEEFUL
+#define KAT_A_CRC      0x24487025UL
+
+#define KAT_B_SIZE     8U
+#define KAT_B_VER      0x00010203UL
+#define KAT_B_W0       0x00000000UL
+#define KAT_B_W1       0xFFFFFFFFUL
+#define KAT_B_CRC      0x711488C6UL
+
+#define KAT_C_SIZE     4U
+#define KAT_C_VER      0x00000002UL
+#define KAT_C_W0       0xCAFEBABEUL
+#define KAT_C_CRC      0xFF421E89UL
+
+/**
+ * Flash 存储没被建到真实地址上就**明确失败**，而不是让随后的直接寻址
+ * 段错误 —— 那样连"崩在哪一条用例"都看不到（本仓库第一次跑 L5 协议测试台
+ * 时就是这么崩的，stdout 有缓冲，连崩溃点都不打）。
+ * 返回 false 时调用方必须立即 return。
+ */
+static bool flash_ready(void)
+{
+    if (!mock_flash_is_mapped()) {
+        TEST_FAIL_MESSAGE("Flash 未映射到真实地址 0x08000000（该地址可能被占用）——"
+                          "本文件所有用例都按真实槽位地址直接寻址，无法在退回的"
+                          "内部数组上运行");
+        return false;
+    }
+    return true;
+}
+
+/* 显式小端写入：目标与主机都是小端，但写成字节序无关的形式更不容易误解 */
+static void poke_le32(uint32_t off, uint32_t value)
+{
+    mock_flash_poke(SLOT_A_BASE + off + 0U, (uint8_t)(value & 0xFFU));
+    mock_flash_poke(SLOT_A_BASE + off + 1U, (uint8_t)((value >> 8) & 0xFFU));
+    mock_flash_poke(SLOT_A_BASE + off + 2U, (uint8_t)((value >> 16) & 0xFFU));
+    mock_flash_poke(SLOT_A_BASE + off + 3U, (uint8_t)((value >> 24) & 0xFFU));
+}
+
+/* 写一个镜像的头部 + payload；crc 由调用方给（便于造 mismatch 用例） */
+static void put_image(uint32_t image_size, uint32_t version, uint32_t crc,
+                      const uint32_t *payload, uint32_t payload_words)
+{
+    poke_le32(HDR_OFF + 0U, image_size);
+    poke_le32(HDR_OFF + 4U, crc);
+    poke_le32(HDR_OFF + 8U, HDR_MAGIC);
+    poke_le32(HDR_OFF + 12U, version);
+
+    for (uint32_t i = 0U; i < payload_words; i++) {
+        poke_le32(HDR_OFF + HDR_PAYLOAD + (i * 4U), payload[i]);
+    }
+
+    /* 把 CRC 外设的内部状态摆到上电值。
+     *
+     * 为什么要在**测试侧**做这件事：硬件上 `CRC->CR |= RESET` 会立刻把内部
+     * 状态复位并自清该位，而 mock 里 `CR` 只是普通存储，拦不到那次写 ——
+     * 这是 mock 明确记录在案的建模限制（见 mock_hal.c 的 CRC 段）。因此这里
+     * 代它把状态摆正，使"每条用例各调用一次 boot_crc_verify"成立。
+     * ⚠️ 若将来某条用例要连续调用两次 verify，必须自己再调一次本函数。 */
+    mock_crc_reset();
+}
+
+/* 造一个 CRC 正确的镜像并断言校验通过；失败信息统一指向"KAT 不符" */
+static void assert_image_accepted(uint32_t image_size, uint32_t version,
+                                  uint32_t expected_crc,
+                                  const uint32_t *payload, uint32_t payload_words)
+{
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(image_size, version, expected_crc, payload, payload_words);
+
+    TEST_ASSERT_TRUE_MESSAGE(
+        boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE),
+        "CRC KAT 不符：期望值由 Python zlib.crc32 独立算出，对不上说明 CRC 外设"
+        "配置（REV_IN / REV_OUT）或终值异或 0xFFFFFFFF 与实际算法契约不一致");
+}
+
 void setUp(void)
 {
-    mock_cmsis_reset();
+    mock_flash_reset();     /* 整片 0xFF；顺带惰性建立真实地址映射 */
+    mock_cmsis_reset();     /* CRC 寄存器 + 行为模型复位（含 INIT/POL 复位值） */
 }
 
 void tearDown(void) {}
 
-/* ---- Null/invalid input tests ---- */
+/* ======================================================================
+ * KAT：把 CRC 通路钉在 zlib.crc32 上
+ * ====================================================================== */
 
-void test_verify_null_flash_start(void)
+void test_kat_a_is_accepted(void)
 {
-    TEST_ASSERT_FALSE(boot_crc_verify(0, 0));
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    assert_image_accepted(KAT_A_SIZE, KAT_A_VER, KAT_A_CRC, payload, 3U);
 }
 
-/*
- * The following tests use a mock flash buffer. On 64-bit hosts,
- * uint32_t flash_start cannot hold a full pointer, so flash memory
- * access in boot_crc_verify() will use an invalid address.
- * On 32-bit hosts (including the STM32G0 target), uint32_t == uintptr_t.
+void test_kat_b_is_accepted(void)
+{
+    static const uint32_t payload[2] = { KAT_B_W0, KAT_B_W1 };
+
+    assert_image_accepted(KAT_B_SIZE, KAT_B_VER, KAT_B_CRC, payload, 2U);
+}
+
+void test_kat_c_is_accepted(void)
+{
+    static const uint32_t payload[1] = { KAT_C_W0 };
+
+    assert_image_accepted(KAT_C_SIZE, KAT_C_VER, KAT_C_CRC, payload, 1U);
+}
+
+/**
+ * 前置条件自证：Flash 真的按地址可寻址
+ * -------------------------------------
+ * 上面所有 KAT 都建立在"`(volatile uint32_t *)0x08xxxxxx` 在主机上真的
+ * 指向被建立的那块存储"之上。这是被测代码之外的假设，单独钉一次 ——
+ * 免得将来有人改掉 mock 的映射方式，于是整个文件悄悄退化成"读一片无关内存"。
  */
-#if UINTPTR_MAX <= UINT32_MAX
-
-void test_verify_no_magic_found(void)
+void test_flash_is_directly_addressable_at_its_real_address(void)
 {
-    static uint8_t buf[512];
-    memset(buf, 0xFF, sizeof(buf));
-    TEST_ASSERT_FALSE(boot_crc_verify((uint32_t)(uintptr_t)buf, sizeof(buf)));
+    TEST_ASSERT_TRUE_MESSAGE(mock_flash_is_mapped(),
+                             "Flash 未映射到真实地址 0x08000000");
+    if (!flash_ready()) {
+        return;
+    }
+
+    mock_flash_poke(SLOT_A_BASE + 4U, 0x5AU);
+    TEST_ASSERT_EQUAL_UINT8(0x5AU, *((volatile uint8_t *)(SLOT_A_BASE + 4U)));
+    TEST_ASSERT_EQUAL_UINT8(0x5AU, mock_flash_peek(SLOT_A_BASE + 4U));
 }
 
-void test_verify_crc_match(void)
+/* ======================================================================
+ * 拒绝路径：校验必须能说"不"
+ * ====================================================================== */
+
+void test_null_flash_start_is_rejected(void)
 {
-    static uint32_t buf[128];
-    memset(buf, 0xFF, sizeof(buf));
-
-    /* Header at offset 0x40: image_size, crc placeholder, magic */
-    buf[0x40 / 4] = 12;                    /* image_size = 3 words */
-    buf[0x44 / 4] = 0;                     /* filled below */
-    buf[0x48 / 4] = 0x4841436B;            /* magic "H2Ck" */
-
-    /* Payload: 3 words at offset 0x4C */
-    uint32_t *payload = &buf[0x4C / 4];
-    payload[0] = 0x12345678;
-    payload[1] = 0x9ABCDEF0;
-    payload[2] = 0xDEADBEEF;
-
-    /* Pre-compute CRC */
-    mock_cmsis_reset();
-    CRC->CR |= CRC_CR_REV_IN_0 | CRC_CR_REV_OUT;
-    CRC->CR |= CRC_CR_RESET;
-    CRC->CR &= ~CRC_CR_RESET;
-    CRC->DR = payload[0];
-    CRC->DR = payload[1];
-    CRC->DR = payload[2];
-    buf[0x44 / 4] = CRC->DR;
-
-    mock_cmsis_reset();
-    TEST_ASSERT_TRUE(boot_crc_verify((uint32_t)(uintptr_t)buf, sizeof(buf)));
+    TEST_ASSERT_FALSE(boot_crc_verify(0U, SLOT_A_SIZE));
 }
 
-void test_verify_crc_mismatch(void)
+void test_no_magic_is_rejected(void)
 {
-    static uint32_t buf[128];
-    memset(buf, 0xFF, sizeof(buf));
-
-    buf[0x40 / 4] = 12;
-    buf[0x44 / 4] = 0xDEADBEEF;            /* Wrong CRC */
-    buf[0x48 / 4] = 0x4841436B;
-
-    uint32_t *payload = &buf[0x4C / 4];
-    payload[0] = 0x12345678;
-    payload[1] = 0x9ABCDEF0;
-    payload[2] = 0xDEADBEEF;
-
-    mock_cmsis_reset();
-    TEST_ASSERT_FALSE(boot_crc_verify((uint32_t)(uintptr_t)buf, sizeof(buf)));
+    /* setUp() 已把整片写成 0xFF（擦除态），没有 magic */
+    if (!flash_ready()) {
+        return;
+    }
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE));
 }
 
-#endif /* UINTPTR_MAX <= UINT32_MAX */
-
-/* ---- Size validation tests (no flash access needed if magic found but size invalid) ---- */
-
-void test_verify_zero_image_size(void)
+void test_wrong_crc_is_rejected(void)
 {
-    /* Place magic at known offset, but size=0 -> early return before CRC */
-    static uint32_t buf[32];
-    memset(buf, 0xFF, sizeof(buf));
-    buf[0x40 / 4] = 0;                     /* Zero size */
-    buf[0x44 / 4] = 0;
-    buf[0x48 / 4] = 0x4841436B;            /* magic present */
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
 
-    mock_cmsis_reset();
-    /*
-     * On 64-bit, the magic search dereferences invalid pointers.
-     * On 64-bit, boot_crc_verify will crash during magic search.
-     * We skip this on 64-bit — magic search correctness is verified
-     * by hardware integration tests on the STM32G0 target.
-     */
-#if UINTPTR_MAX <= UINT32_MAX
-    TEST_ASSERT_FALSE(boot_crc_verify((uint32_t)(uintptr_t)buf, sizeof(buf)));
-#else
-    TEST_ASSERT_TRUE(1);  /* skipped on 64-bit */
-#endif
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(KAT_A_SIZE, KAT_A_VER, KAT_A_CRC ^ 1UL, payload, 3U);
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE));
 }
 
-void test_verify_unaligned_image_size(void)
+/**
+ * 改一个 payload 字 ⇒ CRC 必须变化 ⇒ 必须被拒。
+ * 这是"CRC 真的覆盖了 payload"的判据：若实现把 payload 漏出覆盖范围，
+ * 上面那条 wrong_crc 仍然能过，这一条则必然失败。
+ */
+void test_corrupted_payload_is_rejected(void)
 {
-#if UINTPTR_MAX <= UINT32_MAX
-    static uint32_t buf[32];
-    memset(buf, 0xFF, sizeof(buf));
-    buf[0x40 / 4] = 7;                     /* Not word-aligned */
-    buf[0x44 / 4] = 0;
-    buf[0x48 / 4] = 0x4841436B;
-    mock_cmsis_reset();
-    TEST_ASSERT_FALSE(boot_crc_verify((uint32_t)(uintptr_t)buf, sizeof(buf)));
-#else
-    TEST_ASSERT_TRUE(1);  /* skipped on 64-bit */
-#endif
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(KAT_A_SIZE, KAT_A_VER, KAT_A_CRC, payload, 3U);
+    poke_le32(HDR_OFF + HDR_PAYLOAD + 8U, KAT_A_W2 ^ 0x00000001UL);
+
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE));
 }
 
-void test_verify_overly_large_image_size(void)
+/**
+ * fw_version 必须被 CRC 覆盖。
+ * 它决定"该不该用这个槽"，不被覆盖就可以被改写而仍然通过校验 ——
+ * 这条用例把那个洞钉住：把 version 改掉、CRC 保持不变 ⇒ 必须被拒。
+ */
+void test_tampered_fw_version_is_rejected(void)
 {
-#if UINTPTR_MAX <= UINT32_MAX
-    static uint32_t buf[32];
-    memset(buf, 0xFF, sizeof(buf));
-    buf[0x40 / 4] = 0x00050000;            /* Exceeds 256KB */
-    buf[0x44 / 4] = 0;
-    buf[0x48 / 4] = 0x4841436B;
-    mock_cmsis_reset();
-    TEST_ASSERT_FALSE(boot_crc_verify((uint32_t)(uintptr_t)buf, sizeof(buf)));
-#else
-    TEST_ASSERT_TRUE(1);  /* skipped on 64-bit */
-#endif
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(KAT_A_SIZE, KAT_A_VER, KAT_A_CRC, payload, 3U);
+    poke_le32(HDR_OFF + 12U, KAT_A_VER + 1UL);
+
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE));
+}
+
+void test_zero_image_size_is_rejected(void)
+{
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(0U, KAT_A_VER, KAT_A_CRC, payload, 3U);
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE));
+}
+
+void test_erased_image_size_is_rejected(void)
+{
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(0xFFFFFFFFUL, KAT_A_VER, KAT_A_CRC, payload, 3U);
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE));
+}
+
+void test_unaligned_image_size_is_rejected(void)
+{
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(7U, KAT_A_VER, KAT_A_CRC, payload, 3U);
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE));
+}
+
+void test_oversized_image_size_is_rejected(void)
+{
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    /* 镜像比槽位还大：image_size + 16 > SLOT_A_SIZE。
+     * 上界必须来自调用方给的 slot_size —— 硬编码 256 KB 对 248 KB 的
+     * Slot A 就是错的，所以这里特意用「正好等于槽位大小」的值。 */
+    put_image(SLOT_A_SIZE, KAT_A_VER, KAT_A_CRC, payload, 3U);
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, SLOT_A_SIZE));
+}
+
+/**
+ * slot_size == 0（不做上界检查）时，越界读必须表现为"擦除态"而不是主机崩溃。
+ *
+ * 目标上这是自然行为：Flash 里未编程的区域读出来就是 0xFFFFFFFF。
+ * 主机上由 mock 的真实地址映射给出同样的语义（该地址之后直到 512 KB 边界
+ * 都在映射内且是 0xFF）—— 若没有这条，越界会变成段错误（测试直接崩，
+ * 看不出是被测代码的问题）。
+ */
+void test_unbounded_slot_size_still_rejects_bogus_image(void)
+{
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(0x00040000UL, KAT_A_VER, KAT_A_CRC, payload, 3U);
+    TEST_ASSERT_FALSE(boot_crc_verify(SLOT_A_BASE, 0U));
+}
+
+/* ======================================================================
+ * 版本读取（与校验共用头部定位，先前在主机上没有任何覆盖）
+ * ====================================================================== */
+
+void test_read_fw_version_returns_header_field(void)
+{
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    put_image(KAT_A_SIZE, KAT_A_VER, KAT_A_CRC, payload, 3U);
+    TEST_ASSERT_EQUAL_UINT32(KAT_A_VER, boot_read_fw_version(SLOT_A_BASE));
+}
+
+void test_read_fw_version_is_masked_to_24_bits(void)
+{
+    static const uint32_t payload[3] = { KAT_A_W0, KAT_A_W1, KAT_A_W2 };
+
+    if (!flash_ready()) {
+        return;
+    }
+    /* 高字节是保留位：读回来必须只剩低 24 位，否则"哪个槽更新"的判据会带上噪声 */
+    put_image(KAT_A_SIZE, 0xAB000102UL, KAT_A_CRC, payload, 3U);
+    TEST_ASSERT_EQUAL_UINT32(0x00000102UL, boot_read_fw_version(SLOT_A_BASE));
+}
+
+void test_read_fw_version_returns_zero_without_magic(void)
+{
+    if (!flash_ready()) {
+        return;
+    }
+    TEST_ASSERT_EQUAL_UINT32(0U, boot_read_fw_version(SLOT_A_BASE));
+    TEST_ASSERT_EQUAL_UINT32(0U, boot_read_fw_version(0U));
 }
 
 int main(void)
 {
     UNITY_BEGIN();
-    RUN_TEST(test_verify_null_flash_start);
-#if UINTPTR_MAX <= UINT32_MAX
-    RUN_TEST(test_verify_no_magic_found);
-    RUN_TEST(test_verify_crc_match);
-    RUN_TEST(test_verify_crc_mismatch);
-#endif
-    RUN_TEST(test_verify_zero_image_size);
-    RUN_TEST(test_verify_unaligned_image_size);
-    RUN_TEST(test_verify_overly_large_image_size);
+
+    /* KAT：CRC 通路的判决性用例 */
+    RUN_TEST(test_kat_a_is_accepted);
+    RUN_TEST(test_kat_b_is_accepted);
+    RUN_TEST(test_kat_c_is_accepted);
+    RUN_TEST(test_flash_is_directly_addressable_at_its_real_address);
+
+    /* 拒绝路径 */
+    RUN_TEST(test_null_flash_start_is_rejected);
+    RUN_TEST(test_no_magic_is_rejected);
+    RUN_TEST(test_wrong_crc_is_rejected);
+    RUN_TEST(test_corrupted_payload_is_rejected);
+    RUN_TEST(test_tampered_fw_version_is_rejected);
+    RUN_TEST(test_zero_image_size_is_rejected);
+    RUN_TEST(test_erased_image_size_is_rejected);
+    RUN_TEST(test_unaligned_image_size_is_rejected);
+    RUN_TEST(test_oversized_image_size_is_rejected);
+    RUN_TEST(test_unbounded_slot_size_still_rejects_bogus_image);
+
+    /* 版本读取 */
+    RUN_TEST(test_read_fw_version_returns_header_field);
+    RUN_TEST(test_read_fw_version_is_masked_to_24_bits);
+    RUN_TEST(test_read_fw_version_returns_zero_without_magic);
+
     return UNITY_END();
 }
