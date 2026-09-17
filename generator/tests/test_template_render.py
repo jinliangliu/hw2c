@@ -632,6 +632,57 @@ def _render_cli_driver(version=None, packed=None):
     return _make_env().get_template("drivers/drv_cli.c.j2").render(context)
 
 
+def _render_rtc_driver(initial_time):
+    """Render drivers/drv_rtc.c.j2 for an RTC configured with `initial_time`."""
+    from generator.context.builder import build_context
+
+    hardware = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "peripherals": [{
+            "name": "rtc1", "type": "Internal_RTC",
+            "extra": {"clock_source": "LSE", "wakeup_interval_ms": 1000,
+                      "initial_time": initial_time},
+        }],
+    }
+    context = build_context(hardware, "rtc-calendar-guard")
+    context["peripheral"] = {"name": "rtc1", "_clock_source": "LSE"}
+    context["model"] = {"type": "Internal_RTC"}
+    return _make_env().get_template("drivers/drv_rtc.c.j2").render(context)
+
+
+def test_rtc_calendar_call_carries_the_configured_initial_time():
+    """The parsed calendar must reach the real HAL calls as numbers.
+
+    Parsing correctly and rendering correctly are two links of one chain, and
+    each is easy to break without moving the other: a template that reads the
+    wrong key (or keeps a hard-coded default) leaves every parser test green
+    while the device still boots on the wrong date.  So assert on the arguments
+    `HAL_RTC_SetTime/SetDate` actually receive, and assert `sDate.Date` is a
+    day-of-month (1..31) -- a day/month/year swap used to put 2026 there.
+    """
+    import re
+
+    code = _render_rtc_driver("2026-09-17 10:00:00")
+
+    def _arg(name):
+        m = re.search(r"%s\s*=\s*(\d+)\s*;" % re.escape(name), code)
+        assert m is not None, (
+            "the rendered RTC init no longer assigns %s — the value parsed "
+            "from initial_time did not reach HAL_RTC_SetTime/SetDate" % (name,))
+        return int(m.group(1))
+
+    assert _arg("sTime.Hours") == 10
+    assert _arg("sTime.Minutes") == 0
+    assert _arg("sTime.Seconds") == 0
+    # The RTC stores a 2-digit year, i.e. an offset from 2000.
+    assert _arg("sDate.Year") == 26
+    assert _arg("sDate.Month") == 9
+    assert _arg("sDate.Date") == 17, (
+        "sDate.Date is not the day of month; the calendar fields are being "
+        "written into the wrong RTC struct members")
+
+
 def test_cli_rx_dispatch_rechecks_the_handover_sink_per_byte():
     """A single RX batch may contain BOTH the command that installs the
     handover sink AND the first bytes meant for it.
@@ -1015,4 +1066,5 @@ if __name__ == "__main__":
     test_macros_template_available()
     test_template_environment_has_macros()
     test_rtc_isr_acknowledges_every_flag_before_scheduler()
+    test_rtc_calendar_call_carries_the_configured_initial_time()
     print("All template_render tests passed.")

@@ -10,6 +10,7 @@ import sys
 import re
 import yaml
 import importlib.util
+from datetime import datetime
 
 from ..paths import MODELS_DIR, EXAMPLES_DIR, STATIC_STM32_DIR
 
@@ -97,6 +98,76 @@ def _parse_project_version(raw) -> tuple:
     canonical = "%d.%d.%d" % tuple(nums)
     packed = (nums[0] << 16) | (nums[1] << 8) | nums[2]
     return canonical, packed
+
+
+# 省略 initial_time 时的日历初值（2000-01-01 00:00:00）。
+DEFAULT_RTC_INIT_TIME = {"year": 0, "month": 1, "day": 1,
+                         "hour": 0, "min": 0, "sec": 0}
+
+# RTC 日历的年份字段只有 2 位（HAL_RTC_SetDate 的 Year 是 0..99），
+# 即可表示的窗口是 2000..2099 —— 此窗口之外的年份在硅片上无法表示。
+_RTC_YEAR_MIN = 2000
+_RTC_YEAR_MAX = 2099
+
+# "YYYY-MM-DD HH:MM:SS"（月/日/时/分/秒允许不补零，但年份必须是 4 位）。
+_RTC_INIT_TIME_RE = re.compile(
+    r"^(\d{4})-(\d{1,2})-(\d{1,2}) (\d{1,2}):(\d{1,2}):(\d{1,2})$")
+
+
+def _parse_rtc_initial_time(raw) -> dict:
+    """把 `initial_time` 解析成 RTC 日历字段（year 存 2000 起的偏移）。
+
+    RTC 初始时间是**烤进固件**的常量：`HAL_RTC_SetTime/SetDate` 之后设备就按它
+    走，再没有任何环节能发现它写错了 —— 症状只是"日志时间戳不对"，而那种现象
+    通常会被当成晶振/备份域问题去查硬件。所以这里与 `_parse_project_version`
+    同一个原则：宁可生成失败，也不要静默兜底。
+
+    旧实现有两个静默出口，都会把"写错了"伪装成"设成功了"：
+      · 手写 split（`y, mo, d = date_part.split("-")`）不校验字段位次 ——
+        `"17-09-2026 10:00:00"`（日月年）解析出 `year=17-2000=-1983`（被
+        `max(0, min(99, …))` 钳成 0）与 `day=2026`，后者**原样进 `sDate.Date`**，
+        而 RTC 的 Date 合法范围是 1..31；
+      · `except (ValueError, AttributeError): pass` 把格式错误降级成默认值 ——
+        `"2026/09/17 10:00:00"`、漏写秒、或任意拼错，都静默变成 2000-01-01。
+
+    年份窗口由 RTC 的 2 位年份字段决定；钳制（而非拒绝）是不可接受的，因为
+    钳制后的值看起来是合法的，等于替 YAML 作者做了一个他不知道的决定。
+    """
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return dict(DEFAULT_RTC_INIT_TIME)
+
+    text = str(raw).strip()
+    m = _RTC_INIT_TIME_RE.match(text)
+    if not m:
+        raise ValueError(
+            "initial_time 必须严格写成 \"YYYY-MM-DD HH:MM:SS\"（年份 4 位且在**最前**，"
+            "不接受 DD-MM-YYYY 或 YYYY/MM/DD，时/分/秒都不可省略），实际为 %r"
+            % (raw,)
+        )
+
+    year, month, day, hour, minute, second = (int(g) for g in m.groups())
+    try:
+        # 让 datetime 判定日历合法性（2 月 30 日、13 月、25 时等）。
+        datetime(year, month, day, hour, minute, second)
+    except ValueError as exc:
+        raise ValueError(
+            "initial_time %r 不是真实存在的日历时间：%s" % (raw, exc)
+        ) from None
+
+    if not _RTC_YEAR_MIN <= year <= _RTC_YEAR_MAX:
+        raise ValueError(
+            "initial_time 的年份必须在 %d~%d 之间（RTC 日历只存 2 位年份，"
+            "无法表示其他年份），实际为 %r" % (_RTC_YEAR_MIN, _RTC_YEAR_MAX, raw)
+        )
+
+    return {
+        "year": year - 2000,
+        "month": month,
+        "day": day,
+        "hour": hour,
+        "min": minute,
+        "sec": second,
+    }
 
 
 def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildContext:
@@ -890,25 +961,10 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
                     "period_ms": (period_s * 1000) if atype != "one_shot_ms" else delay_ms,
                     "event": alarm.get("event", "").upper(),
                 })
-            # Parse initial_time from extra config
-            init_str = extra.get("initial_time", "")
-            if init_str:
-                try:
-                    # Format: "YYYY-MM-DD HH:MM:SS"
-                    date_part, time_part = init_str.split(" ")
-                    y, mo, d = date_part.split("-")
-                    h, mi, s = time_part.split(":")
-                    rtc_year = int(y) - 2000
-                    rtc_init_time = {
-                        "year": max(0, min(99, rtc_year)),
-                        "month": int(mo),
-                        "day": int(d),
-                        "hour": int(h),
-                        "min": int(mi),
-                        "sec": int(s),
-                    }
-                except (ValueError, AttributeError):
-                    pass  # malformed, use defaults
+            # Parse initial_time from extra config.
+            # Fail-loud（格式 / 日历 / 年份窗口），见 FR-13.6 —— 这块值会被
+            # 原样烤进 HAL_RTC_SetDate，静默兜底等于让设备按一个错误的日期走。
+            rtc_init_time = _parse_rtc_initial_time(extra.get("initial_time"))
 
     # ---------- 预计算：Bootloader 字节大小 ----------
     boot_size_bytes = boot_config.get("size_kb", 8) * 1024 if has_bootloader else 0

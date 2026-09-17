@@ -382,3 +382,93 @@ UNINITIALIZED"区分不出"用户显式指定"与"旧模板的陈旧值"，真�
 四种来源各验一次 + 变异验证；另有
 `test_missing_project_version_packed_is_refused_at_generation_time`（派生输入
 缺失必须在生成期 `FATAL_ERROR`，而不是让 `--version` 展开为空）。
+
+
+================================================================
+[10] 缺陷 F：RTC `initial_time` 解析的静默出口（2026-09-17 续）
+================================================================
+
+起点不是上板，是用户问"开机 logo 怎么没了"。查证后确认横幅正常（§7.5 的
+观察窗口问题），但用户贴的日志时间戳是 `11:01:30` 而墙上时钟是 15:48 ——
+顺着"设备时钟从哪来"查下去，发现它来自配置里的固定初值：
+
+    examples/mhde_mainboard/hardware.yaml:102  initial_time: "2026-09-17 10:00:00"
+            ↓ 生成期解析
+    output/mhde_v101/src/drivers/drv_rtc.c     sDate.Year=26, Month=9, Date=17, 10:00:00
+
+`11:01:30` = `10:00:00` + uptime 3690 s，与日志严格自洽。真正的问题在
+解析这块：**它从不报错**。
+
+旧实现（`generator/context/builder.py` 预计算段）用手写 split：
+
+    date_part, time_part = init_str.split(" ")
+    y, mo, d = date_part.split("-")          # 字段位次完全不校验
+    rtc_year = int(y) - 2000
+    rtc_init_time = {"year": max(0, min(99, rtc_year)), "month": int(mo), ...}
+    except (ValueError, AttributeError):
+        pass                                  # malformed, use defaults
+
+两个静默出口，都把"配置写错了"伪装成"配置成功了"：
+
+  | 输入 | 旧实现的结果 | 后果 |
+  |---|---|---|
+  | `"17-09-2026 10:00:00"` | `year=17-2000=-1983` → clamp 成 0；`day=2026` | `sDate.Date = 2026` **原样进固件**（RTC 合法范围 1..31） |
+  | `"2026/09/17 10:00:00"` | 静默 → 2000-01-01 00:00:00 | 用户以为设了 2026，实际差 26 年 |
+  | `"2026-09-17 10:00"`（少秒） | 同上 | 同上 |
+
+为什么值得单独记：`initial_time` 是**烤进固件**的常量，写错之后没有任何环节
+能发现它 —— 唯一症状是"日志时间戳不对"，而那种现象天然会被当成 LSE 晶振 /
+备份域问题去查硬件。与缺陷 D/E 同源：**配置错误要有出口，不许静默**。
+
+修法（FR-13.6，与 FR-14.7 同原则）：
+  · 先用 `^\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}$` 校验**形状** ——
+    月/日/时/分/秒允许不补零（人写的 YAML），但年份必须 4 位且在最前，
+    因此 `DD-MM-YYYY` 被挡下；
+  · 再用 `datetime(...)` 构造校验**日历合法性**（2 月 30 日、13 月、25 时）；
+  · 年份必须落在 **2000..2099** —— 这是 RTC 日历自身的能力（只存 2 位年份）。
+    **拒绝而不是钳制**：钳制后的值看起来是合法的，等于替 YAML 作者做了
+    一个他看不到的决定；
+  · 只有**省略**该字段时才用默认值（2000-01-01 00:00:00）。
+
+护栏（5 条，全部做过变异验证，4/4 变异被抓到）：
+    test_builder.py::test_rtc_initial_time_is_parsed_strictly
+    test_builder.py::test_rtc_initial_time_year_must_fit_the_twodigit_calendar
+    test_builder.py::test_build_context_carries_rtc_initial_time
+    test_builder.py::test_bad_rtc_initial_time_fails_the_whole_generation
+        —— 拒绝必须发生在**真实路径**上，不是只在私有函数里；
+           generate.py 顶层有一串 except（含 `except Exception`），
+           已确认 `ValueError` 走 `logger.critical` + `sys.exit(1)`
+    test_template_render.py::test_rtc_calendar_call_carries_the_configured_initial_time
+        —— 跨文件断链：断言 `HAL_RTC_SetTime/SetDate` **实参上的数字**，
+           并断言 `sDate.Date` 是日（1..31）。日月年错位时它会是 2026，
+           而这一条只有"解析对了但模板读错键"时才会红。
+
+变异脚本 `.workbuddy/tmp/mutate_rtc_guard.py`（4/4 抓到）：
+  格式错误→默认值 / 年份越界→clamp / 模板把 `sDate.Date` 写成 year /
+  解析结果丢弃不用
+真链路两向验证 `.workbuddy/tmp/negative_rtc_check.py`：
+  错值 ⇒ 生成 rc=1 且报错含 `initial_time`；正值 ⇒ rc=0 且生成代码里
+  `sDate.Date = 17;` / `sDate.Year = 26;`
+
+—— 重新生成 + 编译 + 烧录 + 取证（2026-09-17 16:05）——
+
+    output/mhde_mainboard  (槽 A, v1.0.0)  combined.bin      126496 B
+    output/mhde_v101       (槽 B, v1.0.1)  mhde_v101_crc.bin 118272 B
+    差分补丁 2409 B，fw_version = 65537（派生自 1.0.1）
+
+  ① 烧录后读回 Flash `0x08000000 +0x1EE20` ⇒ 与本地 combined.bin
+     **逐字节一致**（sha256 `3418cfa51d5ad3f4…`），证明烧进去的就是新构建的镜像；
+  ② **SWD 直读 RTC 寄存器**（不占串口、不经适配器 —— 本次最硬的一条）：
+
+        pyocd cmd -t stm32g0b1vetx -c halt \
+            -c "read32 0x40002800 4" -c "read32 0x40002804 4" -c go
+        TR = 0x00100037  → BCD 解出 10:00:37
+        DR = 0x00260917  → 2026-09-17
+
+     恰为配置的 `2026-09-17 10:00:00` + 复位后 37 s —— 一次同时证明
+     "固件真的在跑"与"`initial_time` 真的生效"。若旧缺陷仍在，`DR` 的
+     日期字段会是被钳制/错位后的非法值。
+
+  ⚠️ 本次 COM5 被占用（`PermissionError(13)`）—— 用户正在自己看串口，
+     故串口侧的横幅 / `rtc` 命令判据**未由我执行**，改用上面两条非串口
+     取证替代。这两条比串口更硬：不经过任何主机侧适配器。

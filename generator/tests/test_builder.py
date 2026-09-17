@@ -70,6 +70,106 @@ def test_build_context_with_rtc():
     assert "stm32g0xx_hal_rtc.c" in ctx["hal_sources"]
 
 
+def _rtc_hw(initial_time):
+    """Minimal hardware description with an RTC carrying `initial_time`."""
+    return {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [{"id": "PA5", "function": "GPIO_Output"}],
+        "peripherals": [{
+            "name": "rtc1", "type": "Internal_RTC",
+            "extra": {"clock_source": "LSE", "wakeup_interval_ms": 1000,
+                      "initial_time": initial_time},
+        }],
+    }
+
+
+def test_rtc_initial_time_is_parsed_strictly():
+    """`initial_time` must be validated at generation time, never clamped.
+
+    The parsed fields go straight into `HAL_RTC_SetTime/SetDate`, so a value
+    that is silently defaulted or clamped leaves the device running on a wrong
+    calendar with no later chance to notice it -- the only symptom is a wrong
+    log timestamp, which gets misdiagnosed as a crystal / backup-domain fault.
+
+    The old implementation split the string by hand (`y, mo, d =
+    date_part.split("-")`), so field order was never checked:
+    "17-09-2026 10:00:00" produced `year = 17-2000 = -1983` clamped to 0 and
+    `day = 2026`, the latter written verbatim into `sDate.Date` whose legal
+    range on the RTC is 1..31.
+    """
+    from generator.context.builder import _parse_rtc_initial_time
+
+    default = {"year": 0, "month": 1, "day": 1, "hour": 0, "min": 0, "sec": 0}
+    # Only an omitted value may fall back to a default.
+    assert _parse_rtc_initial_time(None) == default
+    assert _parse_rtc_initial_time("") == default
+    assert _parse_rtc_initial_time("   ") == default
+
+    assert _parse_rtc_initial_time("2026-09-17 10:00:00") == {
+        "year": 26, "month": 9, "day": 17, "hour": 10, "min": 0, "sec": 0}
+    # Unpadded month/day/time is still accepted (YAML is written by hand).
+    assert _parse_rtc_initial_time("2026-9-7 1:2:3") == {
+        "year": 26, "month": 9, "day": 7, "hour": 1, "min": 2, "sec": 3}
+
+    for bad in ("2026/09/17 10:00:00", "2026-09-17 10:00", "17-09-2026 10:00:00",
+                "2026-02-30 10:00:00", "2026-13-01 10:00:00",
+                "2026-09-17 25:00:00", "2026-09-17 10:60:00", "2026-09-17",
+                "2026-09-17T10:00:00", "garbage", "2026-09-17 10:00:00 extra"):
+        try:
+            _parse_rtc_initial_time(bad)
+        except ValueError:
+            continue
+        raise AssertionError(
+            "initial_time %r was accepted; malformed input must fail the "
+            "generation instead of being clamped or replaced by a default"
+            % (bad,))
+
+
+def test_rtc_initial_time_year_must_fit_the_twodigit_calendar():
+    """The RTC keeps only a 2-digit year, so the window is 2000..2099.
+
+    Refusing (rather than clamping) matters: a clamped year looks like a
+    successful configuration, i.e. the generator makes a decision the YAML
+    author never sees.
+    """
+    from generator.context.builder import _parse_rtc_initial_time
+
+    assert _parse_rtc_initial_time("2000-01-01 00:00:00")["year"] == 0
+    assert _parse_rtc_initial_time("2099-12-31 23:59:59")["year"] == 99
+
+    for bad in ("1999-12-31 23:59:59", "2100-01-01 00:00:00",
+                "0001-01-01 00:00:00"):
+        try:
+            _parse_rtc_initial_time(bad)
+        except ValueError:
+            continue
+        raise AssertionError(
+            "initial_time %r is outside the RTC calendar's 2000..2099 window "
+            "but was accepted" % (bad,))
+
+
+def test_build_context_carries_rtc_initial_time():
+    """A well-formed `initial_time` reaches the template context."""
+    ctx = build_context(_rtc_hw("2026-09-17 10:00:00"), "test_rtc_init")
+    assert ctx["rtc_init_time"] == {
+        "year": 26, "month": 9, "day": 17, "hour": 10, "min": 0, "sec": 0}
+
+
+def test_bad_rtc_initial_time_fails_the_whole_generation():
+    """The refusal must happen on the real path, not only in the helper.
+
+    Guards against the parse being fixed while a later `except` swallows it
+    again somewhere between `build_context` and the rendered driver.
+    """
+    try:
+        build_context(_rtc_hw("17-09-2026 10:00:00"), "test_rtc_bad")
+    except ValueError:
+        return
+    raise AssertionError(
+        "build_context accepted a day/month/year-swapped initial_time; the "
+        "device would have been flashed with `sDate.Date = 2026`")
+
+
 def test_build_context_with_bootloader():
     """build_context with bootloader sets has_bootloader"""
     hw = {
@@ -280,6 +380,10 @@ if __name__ == "__main__":
     test_load_model_i2c_sensor()
     test_build_context_minimal()
     test_build_context_with_rtc()
+    test_rtc_initial_time_is_parsed_strictly()
+    test_rtc_initial_time_year_must_fit_the_twodigit_calendar()
+    test_build_context_carries_rtc_initial_time()
+    test_bad_rtc_initial_time_fails_the_whole_generation()
     test_build_context_with_bootloader()
     test_build_context_with_behavior()
     test_build_context_default_hil()

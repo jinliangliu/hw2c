@@ -313,6 +313,35 @@ python .workbuddy/tmp/serial_capture.py --out <log> --trigger "starting schedule
      `test_template_render.py::test_image_header_version_is_derived_from_project_version`
      （把渲染出的 CMake 解析块用 `cmake -P` 真跑一遍）。两者都做过变异验证。
 
+15. **配置值解析不许有"静默出口"：兜底、钳制、`except: pass` 都算**
+   （RTC `initial_time`，2026-09-17）。
+   `hardware.yaml` 的 `Internal_RTC.extra.initial_time` 是**烤进固件**的日历常量：
+   生成期写进 `HAL_RTC_SetTime/SetDate` 之后设备就按它走，再没有任何环节能发现
+   它错了 —— 唯一症状是"日志时间戳不对"，而那种现象天然会被当成 LSE 晶振 /
+   备份域问题去查硬件。旧实现在这里开了两个静默出口：
+
+   - `except (ValueError, AttributeError): pass  # malformed, use defaults`
+     ⇒ `"2026/09/17 10:00:00"`、漏写秒、任意拼错，都静默变成 2000-01-01。
+   - 手写 `y, mo, d = date_part.split("-")` **不校验字段位次**：
+     `"17-09-2026 10:00:00"`（日月年）解析出 `year = 17-2000` 被
+     `max(0, min(99, …))` **钳成 0**，而 `day = 2026` **原样写进 `sDate.Date`**
+     —— RTC 的 Date 合法范围是 1..31，钳制只是把错误挪了个位置。
+
+   ⇒ 两条通用规则：**① 解析失败要失败，不要兜底；② 越界要拒绝，不要钳制**
+   （钳制后的值看起来合法，等于替 YAML 作者做了一个他看不见的决定）。
+   **只有字段整体省略**时才允许用默认值。需求见 FR-13.6。
+   实现：先正则校验**形状**（`^\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}$`
+   —— 月/日/时/分/秒可不补零，但年份 4 位且在最前，自然挡住 DD-MM-YYYY），
+   再用 `datetime(...)` 构造校验**日历合法性**（2 月 30 日 / 13 月 / 25 时），
+   最后判年份窗口 2000..2099（RTC 只存 2 位年份 —— 这是硅片的窗口，不是偏好）。
+   另注意 `generate.py` 顶层有一串 `except`（含 `except Exception`）：新增
+   `raise ValueError` 时要确认它落在 `logger.critical + sys.exit(1)` 那一支上，
+   否则"报错"会退化成日志里一行容易被忽略的文字。
+   护栏：`test_builder.py` 四条（含"拒绝必须发生在**真实路径**上"）+
+   `test_template_render.py::test_rtc_calendar_call_carries_the_configured_initial_time`
+   （断言 `HAL_RTC_Set*` **实参上的数字**，并断言 `sDate.Date` 是日 1..31 ——
+   日月年错位时它会是 2026）。变异脚本 `.workbuddy/tmp/mutate_rtc_guard.py`。
+
 ## CI（.github/workflows/build_and_test.yml）
 
 三个 job：Lint（flake8/black，均有容错）→ Build & Test（生成 base +
