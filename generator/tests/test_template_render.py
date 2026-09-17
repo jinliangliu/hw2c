@@ -1055,6 +1055,55 @@ project:
     )
 
 
+def test_rtos_heap_size_reaches_the_generated_freertos_config():
+    """`task.yaml` 的 rtos_heap_size 必须落到 FreeRTOSConfig.h 上。
+
+    这是一条跨文件不变量（merge -> HardwareModel -> build_context -> 渲染）：
+    堆大小写错既不会有编译期症状，也不会在设备上留下痕迹，只会让 `ucHeap`
+    那块的尺寸和作者以为的不一样 —— 而运行时症状是 pvPortMalloc 返回 NULL。
+    三个示例曾经把堆写在 project 块里，merge() 只认 name / version，于是配置
+    被静默丢弃（见 test_project_block_unknown_keys_are_reported）。
+    """
+    import re as _re
+
+    from generator.context.builder import build_context
+    from generator.mapper import merge
+    from generator.schemas.hardware import HardwareModel
+
+    hardware = """
+mcu:
+  part: STM32G0B1RET6
+pins:
+  - id: PC0
+    function: GPIO_Output
+    label: LED
+"""
+    task = """
+project:
+  name: heap_probe
+  version: "1.0.0"
+rtos_heap_size: 20480
+"""
+
+    merged = merge(hardware, task, "")
+    assert merged.get("rtos_heap_size") == 20480, (
+        "mapper.merge() 丢了 rtos_heap_size —— 堆会退回自动推算")
+
+    dumped = HardwareModel.model_validate(merged).model_dump(exclude_none=True)
+    assert dumped.get("rtos_heap_size") == 20480, (
+        "HardwareModel 在去往 build_context() 的路上丢了 rtos_heap_size")
+
+    ctx = build_context(dumped, "heap_probe")
+    assert ctx.get("total_heap_size") == 20480
+
+    out = _make_env().get_template("config/FreeRTOSConfig.h.j2").render(ctx)
+    m = _re.search(r"configTOTAL_HEAP_SIZE\s+\(\s*\(size_t\)(\d+)\s*\)", out)
+    assert m, "FreeRTOSConfig.h 里找不到 configTOTAL_HEAP_SIZE 的定义"
+    assert int(m.group(1)) == 20480, (
+        "渲染出的 configTOTAL_HEAP_SIZE = %s，与 task.yaml 里的 rtos_heap_size "
+        "(20480) 不一致" % m.group(1))
+
+
 if __name__ == "__main__":
     test_main_c_template_basic()
     test_main_c_template_with_rtc()

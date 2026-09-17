@@ -5,6 +5,7 @@ Delegates to sub-modules: pin_context, peripheral_context, hal_context,
 bootloader_context.
 """
 
+import logging
 import os
 import sys
 import re
@@ -13,6 +14,8 @@ import importlib.util
 from datetime import datetime
 
 from ..paths import MODELS_DIR, EXAMPLES_DIR, STATIC_STM32_DIR
+
+logger = logging.getLogger("hw2c.builder")
 
 from .pin_context import process_pins
 from .peripheral_context import detect_peripherals
@@ -98,6 +101,77 @@ def _parse_project_version(raw) -> tuple:
     canonical = "%d.%d.%d" % tuple(nums)
     packed = (nums[0] << 16) | (nums[1] << 8) | nums[2]
     return canonical, packed
+
+
+# ---------------------------------------------------------------------------
+# FreeRTOS 堆大小（configTOTAL_HEAP_SIZE）
+# ---------------------------------------------------------------------------
+
+# heap_4 按 portBYTE_ALIGNMENT 切块；堆大小不是它的整数倍时尾部会剩一块永远
+# 分不出去的碎片，所以非对齐的配置按错误处理而不是"好心截断"。
+_RTOS_HEAP_ALIGNMENT = 8
+
+# 上限取验证目标 MCU 的物理 RAM（STM32G0B1RE/B1VE = 144 KB）。这里只拦"数量级
+# 明显写错"的配置；真正的 RAM 溢出由链接器在链接期报错，不会静默。
+_RTOS_HEAP_MAX_BYTES = 144 * 1024
+
+
+def _resolve_rtos_heap_size(configured, auto_size: int) -> int:
+    """决定写进 `configTOTAL_HEAP_SIZE` 的值：显式配置优先，缺省用推算值。
+
+    这个数字是**烤进固件的常量**：写小了只会在运行时表现为 `pvPortMalloc`
+    返回 NULL（任务创建失败、OTA 收不下包），没有任何编译期提示。所以这里宁可
+    生成失败也不静默钳制 —— 与 `project.version`（FR-3.1）、RTC 初值（FR-13.6）
+    同一条原则：**配置值解析不许有静默出口**。
+
+    `configured` 为 None / 空串 / 纯空白表示"没配"，返回 `auto_size`
+    （由任务集推算，见 `compute_heap_size()`）。
+    """
+    if configured is None or (isinstance(configured, str) and not configured.strip()):
+        return auto_size
+
+    if isinstance(configured, bool):
+        raise ValueError(
+            "rtos_heap_size 必须是整数（字节），收到布尔值 %r" % (configured,)
+        )
+
+    if isinstance(configured, str):
+        try:
+            # base 0 让 0x5000 / 0b1010 这类写法也能用，与 YAML 作者的预期一致。
+            value = int(configured.strip(), 0)
+        except ValueError:
+            raise ValueError(
+                "rtos_heap_size 无法解析为整数: %r（应写字节数，如 20480 或 0x5000）"
+                % (configured,)
+            ) from None
+    elif isinstance(configured, int):
+        value = configured
+    else:
+        raise ValueError(
+            "rtos_heap_size 类型不支持: %s（应为整数或数字字符串）"
+            % type(configured).__name__
+        )
+
+    if value <= 0:
+        raise ValueError("rtos_heap_size 必须为正数，收到 %d" % value)
+    if value % _RTOS_HEAP_ALIGNMENT != 0:
+        raise ValueError(
+            "rtos_heap_size 必须是 %d 的整数倍（FreeRTOS heap_4 按 "
+            "portBYTE_ALIGNMENT 对齐分配），收到 %d" % (_RTOS_HEAP_ALIGNMENT, value)
+        )
+    if value > _RTOS_HEAP_MAX_BYTES:
+        raise ValueError(
+            "rtos_heap_size = %d 超过 MCU 的 RAM 容量 %d B"
+            % (value, _RTOS_HEAP_MAX_BYTES)
+        )
+    if value < auto_size:
+        logger.warning(
+            "rtos_heap_size = %d 低于按任务集推算的 %d B —— "
+            "运行时可能出现 pvPortMalloc 失败（任务创建 / 队列 / OTA 收包）",
+            value,
+            auto_size,
+        )
+    return value
 
 
 # 省略 initial_time 时的日历初值（2000-01-01 00:00:00）。
@@ -1014,7 +1088,12 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
         # Driver / kernel overhead
         heap += 4096
         return ((heap + 1023) // 1024) * 1024   # round to KiB
-    total_heap_size = compute_heap_size(app_tasks, has_cli, has_fota)
+    # 显式配置（task.yaml 顶层的 rtos_heap_size）优先，缺省用推算值；
+    # 解析失败直接抛 ValueError，由 generate.py 顶层拦成非零退出（FR-3.16）。
+    total_heap_size = _resolve_rtos_heap_size(
+        hw.get("rtos_heap_size"),
+        compute_heap_size(app_tasks, has_cli, has_fota),
+    )
 
     # ---------- 查找 LED 任务名 ----------
     led_task_name = None

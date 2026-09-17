@@ -60,6 +60,31 @@ def merge(
     if isinstance(project, dict) and project.get("version") is not None:
         merged["project_version"] = project["version"]
 
+    # ---- Extract RTOS heap size ----
+    #
+    # `rtos_heap_size` 是 FreeRTOS heap_4 池的大小（configTOTAL_HEAP_SIZE），
+    # 放在 task.yaml 顶层。它与 hardware.yaml 的 `heap_size` 是两个不同的东西
+    # —— 后者进链接脚本，是留给 newlib 的系统堆 —— 所以刻意不共用一个名字。
+    # 缺省时由 builder._resolve_rtos_heap_size() 按任务集推算（FR-3.16）。
+    if task.get("rtos_heap_size") is not None:
+        merged["rtos_heap_size"] = task["rtos_heap_size"]
+
+    # ---- project 块只认 name / version，其余键必须出声 ----
+    #
+    # 这里曾经静默丢弃 `project.heap_size`：几个示例都写了它（24576 / 16384），
+    # 于是作者以为堆配上了，而生成的链接脚本一直是默认的 0x200、FreeRTOS 堆照旧
+    # 走自动推算。配置写在错层**不报错**是最难查的一类缺陷 —— 它既不出现在 diff
+    # 里，也不会在设备上留下任何痕迹。
+    if isinstance(project, dict):
+        _unknown_project_keys = sorted(set(project) - {"name", "version"})
+        if _unknown_project_keys:
+            logger.warning(
+                "task.yaml 的 project 块只认 name / version，已忽略 %s —— "
+                "写在这里的配置不会生效。FreeRTOS 堆请用顶层的 rtos_heap_size，"
+                "链接脚本的系统堆请用 hardware.yaml 的 heap_size",
+                _unknown_project_keys,
+            )
+
     # ---- Merge app_tasks ----
     app_tasks = task.get("app_tasks", [])
     if not app_tasks and "app_tasks" in hw:

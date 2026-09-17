@@ -13,7 +13,6 @@
 project:
   name: base
   version: "1.0.0"
-  heap_size: 24576
 
 event_task:
   name: events_process_task

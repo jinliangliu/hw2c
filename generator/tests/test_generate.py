@@ -147,6 +147,43 @@ def test_software_layer_fields_survive_the_real_pipeline(tmp_path):
     assert seen["project_name"] == "ver_probe"
 
 
+def test_project_block_unknown_keys_are_reported(caplog):
+    """写在 task.yaml 的 project 块里、merge() 不认识的键必须出声。
+
+    这里曾经静默丢弃 `project.heap_size`：几个示例都写了它（24576 / 16384），
+    作者以为堆配上了，而生成的链接脚本一直是默认的 0x200、FreeRTOS 堆照旧走
+    自动推算。配置写在错层却不报错是最难查的一类缺陷 —— 它既不出现在 diff 里，
+    也不会在设备上留下任何痕迹。
+    """
+    import logging
+
+    from generator.mapper import merge
+
+    hardware = """
+mcu:
+  part: STM32G0B1RET6
+pins:
+  - id: PC0
+    function: GPIO_Output
+    label: LED
+"""
+    task = """
+project:
+  name: heap_probe
+  version: "1.0.0"
+  heap_size: 24576
+"""
+
+    with caplog.at_level(logging.WARNING, logger="hw2c.mapper"):
+        merged = merge(hardware, task, "")
+
+    assert merged.get("heap_size") is None, (
+        "project.heap_size 不该被合并到顶层 —— 它是错层的配置，"
+        "静默接受反而会让作者以为它生效了")
+    assert any("heap_size" in r.getMessage() for r in caplog.records), (
+        "merge() 对 project 块里的未知键保持沉默 —— 写错层的配置又被静默吞掉了")
+
+
 if __name__ == "__main__":
     test_generate_with_mock_validator()
     test_generate_with_mock_context_builder()

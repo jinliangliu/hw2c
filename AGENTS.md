@@ -342,6 +342,28 @@ python .workbuddy/tmp/serial_capture.py --out <log> --trigger "starting schedule
    （断言 `HAL_RTC_Set*` **实参上的数字**，并断言 `sDate.Date` 是日 1..31 ——
    日月年错位时它会是 2026）。变异脚本 `.workbuddy/tmp/mutate_rtc_guard.py`。
 
+16. **YAML 里写了、却没有任何代码会去读的键，必须在生成期出声**
+   （`project.heap_size`，2026-09-17）。
+   `mapper.merge()` 从 `task.yaml` 的 `project` 块里只取 `name` / `version`；而几个
+   示例都写了 `project.heap_size: 24576`（`knob_demo` 是 16384）—— 作者以为堆配上了，
+   实际生成的链接脚本一直是默认 `0x200`，FreeRTOS 堆照旧走自动推算。这不是"解析
+   失败"，而是**根本没进解析**，所以教训 15 那类 fail-loud 拦不住它。
+
+   ⇒ 两条判据：
+   **① 每一层 YAML 的每个键，都要能指出"谁读它"**。`merge()` 那种白名单式提取
+   （`project` 只认 `name` / `version`）必须对未知键出声；否则"写错层"和"写对了"
+   在生成日志里长得一模一样。
+   **② 同一概念在不同层有不同归属时，不要复用名字**。`heap_size` 属于
+   `hardware.yaml`（进链接脚本，是留给 newlib 的系统堆），FreeRTOS 的堆另起名
+   `rtos_heap_size` 放 `task.yaml` 顶层 —— 复用名字会让"放错层"看起来是对的。
+   新增配置项时记得同步 `split_legacy()` 的层归属列表（旧单体 YAML 走那条路径）。
+
+   FreeRTOS 堆：缺省由 `compute_heap_size()` 按任务集推算，显式配置优先，非法值
+   （非整数 / ≤0 / 非 8 字节对齐 / 超过 RAM 容量）在**生成期报错**（FR-3.16）。
+   ⚠️ **推算值偏紧**：mhde_mainboard 推算 13312 B，而实测稳态只剩 760 B 空闲
+   （公式没把组件 step 任务算进去）—— 加组件或调大任一任务栈之前先看这个数字，
+   而不是链接期剩下的那 112 KB。
+
 ## CI（.github/workflows/build_and_test.yml）
 
 三个 job：Lint（flake8/black，均有容错）→ Build & Test（生成 base +

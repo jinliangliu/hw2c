@@ -170,6 +170,78 @@ def test_bad_rtc_initial_time_fails_the_whole_generation():
         "device would have been flashed with `sDate.Date = 2026`")
 
 
+def test_rtos_heap_size_is_parsed_strictly():
+    """rtos_heap_size 是烤进固件的常量，不允许任何静默兜底。
+
+    写小了这个值只会在运行时表现为 pvPortMalloc 返回 NULL（任务创建失败、
+    OTA 收不下包），编译期毫无提示 —— 所以非法配置必须在**生成期**失败：
+      · 非整数 / 布尔 / 浮点 / 容器        -> ValueError
+      · <= 0                              -> ValueError
+      · 不是 portBYTE_ALIGNMENT(8) 的整数倍 -> ValueError
+        （heap_4 会留下一块永远分不出去的尾部碎片）
+      · 超过 MCU 的 RAM 容量              -> ValueError
+    """
+    from generator.context.builder import _resolve_rtos_heap_size
+
+    AUTO = 13312
+
+    # 省略（None / 空串 / 纯空白）→ 推算值
+    assert _resolve_rtos_heap_size(None, AUTO) == AUTO
+    assert _resolve_rtos_heap_size("", AUTO) == AUTO
+    assert _resolve_rtos_heap_size("   ", AUTO) == AUTO
+
+    # 显式值优先；十进制与十六进制都认
+    assert _resolve_rtos_heap_size(20480, AUTO) == 20480
+    assert _resolve_rtos_heap_size("20480", AUTO) == 20480
+    assert _resolve_rtos_heap_size("0x5000", AUTO) == 20480
+
+    # 低于推算值：接受（作者可能有意省 RAM），但要出声
+    assert _resolve_rtos_heap_size(4096, AUTO) == 4096
+
+    for bad in (0, -1, 1, 20481, "abc", "20 KB", "0x1FFF",
+                True, False, 3.5, [1], {"a": 1}, 300000, 144 * 1024 + 8):
+        try:
+            got = _resolve_rtos_heap_size(bad, AUTO)
+        except ValueError:
+            continue
+        raise AssertionError(
+            "rtos_heap_size=%r 被接受了（得到 %r）—— 非法值必须在生成期失败"
+            % (bad, got))
+
+
+def test_rtos_heap_size_overrides_the_computed_default():
+    """task.yaml 顶层的 rtos_heap_size 必须真的走到 build_context 里。
+
+    这条防的是"配置写了但不生效"：示例里曾经把堆大小写在 project 块下，
+    而 merge() 只认 name / version —— 那份配置被静默丢弃，堆一路走自动推算，
+    全程没有任何地方会报错。
+    """
+    from generator.mapper import merge
+
+    hw_yaml = (
+        "mcu: {part: STM32G0B1RET6}\n"
+        "pins:\n"
+        "  - {id: PA5, function: GPIO_Output}\n"
+        "peripherals:\n"
+        "  - name: usart2\n"
+        "    type: UART_Serial\n"
+        "    instance: USART2\n"
+        "    interface: uart\n"
+        "    extra: {baudrate: 115200}\n"
+    )
+    head = "project: {name: heap_probe, version: '1.0.0'}\n"
+
+    configured = build_context(
+        merge(hw_yaml, head + "rtos_heap_size: 20480\n"), "heap_probe")
+    auto = build_context(merge(hw_yaml, head), "heap_probe")
+
+    assert configured["total_heap_size"] == 20480, (
+        "rtos_heap_size 没有走到上下文里 —— YAML 里配的堆大小又成了摆设")
+    assert auto["total_heap_size"] > 0
+    assert auto["total_heap_size"] != 20480, (
+        "省略 rtos_heap_size 时应当走自动推算，而不是也得到 20480")
+
+
 def test_build_context_with_bootloader():
     """build_context with bootloader sets has_bootloader"""
     hw = {
@@ -384,6 +456,8 @@ if __name__ == "__main__":
     test_rtc_initial_time_year_must_fit_the_twodigit_calendar()
     test_build_context_carries_rtc_initial_time()
     test_bad_rtc_initial_time_fails_the_whole_generation()
+    test_rtos_heap_size_is_parsed_strictly()
+    test_rtos_heap_size_overrides_the_computed_default()
     test_build_context_with_bootloader()
     test_build_context_with_behavior()
     test_build_context_default_hil()

@@ -5,7 +5,11 @@
 project:
   name: mhde_mainboard
   version: "1.0.0"
-  heap_size: 24576
+
+# FreeRTOS 堆大小（configTOTAL_HEAP_SIZE）。省略时由生成器按任务集自动推算
+# （本工程推算出 13312 B，实测运行到稳态后只剩 760 B 空闲），这里显式给 20 KB。
+# 注意与 hardware.yaml 的 heap_size 区分：那个进链接脚本，是留给 newlib 的系统堆。
+rtos_heap_size: 20480
 
 event_task:
   name: events_process_task

@@ -105,7 +105,7 @@
 
 | ID | 需求 |
 |----|------|
-| FR-3.1 | 工程元数据：`project.name` / `project.version` / `heap_size` |
+| FR-3.1 | 工程元数据：`project.name` / `project.version` |
 | FR-3.2 | FreeRTOS 任务定义：`name` / `priority`(0–31) / `stack_size`（单次运行行为由触发条件隐式表达） |
 | FR-3.3 | 层级状态机：`behavior.initial_state` / `states` / `transitions{event,target,actions}` |
 | FR-3.4 | 复合子状态（`state.states`，**仅一层嵌套**） |
@@ -120,6 +120,7 @@
 | FR-3.13 | 变量声明：名称 / C 类型或自定义类型 / 数组 / 初值 |
 | FR-3.14 | 跨区域通信：`send_to` + `publish_async` |
 | FR-3.15 | guard 条件表达式原样嵌入 C（编译期报错），生成期做变量引用校验 |
+| FR-3.16 | FreeRTOS 堆大小：`task.yaml` 顶层 `rtos_heap_size`（字节）。缺省时由任务集**自动推算**（各任务栈 + TCB + 事件队列 + 内核开销，向上取整到 KiB）；显式配置优先。非法值（非整数 / ≤0 / 未按 `portBYTE_ALIGNMENT` 对齐 / 超过 RAM 容量）在**生成期报错**，不静默钳制；低于自动推算值只告警。**注意与 FR-2.8 的 `heap_size` 区分**：后者是 `hardware.yaml` 里留给链接脚本 newlib 的系统堆，两者互不影响 |
 
 ### FR-4 接线 / 绑定层 `bind.yaml` ✅
 
