@@ -357,7 +357,7 @@ int main(void)
             "\t _/    _/    _/  _/  _/      _/      _/\n"            
             "\t_/    _/      _/  _/      _/_/_/_/    _/_/_/\r\n"
     );
-    log_info("{{ project_name }} v1.0 — Hardware2Code | {{ mcu.part }} @ {{ (mcu.clock_freq_hz / 1000000) | int }} MHz");
+    log_info("{{ project_name }} v{{ project_version }} — Hardware2Code | {{ mcu.part }} @ {{ (mcu.clock_freq_hz / 1000000) | int }} MHz");
 
     /*
      * Report a fault trapped before the previous reset.  Without this the

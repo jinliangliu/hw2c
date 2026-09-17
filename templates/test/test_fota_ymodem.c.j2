@@ -475,14 +475,62 @@ void test_header_block_with_an_xmodem_crc_is_acked_and_parsed(void)
     build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO, crc, 0U);
     feed_tx();
 
-    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
-    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+    /* ⚠️ 应答是 **两个** 字节：ACK，以及紧随其后的 'C'。
+     *
+     * 规范里接收方的次序是"发 'C' → 收块 0 → ACK → **再发 'C'** → 收数据块"。
+     * 这条断言曾经只要求一个字节 —— 而设备也真的只发一个字节，于是自研主机
+     * 与设备完全自洽、本文件全绿。对接真正的第三方发送端时才暴露：发送端在
+     * 块 0 被 ACK 后等的就是这个 'C'，等到自己的超时（python-ymodem 包 60 s）
+     * 才放弃，现场表现是"文件发不出去、设备一声不吭"。
+     *
+     * 真机实测记录：`docs/reviews/onboard-capture-2026-09-17.txt`。
+     * 所以这里断言成"两个字节 + 次序"，而不是"至少有 ACK"。 */
+    TEST_ASSERT_EQUAL_UINT16(2U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_at(0U));
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CRC_REQUEST, out_at(1U));
 
     /* 文件名与声明长度都要被真的解析出来：文件名是操作员的诊断信息
      * （"是不是选错了文件"），声明长度是末块截断与长度交叉核对的依据。 */
     TEST_ASSERT_EQUAL_STRING(name, fota_ymodem_file_name());
     TEST_ASSERT_EQUAL_UINT32(4096U, g_declared);
     TEST_ASSERT_EQUAL_UINT8(1U, g_expect_blk);      /* 下一块是数据块 1 */
+}
+
+/**
+ * 块 0 之后那个 'C' 是**一次性的邀请**：数据阶段空闲时应当 NAK，不能再发 'C'。
+ *
+ * 为什么单独钉这一条：把 'C' 挂到周期路径上（例如为了"保险起见"在每个
+ * `fota_process()` 里补一脚）会得到一个每 3 s 往数据流里插一个 'C' 的实现。
+ * 症状是发送端在等 ACK 时先读到 'C'，把它当成"应答不对"，于是重发当前块 ——
+ * 每批都白跑，严格的实现直接判失败。而"ACK 后面有 'C'"这条断言（上一条用例）
+ * 单独是**看不出来**的。
+ */
+void test_the_post_header_crc_request_is_sent_once_and_not_periodically(void)
+{
+    static const char name[] = "fota_demo.h2cd";
+    uint16_t plen;
+    uint16_t crc;
+    uint32_t i;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    plen = fill_header_payload((uint8_t)YMODEM_CTL_SOH, name, 4096U);
+    crc  = payload_crc(plen, 0U);
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO, crc, 0U);
+    feed_tx();
+    TEST_ASSERT_EQUAL_UINT16(2U, g_out_len);        /* ACK + 'C'，就这一次 */
+
+    /* 数据阶段迟迟没有块到来：每过一个块超时应答一个 NAK，
+     * 而不是再邀请一次。 */
+    out_reset();
+    for (i = 0U; i < 3U; i++) {
+        mock_tick_advance((uint32_t)YMODEM_BLOCK_TIMEOUT_MS);
+        fota_process();
+        TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
+        TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_NAK, out_at(0U));
+        out_reset();
+    }
 }
 
 /**
@@ -587,13 +635,17 @@ void test_a_repeated_header_block_is_acked_as_a_duplicate(void)
 
     build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO, crc, 0U);
     feed_tx();
-    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+    TEST_ASSERT_EQUAL_UINT16(2U, g_out_len);        /* ACK + 'C' */
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_at(0U));
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CRC_REQUEST, out_at(1U));
 
-    /* 原样再发一次。 */
+    /* 原样再发一次。重复块只再 ACK 一次，**不再补发 'C'** —— 'C' 是"请开始
+     * 发数据"的一次性邀请，重复块并没有开启新阶段。 */
+    out_reset();
     build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO, crc, 0U);
     feed_tx();
 
-    TEST_ASSERT_EQUAL_UINT16(2U, g_out_len);
+    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
     TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
     TEST_ASSERT_EQUAL_UINT8(1U, g_expect_blk);     /* 没有前进两次 */
     TEST_ASSERT_EQUAL_UINT32(4096U, g_declared);
@@ -663,7 +715,8 @@ void test_one_can_is_noise_but_two_at_a_block_boundary_abort(void)
                     payload_crc(plen, 0U), 0U);
         feed_tx();
     }
-    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+    TEST_ASSERT_EQUAL_UINT16(2U, g_out_len);     /* ACK + 'C'（块 0 被收下） */
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_at(0U));
     out_reset();
 
     fota_ymodem_rx_bytes(two_can, 2U);
@@ -697,8 +750,9 @@ void test_can_bytes_inside_a_block_are_payload_not_an_abort(void)
                 payload_crc(plen, 0U), 0U);
     feed_tx();
 
-    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
-    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+    TEST_ASSERT_EQUAL_UINT16(2U, g_out_len);         /* ACK + 'C' */
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_at(0U));
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CRC_REQUEST, out_at(1U));
     TEST_ASSERT_EQUAL_STRING(name, fota_ymodem_file_name());
     TEST_ASSERT_EQUAL_UINT8(1U, cli_rx_sink_active());
     TEST_ASSERT_EQUAL_INT(FOTA_E_NONE, fota_get_last_error());
@@ -723,6 +777,7 @@ int main(void)
     RUN_TEST(test_handshake_timeout_returns_the_uart_as_idle_not_error);
 
     RUN_TEST(test_header_block_with_an_xmodem_crc_is_acked_and_parsed);
+    RUN_TEST(test_the_post_header_crc_request_is_sent_once_and_not_periodically);
     RUN_TEST(test_the_same_block_with_a_ccitt_false_crc_is_naked);
     RUN_TEST(test_a_broken_block_complement_is_naked_even_with_a_good_crc);
     RUN_TEST(test_a_data_block_before_the_header_is_naked);

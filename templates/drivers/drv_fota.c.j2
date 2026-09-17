@@ -17,6 +17,9 @@
 #include "drv_{{ cli_name }}.h"      /* cli_set_rx_sink / cli_write_raw / cli_rx_sink_active */
 #include "drv_iwdg.h"
 #include "hw2c_fault.h"
+{% if has_log %}
+#include "drv_log.h"                 /* log_error：应用失败的唯一线索，见 fota_apply_now() */
+{% endif %}
 
 /* ⚠️ 必须 include：`fota_process()` 在 `FOTA_TP_YMODEM` 期间要调
  * `fota_ymodem_process()`。缺了它只是"隐式声明"警告（C99 里是错误，
@@ -1040,6 +1043,31 @@ static void fota_apply_now(void)
     if (rc != FOTA_DELTA_OK) {
         g_last_error = (derr != 0) ? derr : rc;
         g_state      = FOTA_STATE_ERROR;
+{% if has_log %}
+        /* 这条日志是**唯一**的失败线索，别删。
+         *
+         * 这里的失败在复位后不留任何痕迹：错误码只活在 RAM 的 g_last_error 里，
+         * 而紧接着的 hw2c_fault_trap() 会立刻复位；元数据记录的字段是
+         * (seq, state, slot, staged)，**没有**错误码的位置。于是复位后
+         * `fota status` 只会说 `state: ERROR / last error: 0` ——
+         * 现场看到"升级失败"，却看不到"为什么失败"。
+         * 本仓库真机上第一次差分升级失败就是这么变成哑谜的
+         * （docs/reviews/onboard-capture-2026-09-17.txt）。
+         *
+         * 打印信封里的 old/new 尺寸与 CRC，是因为最常见的两类失败
+         * （-8 FOTA_DELTA_E_OLD_SIZE / -9 FOTA_DELTA_E_OLD_CRC）都只能靠
+         * "补丁声称的旧镜像"与"活动槽实况"对比才能定位 —— 而主机侧那份
+         * `--old` 镜像就是这里的比对对象，两边一对就知道是不是拿错了镜像。 */
+        log_error("FOTA apply failed: rc=%d derr=%d "
+                  "old=%lu/%08lX new=%lu/%08lX patch=%lu",
+                  (int)rc, derr,
+                  (unsigned long)g_env.old_size,
+                  (unsigned long)g_env.old_crc32,
+                  (unsigned long)g_env.new_size,
+                  (unsigned long)g_env.new_crc32,
+                  (unsigned long)g_env.patch_size);
+        log_flush();
+{% endif %}
         (void)fota_meta_append(FOTA_META_STATE_ERROR, g_slot,
                                g_staging_used);
         /* 失败时活动槽**未被触碰**，设备继续跑旧固件。

@@ -50,6 +50,16 @@ def merge(
     if isinstance(project, dict) and project.get("name"):
         merged["project_name"] = project["name"]
 
+    # ---- Extract project version ----
+    #
+    # 这一条曾经缺失：`project.name` 被取走了，`project.version` 被丢掉，于是
+    # task.yaml 里写 `version: "1.0.1"` 对固件**完全没有影响** —— banner 与
+    # `version` 命令各自打印一个字面量（`v1.0` / `1.0.0`），差分 OTA 升级完
+    # 版本号不变。版本号必须在链路上传到底，见 generator/context/builder.py
+    # 的 _parse_project_version()。
+    if isinstance(project, dict) and project.get("version") is not None:
+        merged["project_version"] = project["version"]
+
     # ---- Merge app_tasks ----
     app_tasks = task.get("app_tasks", [])
     if not app_tasks and "app_tasks" in hw:

@@ -45,7 +45,28 @@ set(LWRB_DIR          "${HW2C_ROOT}/third_party/lwrb")
 set(HW2C_CLI_DIR      "${HW2C_ROOT}/hw2c_cli")
 
 # ── Linker script ────────────────────────────────────────────────────────────
-set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/linker/{{ 'app_slot_a.ld' if has_bootloader else 'STM32G0B1RETx_FLASH.ld' }}")
+{% if has_bootloader %}
+# 应用链接到哪个槽。默认 A（正常构建 / 上板用的就是这个）。
+#
+# 为什么做成可切换的：差分 OTA 的 `--new` 镜像**必须按目标槽的基址链接**，
+# 否则补丁内容会是一份"给 A 槽定位、却被写进 B 槽"的固件 —— CRC 全对、传输
+# 全过，跳过去当场硬故障（或更坏：跳到 A 槽里旧固件的地址上，看起来像"升级
+# 没生效"）。A/B 两个槽的基址不同（0x08002000 / 0x08040000），向量表和所有
+# 绝对地址都随之不同，所以这不是可选项。
+#
+#   cmake -B build_b -DHW2C_APP_SLOT=B ...
+#   cmake --build build_b --target combined
+#
+# 见 docs/plans/differential-ota.md §8.1 与 generator/tests/delta_fixtures.py。
+set(HW2C_APP_SLOT "A" CACHE STRING "App slot to link against (A or B)")
+string(TOUPPER "${HW2C_APP_SLOT}" _HW2C_SLOT_UPPER)
+if(NOT _HW2C_SLOT_UPPER STREQUAL "A" AND NOT _HW2C_SLOT_UPPER STREQUAL "B")
+    message(FATAL_ERROR "HW2C_APP_SLOT must be A or B, got '${HW2C_APP_SLOT}'")
+endif()
+set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/linker/app_slot_${_HW2C_SLOT_UPPER}.ld")
+{% else %}
+set(LINKER_SCRIPT "${CMAKE_SOURCE_DIR}/linker/STM32G0B1RETx_FLASH.ld")
+{% endif %}
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -T${LINKER_SCRIPT}")
 
 # ── Global include directories ──────────────────────────────────────────────

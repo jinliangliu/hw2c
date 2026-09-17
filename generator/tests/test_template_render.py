@@ -22,6 +22,8 @@ def _minimal_context():
     """Return a minimal but valid template context for main.c.j2."""
     return {
         "project_name": "test_proj",
+        "project_version": "1.0.0",
+        "project_version_packed": 0x010000,
         "mcu": {
             "part": "STM32G0B1RET6",
             "clock_source": "HSI",
@@ -549,6 +551,264 @@ def test_rtc_isr_acknowledges_every_flag_before_scheduler():
     assert "rtc_clear_all_flags();" in body
     assert "__HAL_RTC_WAKEUPTIMER_CLEAR_FLAG" not in body
     assert "__HAL_RTC_ALARM_CLEAR_FLAG" not in body
+
+
+# ---------------------------------------------------------------------------
+# CLI RX dispatch: line editor vs. binary handover
+# ---------------------------------------------------------------------------
+
+def _strip_c_comments(code):
+    """Drop /* ... */ and // ... so structural searches cannot match text
+    inside a comment (the comments here explain the very code being searched
+    for, so an un-stripped search would pass on a comment alone)."""
+    code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
+    return re.sub(r"//[^\n]*", "", code)
+
+
+def _body_of(code, signature):
+    """Extract a complete function body by brace balancing. Comments must
+    already be stripped."""
+    i = code.index(signature)
+    j = code.index("{", i)
+    depth = 0
+    for k in range(j, len(code)):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[i:k + 1]
+    raise AssertionError("unbalanced braces: %s" % signature)
+
+
+_SINK_READ = "cli_rx_sink_t sink = cli_rx_sink;"
+_LOOP_HEAD = "while (i < len)"
+_HANDOVER = "sink(&buf[i]"
+_EDITOR = "hw2c_cli_input("
+
+
+def _rx_dispatch_layout(code):
+    """Return the byte offsets of the four landmarks in cli_dispatch_rx.
+
+    A pure function of the source text, so a deliberately regressed copy can
+    be fed in to prove the check actually fires — no compiler needed.
+    """
+    body = _body_of(code, "static void cli_dispatch_rx(")
+    return {
+        "loop": body.find(_LOOP_HEAD),
+        "read": body.find(_SINK_READ),
+        "handover": body.find(_HANDOVER),
+        "editor": body.find(_EDITOR),
+    }
+
+
+def _render_cli_driver(version=None, packed=None):
+    """Render drivers/drv_cli.c.j2 with a UART + CLI + bootloader setup."""
+    from generator.context.builder import build_context
+
+    hardware = {
+        "mcu": {"part": "STM32G0B1RET6"},
+        "pins": [
+            {"id": "PA2", "function": "USART2_TX", "af": 1},
+            {"id": "PA3", "function": "USART2_RX", "af": 1},
+            {"id": "PC0", "function": "GPIO_Output", "label": "LED",
+             "active_level": "low"},
+        ],
+        "peripherals": [
+            {"name": "usart2", "type": "UART_Serial", "instance": "USART2",
+             "interface": "uart", "extra": {"baudrate": 115200}},
+            {"name": "cli", "type": "Internal_CLI", "uart": "usart2",
+             "extra": {"prompt": "cli> "}},
+        ],
+        "bootloader": {"enabled": True},
+    }
+    context = build_context(hardware, "cli-dispatch-guard")
+    context["peripheral"] = {"name": "cli", "uart_name": "usart2"}
+    context["model"] = {"type": "Internal_CLI"}
+    if version is not None:
+        context["project_version"] = version
+    if packed is not None:
+        context["project_version_packed"] = packed
+    return _make_env().get_template("drivers/drv_cli.c.j2").render(context)
+
+
+def test_cli_rx_dispatch_rechecks_the_handover_sink_per_byte():
+    """A single RX batch may contain BOTH the command that installs the
+    handover sink AND the first bytes meant for it.
+
+    `cli_task` drains the ring buffer in 64-byte batches.  If it only sampled
+    `cli_rx_sink` once per batch, the batch holding `fota ymodem\\r` followed
+    by YMODEM block 0 would run the command, install the sink, and then feed
+    the remaining bytes of the SAME batch to the line editor anyway.  The
+    command succeeds and the sink is live, so `fota status` looks clean
+    (state IDLE, last error 0, not even a filename) while the device answers
+    nothing at all — the only visible symptom is a stray
+    `Unknown command: <binary garbage>`.
+
+    A human operator cannot hit this (hundreds of ms between the command and
+    the transfer); a script does every time.  Measured on target; the capture
+    is in docs/reviews/onboard-capture-2026-09-17.txt.
+    """
+    code = _strip_c_comments(_render_cli_driver())
+    layout = _rx_dispatch_layout(code)
+
+    assert layout["loop"] >= 0, "cli_dispatch_rx lost its per-byte loop"
+    assert layout["read"] >= 0, (
+        "cli_dispatch_rx no longer reads cli_rx_sink at all"
+    )
+    assert layout["handover"] >= 0, (
+        "cli_dispatch_rx no longer hands the remaining bytes to the sink"
+    )
+    assert layout["editor"] >= 0, (
+        "cli_dispatch_rx no longer feeds the line editor"
+    )
+
+    # The read must sit inside the loop: after the `while` head and before
+    # the editor call.  Hoisting it above the loop is exactly the regression.
+    assert layout["loop"] < layout["read"], (
+        "the sink read was hoisted out of the per-byte loop — a batch holding "
+        "both the `fota ymodem` command and YMODEM block 0 will be swallowed "
+        "by the line editor again"
+    )
+    assert layout["read"] < layout["editor"], (
+        "the sink is read after the line editor call, so it can never take over"
+    )
+
+    # cli_task itself must no longer touch the editor directly.
+    task = _body_of(code, "void cli_task(")
+    assert "cli_dispatch_rx(" in task, "cli_task stopped using the dispatcher"
+    assert "hw2c_cli_input(" not in task, (
+        "cli_task feeds the line editor directly again — the dispatch went "
+        "back to sampling the sink once per batch"
+    )
+
+    # Mutation check: hoist the read above the loop and confirm the check fires.
+    mutated = code.replace(
+        "    while (i < len) {\n        " + _SINK_READ,
+        "    " + _SINK_READ + "\n    while (i < len) {", 1)
+    assert mutated != code, "mutation anchor not found"
+    assert _rx_dispatch_layout(mutated)["read"] < _rx_dispatch_layout(mutated)["loop"], (
+        "hoisting the sink read out of the loop was not detected — this check "
+        "is dead"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Project version: task.yaml -> banner / `version` command
+# ---------------------------------------------------------------------------
+
+def test_the_configured_project_version_reaches_the_firmware():
+    """`task.yaml: project.version` must end up in the firmware verbatim.
+
+    Both places used to hardcode it: the boot banner printed `v1.0` for every
+    project, and `cmd_version()` had a `{% if fw_version is defined %}` branch
+    that **nothing ever satisfied** (no such context key existed), so it always
+    fell through to the literal `1.0.0`.
+
+    The symptom is not an error — it is that a differential OTA looks like it
+    did nothing, because the device reports the same version before and after
+    a successful upgrade.  There is no other user-visible proof of "which
+    firmware is running", so this is the acceptance criterion of the whole
+    feature and it has to be pinned.
+
+    The check is a differential one on purpose: it renders the same template
+    twice with two different versions and requires the output to move.  A test
+    that only asserted "1.0.0 appears" would pass on the hardcoded version.
+    """
+    def render(version, packed):
+        # has_log gates the banner block in main.c.j2; without it the whole
+        # boot banner (logo + project line) is not emitted at all.
+        banner = _make_env().get_template("src/main.c.j2").render(
+            {**_minimal_context(),
+             "has_log": True,
+             "project_version": version,
+             "project_version_packed": packed})
+        cli = _render_cli_driver(version=version, packed=packed)
+        return banner, cli
+
+    banner_a, cli_a = render("1.0.0", 0x010000)
+    banner_b, cli_b = render("2.3.4", 0x020304)
+
+    # The banner must carry the configured version, not the old literal.
+    assert "v1.0.0 — Hardware2Code" in banner_a
+    assert "v2.3.4 — Hardware2Code" in banner_b
+    assert "v1.0 — Hardware2Code" not in banner_b, (
+        "the banner still prints the hardcoded v1.0"
+    )
+
+    # `version` must be derived, and must actually differ between the two.
+    assert cli_a != cli_b, (
+        "cmd_version() renders identically for two different project "
+        "versions — the version is hardcoded again"
+    )
+    assert "Firmware version: 1.0.0" not in cli_b, (
+        "the hardcoded '1.0.0' literal is back in cmd_version()"
+    )
+    assert "0x020304" in cli_b, (
+        "the packed project version never reaches the C source"
+    )
+
+
+def test_project_version_is_parsed_strictly():
+    """Bad version strings must fail at generation time, not silently degrade.
+
+    A wrong version is indistinguishable from "OTA did not work", so the
+    generator refuses rather than guessing.  Short forms are padded.
+    """
+    from generator.context.builder import _parse_project_version
+
+    assert _parse_project_version(None) == ("1.0.0", 0x010000)
+    assert _parse_project_version("") == ("1.0.0", 0x010000)
+    assert _parse_project_version("2") == ("2.0.0", 0x020000)
+    assert _parse_project_version("2.1") == ("2.1.0", 0x020100)
+    assert _parse_project_version("2.1.3") == ("2.1.3", 0x020103)
+    # The YAML may hand us an int for a bare `version: 2`.
+    assert _parse_project_version(2) == ("2.0.0", 0x020000)
+
+    for bad in ("v1.0.1", "1.0.1-rc1", "1.2.3.4", "1.256.0", "1..0", "1.x"):
+        try:
+            _parse_project_version(bad)
+        except ValueError:
+            continue
+        raise AssertionError(
+            "project.version %r was accepted; a malformed version must be "
+            "rejected at generation time" % (bad,))
+
+
+def test_project_version_survives_the_three_layer_merge():
+    """`mapper.merge()` -> `HardwareModel` must not drop the version.
+
+    The merge step already carried `project.name` and silently dropped
+    `project.version`; the pydantic model on top of it accepts extra keys, so
+    either link could lose it again without anything failing.
+    """
+    from generator.mapper import merge
+    from generator.schemas.hardware import HardwareModel
+
+    hardware = """
+mcu:
+  part: STM32G0B1RET6
+pins:
+  - id: PC0
+    function: GPIO_Output
+    label: LED
+"""
+    task = """
+project:
+  name: version_probe
+  version: "3.2.1"
+"""
+
+    merged = merge(hardware, task, "")
+    assert merged.get("project_version") == "3.2.1", (
+        "mapper.merge() dropped project.version — the firmware will report "
+        "the hardcoded default no matter what task.yaml says"
+    )
+
+    dumped = HardwareModel.model_validate(merged).model_dump(exclude_none=True)
+    assert dumped.get("project_version") == "3.2.1", (
+        "HardwareModel dropped project_version on the way to build_context()"
+    )
 
 
 if __name__ == "__main__":

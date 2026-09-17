@@ -209,13 +209,23 @@ static void cmd_version(int argc, char *argv[], cli_output_fn out)
 {
     (void)argc;
     (void)argv;
-{% if fw_version is defined %}
+    /* 版本号来自 task.yaml 的 `project.version`（生成期解析成 major<<16|minor<<8|patch）。
+     *
+     * ⚠️ 这里曾经是一个**永远取不到的**条件分支（判据是 fw_version is defined，
+     * 而上下文里从来没有这个键），于是每次都打印硬编码的 "1.0.0" —— banner 那边
+     * 同样写死 "v1.0"。后果不是报错，而是差分 OTA 升级完之后版本号纹丝不动，
+     * 看起来像"升级没生效"。判据是"配置里写的版本必须原样出现在固件里"，
+     * 护栏见 generator/tests/test_template_render.py
+     * 的 test_the_configured_project_version_reaches_the_firmware。 */
+{% if project_version is defined %}
+    /* {{ project_version }} —— 十六进制是为了让 C 里能直接看出 major/minor/patch */
     out("Firmware version: %d.%d.%d\r\n",
-        ({{ fw_version }} >> 16) & 0xFF,
-        ({{ fw_version }} >> 8) & 0xFF,
-        {{ fw_version }} & 0xFF);
+        ({{ "0x%06XUL" | format(project_version_packed) }} >> 16) & 0xFF,
+        ({{ "0x%06XUL" | format(project_version_packed) }} >> 8) & 0xFF,
+        {{ "0x%06XUL" | format(project_version_packed) }} & 0xFF);
 {% else %}
-    out("Firmware version: 1.0.0\r\n");
+    /* 只在拿不到上下文的特殊渲染路径下出现（生成链路恒有 project_version）。 */
+    out("Firmware version: unknown\r\n");
 {% endif %}
     out("Build: %s %s\r\n", __DATE__, __TIME__);
 }
@@ -1332,6 +1342,47 @@ void cli_uart_irq_handler(void)
  *  simply drains the ring buffer and feeds bytes one at a time.
  * ================================================================== */
 
+/* ==================================================================
+ *  RX batch dispatch — line editor vs. binary handover
+ * ================================================================== */
+
+/*
+ * 把一个 RX 批次分发给"接管者"或行编辑器。
+ *
+ * ⚠️ **必须在每个字节之前重新判断接管者，不能整批只看一次。**
+ *
+ * 一个批次里可能同时装着"装上接管者的那条命令"和"接管者要收的第一批数据"
+ * —— `fota ymodem` 紧跟 YMODEM 的块 0（真人操作有几百 ms 的间隔，踩不到；
+ * 脚本 / 自动化会）。整批只查一次的后果非常难查：那句命令**正常执行**了、
+ * 接管者**也装上了**，但同一批剩下的字节仍然被行编辑器吃掉 —— 现场表现是
+ * 设备回一句 `Unknown command: <二进制乱码>`、随后一个应答都不发，而
+ * `fota status` 看起来"什么都没发生过"（`fota_ymodem_begin()` 确实跑过，却
+ * 干净得没留下任何痕迹：状态仍是 IDLE、last error 仍是 0、连文件名都没有，
+ * 因为它一个块都没收到）。真机实测记录：
+ * `docs/reviews/onboard-capture-2026-09-17.txt`。
+ *
+ * 每字节多一次指针比较，代价可以忽略；接管者仍然**按批**被调用一次
+ * （见 cli_task 里"为什么按批"的说明）。
+ */
+static void cli_dispatch_rx(const uint8_t *buf, size_t len)
+{
+    size_t i = 0;
+
+    while (i < len) {
+        cli_rx_sink_t sink = cli_rx_sink;
+
+        if (sink != NULL) {
+            /* 本批余下的部分整体交给接管者后不再处理：它要么自己消化，要么在
+             * 回调内部交还（FOTA 收完 FINISH / 判失败就会）。后一种情况下这些
+             * 字节本来也不再属于它 —— 与"批次开始时接管者已存在"的语义一致。 */
+            sink(&buf[i], (uint16_t)(len - i));
+            return;
+        }
+        hw2c_cli_input(&cli_inst, (char)buf[i]);
+        i++;
+    }
+}
+
 void cli_task(void *arg)
 {
     (void)arg;
@@ -1352,23 +1403,7 @@ void cli_task(void *arg)
              * 批量取出后再分发，两边都只用一次调用。 */
             got = lwrb_read(&cli_ringbuf, batch, sizeof(batch));
 
-            if (cli_rx_sink != NULL) {
-                /* 接管中：行编辑器完全看不到这些字节。
-                 * 再次取一次 cli_rx_sink 的当前值 —— 回调内部可能已经交还
-                 * （FOTA 收完 FINISH 就会），那样余下的批次应当回到行编辑器。 */
-                cli_rx_sink_t sink = cli_rx_sink;
-                if (sink != NULL) {
-                    sink(batch, (uint16_t)got);
-                    continue;
-                }
-            }
-
-            {
-                size_t i;
-                for (i = 0; i < got; i++) {
-                    hw2c_cli_input(&cli_inst, (char)batch[i]);
-                }
-            }
+            cli_dispatch_rx(batch, got);
         }
     }
 }

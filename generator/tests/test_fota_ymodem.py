@@ -116,6 +116,11 @@ _NOT_A_MACRO = {
         "设备用『载荷全零』判定结束块，不比较具体值；生成期已钉住它必须是 0",
     ("terminator_block", "size"):
         "结束块的长度由起始字节（SOH/STX）决定，设备侧不读这个值",
+    ("handshake", "crc_after_header_ack"):
+        "设备侧**无条件**执行（规范强制的固定次序），所以它不是设备侧的宏；"
+        "真源这一项的作用是给主机发送器与 L5 计划提供期望值，"
+        "生成期已钉住它必须是 1。设备确实补发了那个 'C' 由 "
+        "test_the_header_path_sends_the_crc_request_after_the_ack 与工程内单测钉住",
 }
 
 
@@ -399,6 +404,71 @@ def test_narrowing_check_actually_bites(rendered):
 # ---------------------------------------------------------------------------
 # 4. CRC：设备侧不许复用帧协议那份
 # ---------------------------------------------------------------------------
+
+ACK_CALL = "ym_ack();"
+CRC_CALL = "ym_send_ctl((uint8_t)YMODEM_CTL_CRC_REQUEST);"
+TICK_CALL = "g_tick = HAL_GetTick();"
+
+
+def _body_of(code: str, signature: str) -> str:
+    """取出一个函数的完整函数体（按大括号配平）。code 必须已剥掉注释。"""
+    i = code.index(signature)
+    j = code.index("{", i)
+    depth = 0
+    for k in range(j, len(code)):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[i:k + 1]
+    raise AssertionError("大括号不配平：%s" % signature)
+
+
+def _header_path_step_order(code: str) -> list:
+    """块 0 处理函数里三个关键动作的出现次序（缺项用 -1 表示）。
+
+    纯函数，于是可以喂一段**改坏的源码**证明它真的会报 —— 不依赖编译。
+    """
+    body = _body_of(code, "static void ym_handle_header(")
+    return [body.find(ACK_CALL), body.find(TICK_CALL), body.find(CRC_CALL)]
+
+
+def test_the_header_path_sends_the_crc_request_after_the_ack(rendered):
+    """块 0 被 ACK 之后，设备必须**再发一个 'C'**（规范里接收方的固定次序）。
+
+    ⚠️ 这条抓到的缺陷比 CRC 那条更隐蔽：两侧都是自研实现时它**完全自洽** ——
+    设备 ACK 完就等数据，自研主机 ACK 完就发数据，渲染层 / L5 台架 / 工程内
+    单测**全绿**，那是两个错凑成一个对。只有接上真正的第三方发送端才暴露：
+    发送端在块 0 被 ACK 后等的就是这个 'C'（python-ymodem 包等 60 s、
+    Tera Term / lrzsz sb 同理），现场表现是"文件发不出去、设备一声不吭"。
+    真机实测记录：`docs/reviews/onboard-capture-2026-09-17.txt`。
+
+    三个断言的次序是设计的一部分：先 ACK（告诉发送端"块 0 收下了"），再重启
+    数据块超时（邀请开启一个新窗口），最后才是那个 'C'。次序反了的话，发送端
+    在等 ACK 时先读到 'C'，会当成"块 0 没被收下"而重发。
+    """
+    order = _header_path_step_order(_strip_c_comments(rendered["c_src"]))
+    ack, tick, crc = order
+    assert ack >= 0, "ym_handle_header 里找不到 ym_ack() —— 函数被改写了吗？"
+    assert tick >= 0, "块 0 之后没有重启数据块超时（g_tick 未刷新）"
+    assert crc >= 0, (
+        "块 0 被 ACK 之后**没有**再发 'C'。规范里接收方的次序是"
+        "『发 'C' → 收块 0 → ACK → 再发 'C' → 收数据块』，漏了这一句会让所有"
+        "外部 YMODEM 发送端（python-ymodem / Tera Term / lrzsz sb）在块 0 之后"
+        "等到自己的超时才放弃"
+    )
+    assert ack < tick < crc, (
+        "块 0 的应答次序不对：应当先 ACK、再重启超时、最后发 'C'，实际下标 %r"
+        % (order,)
+    )
+
+    # 变异验证：把那个 'C' 删掉（= 修复前的状态），检查必须报出来。
+    mutated = _strip_c_comments(rendered["c_src"]).replace(CRC_CALL, "", 1)
+    assert mutated != _strip_c_comments(rendered["c_src"]), "变异锚点没找到"
+    assert _header_path_step_order(mutated)[2] == -1, (
+        "去掉那句 'C' 之后本检查居然还是通过的（这条检查本身失效了）"
+    )
 
 def test_device_implements_its_own_xmodem_crc(rendered):
     """两块 CRC 必须是**两个**实现，且设备侧那个用初值 0x0000。

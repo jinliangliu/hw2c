@@ -160,6 +160,21 @@
     "block_timeout_ms": 3000,
     "nak_max_retries": 10,
     "can_count_before_abort": 2,
+    "crc_after_header_ack": 1,
+    "crc_after_header_ack_comment": [
+      "块 0 被 ACK 之后，接收方**必须再发一个 'C'**（邀请数据块）。",
+      "规范里接收方的完整次序是：发 'C' → 收块 0 → ACK → 再发 'C' → 收数据块。",
+      "",
+      "⚠️ 漏掉第二个 'C' 是本通道上最隐蔽的一类缺陷，因为两侧都是同一份自研",
+      "实现时它**完全自洽**：设备 ACK 完就等数据，自研主机 ACK 完就发数据，",
+      "主机侧全部测试（渲染 / L5 / 工程内）都会绿 —— 而这是两个错凑成一个对。",
+      "对接任何**外部**发送端就会暴露：发送端在块 0 被 ACK 后等这个 'C'，",
+      "等到自己的超时才放弃（python-ymodem 包等 60 s，Tera Term / lrzsz sb 同理），",
+      "表现为『文件发不出去、设备一声不吭』。",
+      "",
+      "所以它是真源里的一项而不是 C 里的一个字面量：主机发送器与 L5 台架的",
+      "期望值都由它派生，两侧不再可能各记一份。"
+    ],
     "eot_nak_before_ack": 1,
     "eot_nak_before_ack_comment": [
       "第一次 EOT 回 NAK、第二次才 ACK —— 这是 lrzsz rz 的行为，也是 sb 期望的：",

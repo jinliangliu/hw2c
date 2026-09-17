@@ -276,6 +276,23 @@ static void ym_handle_header(const uint8_t *payload, uint16_t plen)
     g_st         = YM_ST_WAIT_DATA;
 
     ym_ack();
+
+    /* ⚠️ **ACK 之后必须再发一个 'C'**：规范里接收方的固定次序是
+     *     发 'C' → 收块 0 → ACK → **再发 'C'** → 收数据块。
+     *
+     * 漏掉这一句是本通道上最隐蔽的一类缺陷，因为两侧都是自研实现时它**完全
+     * 自洽**：设备 ACK 完就等数据，自研主机 ACK 完就发数据，渲染层 / L5 台架 /
+     * 工程内单测**全绿** —— 那是两个错凑成一个对。对接任何**外部**发送端才暴露：
+     * 发送端在块 0 被 ACK 后等的正是这个 'C'，等到自己的超时才放弃
+     * （python-ymodem 包 60 s，Tera Term / lrzsz sb 同理），现场表现是
+     * "文件发不出去、设备一声不吭"。本机真机实测过这一条：
+     * `docs/reviews/onboard-capture-2026-09-17.txt`。
+     *
+     * 判据不能是"自研主机也这么发"，那是 CRC 那件事的翻版（见 ym_crc16 的注释）。
+     * 真源 `generator/data/ymodem_format.json` 的 `crc_after_header_ack` 记下这条
+     * 事实，主机发送器与 L5 计划由它派生期望值，生成期还断言它必须是 1。 */
+    g_tick = HAL_GetTick();          /* 数据块超时从这一拍重新起算 */
+    ym_send_ctl((uint8_t)YMODEM_CTL_CRC_REQUEST);
 }
 
 /* ===========================================================================

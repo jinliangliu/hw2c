@@ -52,11 +52,61 @@ def load_model(model_type: str) -> dict:
         return {}
 
 
+DEFAULT_PROJECT_VERSION = "1.0.0"
+
+
+def _parse_project_version(raw) -> tuple:
+    """把 `project.version` 解析成 (字符串, 打包整数)，打包为 major<<16|minor<<8|patch。
+
+    版本号是**唯一**能证明"设备跑的是哪一版固件"的东西，所以它宁可失败也不要
+    静默兜底：写错的版本号（拼成 `v1.0.1`、三段以上、超过 255 的段）会让
+    差分 OTA 失去全部可验证性 —— 升级前后设备报的版本一模一样。
+    这里 fail-loud，把决定权交回给 YAML 作者。
+
+    省略的段按 0 补：`"2"` → 2.0.0，`"2.1"` → 2.1.0（与 CMake 的
+    `FW_VERSION` 那种单调计数器无关，见 generator/ir/project.py）。
+    """
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        text = DEFAULT_PROJECT_VERSION
+    else:
+        text = str(raw).strip()
+
+    parts = text.split(".")
+    if not 1 <= len(parts) <= 3:
+        raise ValueError(
+            "project.version 必须是 1~3 段数字（如 \"1\" / \"1.2\" / \"1.2.3\"），"
+            "实际为 %r" % (raw,)
+        )
+
+    nums = []
+    for part in parts:
+        if not part.isdigit():
+            raise ValueError(
+                "project.version 的每一段都必须是非负十进制整数（不要写 'v' 前缀、"
+                "不要写后缀），实际为 %r" % (raw,)
+            )
+        if int(part) > 255:
+            raise ValueError(
+                "project.version 的每一段都必须 <= 255（镜像与 CLI 都按 8 bit 打印），"
+                "实际为 %r" % (raw,)
+            )
+        nums.append(int(part))
+    while len(nums) < 3:
+        nums.append(0)
+
+    canonical = "%d.%d.%d" % tuple(nums)
+    packed = (nums[0] << 16) | (nums[1] << 8) | nums[2]
+    return canonical, packed
+
+
 def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildContext:
     """
     将 YAML 中的硬件描述处理成模板渲染所需的完整上下文。
     """
     # ---------- 基础信息提取 ----------
+    project_version, project_version_packed = _parse_project_version(
+        hw.get("project_version"))
+
     mcu = hw.get("mcu", {})
     mcu["core_clock_mhz"] = int(mcu.get("core_clock_mhz", 16))
     mcu["clock_source"] = mcu.get("clock_source", "HSI").upper()
@@ -1001,6 +1051,8 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
         mcu=mcu_ir,
         log=log_ir,
         project_name=project_name,
+        project_version=project_version,
+        project_version_packed=project_version_packed,
         pins=pins,
         sleep=sleep,
         app_tasks=app_tasks,

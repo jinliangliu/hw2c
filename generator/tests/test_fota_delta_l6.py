@@ -49,7 +49,11 @@ from generator.context.bootloader_context import (  # noqa: E402
     fota_delta_budget,
     fota_format_for_templates,
 )
-from generator.delta_tool import build  # noqa: E402
+from generator.delta_tool import (  # noqa: E402
+    build,
+    crc16_ccitt_false,
+    parse_envelope,
+)
 
 from generator.tests.delta_fixtures import (  # noqa: E402
     SLOT_A_BASE,
@@ -339,3 +343,203 @@ def test_l6_bench_detects_active_slot_corruption(tmp_path):
         "L6 没有抓到「活动槽被改动」—— 说明不变量 ① 形同虚设：\n%s" % run.stdout
     )
     assert "active slot" in run.stdout + run.stderr, (run.stdout + run.stderr)
+
+
+# ---------------------------------------------------------------------------
+# 版本号契约：信封里的 fw_version 必须与新镜像头一致，否则设备报 -19
+#
+# 2026-09-17 真机实测：设备报 `HW2C_FAULT_FOTA_APPLY`，活动槽毫发无损。
+# 把真机那份 `drv_fota_delta.c` 编到主机上、用真实产物重放，拿到的是
+# `FOTA_DELTA_E_CRC(-19)` —— 而真实原因只是**信封声明的版本号**与**新镜像
+# 头部里的版本号**对不上（1 vs 2）。
+#
+# 机制：设备在 FLUSH 阶段把信封里的 fw_version 写进目标槽镜像头，而镜像 CRC
+# 的覆盖区从 magic 起、包含 fw_version 那 4 字节 ⇒ 两者不一致时算出的 CRC
+# 与信封里的 new_crc32 必然不同。
+#
+# 主机侧的护栏（`delta_tool.build()` 拒绝不一致的 fw_version，见
+# test_delta_tool.py 的 2b 组）只能证明"我们不再生成这种补丁"。本用例把
+# **设备上的后果**也钉住：这样一旦设备侧改成报一个专门的错误码，这里会红，
+# 那时才可以把主机侧的措辞与策略放宽。
+# ---------------------------------------------------------------------------
+
+_VERSION_GUARD_HARNESS = (
+    Path(__file__).resolve().parent / "harness" / "fota_delta_version_guard.c"
+)
+_VG_VECTORS_H = "fota_version_guard_vectors.h"
+
+
+def _emit_version_guard_vectors(path, old_image, new_image,
+                                patch_ok, patch_bad):
+    """把四个向量写成 C 头。数组名统一带 vg_ 前缀，避免与 L6 的向量冲突。"""
+    def arr(name, blob):
+        lines = ["static const unsigned char %s[%d] = {" % (name, len(blob))]
+        for i in range(0, len(blob), 16):
+            row = ", ".join("0x%02X" % b for b in blob[i:i + 16])
+            lines.append("    %s," % row)
+        lines.append("};")
+        return "\n".join(lines)
+
+    env_size = json.loads(
+        (_GENERATOR_DIR / "data" / "fota_format.json").read_text(encoding="utf-8")
+    )["delta_envelope"]["size"]
+
+    parts = [
+        "/* 自动生成，请勿手工编辑。见 generator/tests/test_fota_delta_l6.py */",
+        "#ifndef __FOTA_VERSION_GUARD_VECTORS_H",
+        "#define __FOTA_VERSION_GUARD_VECTORS_H",
+        "",
+        "#define VG_SLOT_A_BASE      %dUL" % SLOT_A_BASE,
+        "#define VG_SLOT_B_BASE      %dUL" % SLOT_B_BASE,
+        "#define VG_SLOT_B_SIZE      %dUL" % _SLOT_B_SIZE,
+        "#define VG_PAGE_SIZE        %dUL" % _BUDGET["page_size"],
+        "#define VG_ENV_SIZE         %d" % env_size,
+        "#define VG_OLD_SIZE         %d" % len(old_image),
+        "#define VG_NEW_SIZE         %d" % len(new_image),
+        "#define VG_PATCH_OK_SIZE    %d" % len(patch_ok),
+        "#define VG_PATCH_BAD_SIZE   %d" % len(patch_bad),
+        "",
+        arr("g_vg_old", old_image),
+        arr("g_vg_new", new_image),
+        arr("g_vg_patch_ok", patch_ok),
+        arr("g_vg_patch_bad", patch_bad),
+        "",
+        "#endif /* __FOTA_VERSION_GUARD_VECTORS_H */",
+        "",
+    ]
+    path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def _make_version_guard_patches():
+    """造一对**只差信封版本号**的补丁，其余字节完全相同。
+
+    `bad` 的做法：拿 `ok` 的字节，只改信封的 fw_version 那 4 字节，再按真源
+    重算信封头 CRC16（它覆盖前 32 字节）—— 于是两个补丁都能通过
+    `parse_envelope` 的全部**结构**校验，差异被压到"语义"这一层。
+    """
+    img = json.loads(
+        (_GENERATOR_DIR / "data" / "fota_format.json").read_text(encoding="utf-8")
+    )
+    env = img["delta_envelope"]
+    ver_off = env["fields"]["fw_version"]["offset"]
+    crc_off = env["fields"]["hdr_crc16"]["offset"]
+    crc_cover = crc_off                  # hdr_crc16 覆盖它之前的全部字节
+
+    old_code = firmware_like(_OLD_IMAGE_SIZE - 208, seed=31)
+    new_code = bytearray(firmware_like(_NEW_IMAGE_SIZE - 208, seed=32))
+    new_code[32:32 + 96] = old_code[256:256 + 96]
+    new_code = bytes(new_code)
+
+    old_image = slot_image(old_code, fw_version=4, slot_base=SLOT_A_BASE)
+    new_image = slot_image(new_code, fw_version=5, slot_base=SLOT_B_BASE)
+    patch_ok = build(old_image, new_image)              # 默认取新镜像头的版本号
+
+    bad = bytearray(patch_ok)
+    # 刻意让版本号的**所有有效字节**都变：这样下面对"差异位置"的断言才有判别力
+    # （若只改低字节，差异只剩 1 B，断言几乎形同虚设）。注意 fw_version 是 24 位，
+    # 最高字节恒为 0，所以那里的差异最多 3 个字节。
+    bad[ver_off:ver_off + 4] = (0x0A0B0C).to_bytes(4, "little")
+    c16 = crc16_ccitt_false(bytes(bad[:crc_cover]))
+    bad[crc_off:crc_off + 2] = c16.to_bytes(2, "little")
+    patch_bad = bytes(bad)
+
+    # 主张：两个补丁的差异**只允许**落在 fw_version 字段与 hdr_crc16 字段内。
+    # 换句话说，补丁正文（lite 流）与信封的其余字段逐字节相同 —— 于是两者
+    # 唯一可能的语义差异就是版本号。
+    ver_range = set(range(ver_off, ver_off + 4))
+    crc_range = set(range(crc_off, crc_off + 2))
+    diff = {i for i in range(len(patch_ok)) if patch_ok[i] != patch_bad[i]}
+    assert diff <= (ver_range | crc_range), (
+        "差异跑到了 fw_version / hdr_crc16 之外：%r" % (sorted(diff),))
+    assert diff & ver_range, "fw_version 字段根本没变，这个用例就没在测版本号不一致"
+    assert diff & crc_range, "hdr_crc16 没重算 —— 坏补丁会先被结构校验拦下，测不到语义层"
+
+    # 两者都必须通过结构校验，否则测的就不是"语义不一致"
+    assert parse_envelope(patch_ok)["fw_version"] == 5
+    assert parse_envelope(patch_bad)["fw_version"] == 0x0A0B0C
+    for tag, blob in (("ok", patch_ok), ("bad", patch_bad)):
+        parsed = parse_envelope(blob)
+        assert parsed["old_size"] == len(old_image), tag
+        assert parsed["new_size"] == len(new_image), tag
+    return old_image, new_image, patch_ok, patch_bad
+
+
+def _run_version_guard(tmp_path, override=None):
+    """渲染真实模板 → 编译版本号契约台架 → 运行。"""
+    gcc = _host_gcc()
+    _hdr, src = _render_driver(tmp_path, override=override)
+    old_image, new_image, patch_ok, patch_bad = _make_version_guard_patches()
+    _emit_version_guard_vectors(tmp_path / _VG_VECTORS_H,
+                                old_image, new_image, patch_ok, patch_bad)
+
+    exe = tmp_path / ("vg.exe" if sys.platform.startswith("win") else "vg")
+    cmd = [
+        gcc, "-std=c99", "-O1", "-Wall", "-Wextra",
+        "-I", str(tmp_path),
+        "-I", str(_HPATCH_DIR),
+        "-I", str(_TUZ_DIR),
+        str(_VERSION_GUARD_HARNESS),
+        str(src),
+        str(_HPATCH_DIR / "hpatch_lite.c"),
+        str(_TUZ_DIR / "tuz_dec.c"),
+        "-o", str(exe),
+    ]
+    comp = subprocess.run(cmd, capture_output=True, text=True)
+    assert comp.returncode == 0, (
+        "版本号契约台架编译失败：\n%s\n%s" % (comp.stdout, comp.stderr)
+    )
+    return subprocess.run([str(exe)], capture_output=True, text=True, cwd=str(tmp_path))
+
+
+def test_l6_version_mismatch_is_a_device_side_crc_failure(tmp_path):
+    """只有信封版本号不同 → 设备必须报 -19（而不是成功）。
+
+    这条把「版本号不一致 ⇒ 真机 E_CRC」的因果链钉在**设备侧真实代码**上。
+    """
+    run = _run_version_guard(tmp_path)
+    out = run.stdout + run.stderr
+    assert "RESULT: OK" in run.stdout, out
+    assert run.returncode == 0, out
+    assert "OK_RC=0" in run.stdout, out
+    assert "BAD_RC=-19" in run.stdout, (
+        "版本号不一致的补丁竟然没被设备侧拒绝，或错误码变了：\n%s" % out
+    )
+
+
+# 变异：把**两道**镜像 CRC 闸门都短路掉。此时"版本号不一致"的补丁会被放行，
+# 上一条用例的 BAD_RC 断言必须失效 —— 证明那个 -19 真的来自 CRC 比较。
+#
+# ⚠️ 必须**同时**关掉两道，这与"测试有没有牙"直接相关：第一次只关掉了 7.5
+# 的累积值比较，结果 -19 依旧出现（由 7.6 的 `fota_delta_verify()` 回读复算
+# 给出）。若据此判定"断言与实现无关"就会得出完全错误的结论 —— 正确的结论是
+# **这一处不变量有两道互相独立的闸门**（一个在内存里、一个回读 Flash）。
+_MUT_SKIP_NEW_CRC = [
+    # 7.5：解码过程中累积的覆盖区 CRC
+    ("    c.crc ^= FOTA_CRC32_FINAL_XOR;\n"
+     "    if (c.crc != env->new_crc32) {",
+     "    c.crc ^= FOTA_CRC32_FINAL_XOR;\n"
+     "    if (0 && c.crc != env->new_crc32) {"),
+    # 7.6：回读目标槽再算一遍
+    ("    return (crc == expected_crc) ? FOTA_DELTA_OK : FOTA_DELTA_E_CRC;",
+     "    return FOTA_DELTA_OK;   /* MUTATION: 回读复核被短路 */"),
+]
+
+
+def test_l6_version_guard_has_teeth(tmp_path):
+    """两道 CRC 闸门都短路后，上一条用例的判据必须失效。"""
+    src_text = (_TEMPLATES_DIR / _DRIVER_C).read_text(encoding="utf-8")
+    mutated = src_text
+    for anchor, repl in _MUT_SKIP_NEW_CRC:
+        assert mutated.count(anchor) == 1, (
+            "变异锚点在模板里不再唯一（可能多了一道/少了一道闸门）—— "
+            "模板改过，请同步更新本测试的锚点：\n%s" % anchor
+        )
+        mutated = mutated.replace(anchor, repl)
+
+    run = _run_version_guard(tmp_path, override={_DRIVER_C: mutated})
+    out = run.stdout + run.stderr
+    assert "mismatched   rc=0" in run.stdout, (
+        "两道 CRC 闸门都短路了，版本号不一致的补丁却仍被拒 —— "
+        "说明另有一处判据在起作用（好消息，但请把这个用例的锚点更新到那一处）：\n%s"
+        % out
+    )

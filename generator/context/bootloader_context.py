@@ -137,6 +137,19 @@ def ymodem_for_templates() -> dict:
         raise ValueError(
             "ymodem terminator_block.payload_value 必须是 0（设备侧用『载荷全零』"
             "判定结束块，不比较具体值）：真源写的是 %r" % (term["payload_value"],))
+
+    # 块 0 被 ACK 之后再发一个 'C' —— 规范里接收方的固定次序，**不是**开关。
+    #
+    # 设备侧无条件执行这一步（协议强制），所以真源这一项也必须是 1：改成 0 不会
+    # 让设备跟着改，只会让**主机侧发送器与 L5 台架的期望值**少掉那个 'C'，于是
+    # 测试变成"要求设备漏发" —— 恰恰是本通道上最隐蔽的那类缺陷（两侧都自研时
+    # 完全自洽，对接任何外部发送端才暴露）。必须在生成期拒掉。
+    if int(hs["crc_after_header_ack"]) != 1:
+        raise ValueError(
+            "ymodem handshake.crc_after_header_ack 必须是 1：规范里接收方在 ACK 块 0 "
+            "之后必须再发一个 'C' 邀请数据块，设备侧无条件执行。真源写成 %r 只会让"
+            "主机侧期望值错，不会让设备漏发 —— 见设备模板 ym_handle_header() 的注释。"
+            % (hs["crc_after_header_ack"],))
     return out
 
 

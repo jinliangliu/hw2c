@@ -32,6 +32,21 @@ class ProjectIR(IRObject):
     # ---------- Project identity ----------
     project_name: str = "hw2code"
 
+    # 固件版本号，来自 task.yaml 的 `project.version`（形如 "1.0.1"）。
+    #
+    # 为什么它必须在上下文里、不能写死在模板里：这是**唯一**能证明"设备跑的是
+    # 哪一版固件"的东西。banner 与 `version` 命令都曾经把它写成字面量
+    # （`v1.0` / `1.0.0`），于是差分 OTA 升级完两台设备长得一模一样 ——
+    # 升级看起来"没生效"，而实际上固件换了。见
+    # generator/tests/test_template_render.py 的版本派生护栏。
+    #
+    # ⚠️ 与**镜像头**里的 `fw_version` 不是一回事：那个是引导器判断
+    # "哪个槽更新"的单调计数器（由 CMake 的 `FW_VERSION` 决定，默认 1），
+    # 24 bit、只为比较大小，不给人看。这里是给人看的语义化版本。
+    project_version: str = "1.0.0"
+    # 上面那个的打包形式，major<<16 | minor<<8 | patch，供 C 侧按 %d.%d.%d 打印。
+    project_version_packed: int = 0x010000
+
     # ---------- MCU ----------
     mcu: McuIR = field(default_factory=McuIR)
 

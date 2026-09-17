@@ -661,10 +661,13 @@ def _make_lite(old: bytes, new: bytes, covers: Sequence[Cover],
     return compressed if len(compressed) < len(uncompressed) else uncompressed
 
 
-def build(old_image: bytes, new_image: bytes, *, fw_version: int,
+def build(old_image: bytes, new_image: bytes, *, fw_version: int = None,
           compress="auto", block: int = _BLOCK, min_gain: int = _MIN_GAIN,
           dict_size: int = 4096) -> bytes:
     """生成完整补丁（48 B 信封 + lite 流）。
+
+    `fw_version` 默认从 `new_image` 的镜像头里**读出来**（推荐），也可以显式给出，
+    但必须与镜像头里的值**相等** —— 不等会被拒绝，理由见下面的"版本号一致性"。
 
     两个入参是**完整 slot 镜像**（含向量表与头部），不是代码区 —— 理由见
     `split_image()` 的文档：不含向量表会让更新后启动旧固件或静默放弃跳转。
@@ -702,6 +705,36 @@ def build(old_image: bytes, new_image: bytes, *, fw_version: int,
                 "%s 镜像头部 crc32=0x%08X 与按覆盖区算出的 0x%08X 不符："
                 "该镜像未经 patch_crc.py 回填，或回填算法不一致"
                 % (tag, parts["crc32_field"], want))
+
+    # ---- 版本号一致性（真机实测踩到，症状极具误导性）-------------------------
+    #
+    # 设备侧 `fota_delta_apply()` 在 FLUSH 阶段把**信封里的** `fw_version` 写进
+    # 目标槽的镜像头（见 `templates/drivers/drv_fota_delta.c.j2`），而镜像头的
+    # `crc_region` 从 `magic` 起、**包含 `fw_version` 那 4 字节**（真源
+    # `fota_format.json::image_header.crc_region`）。
+    #
+    # ⇒ 只要信封声明的版本号与新镜像头部里的不一致，设备**必然**在最后一步的
+    #   `c.crc != env->new_crc32` 上失败，返回 `FOTA_DELTA_E_CRC(-19)`。
+    #   故障码指向"内容已错、拒绝提交"，于是排查方向会被引到差分/Flash/传输上，
+    #   而真正的原因只是两个版本号对不上 —— 2026-09-17 真机复现：镜像头
+    #   `fw_version=1`、信封 `fw_version=2`，设备报 -19，槽 A 完全未被改动。
+    #
+    # 因此这条**只能**在主机侧拦：设备侧看到的信息不足以区分这两种原因。
+    # 默认值取镜像头里的值，是因为设备最终写进去的就是它 —— 让"必须相等"成为
+    # 结构上的必然，而不是靠调用方记得两边填同一个数。
+    new_hdr_version = split_image(new_image)["fw_version"]
+    if fw_version is None:
+        fw_version = new_hdr_version
+    elif int(fw_version) != new_hdr_version:
+        raise ValueError(
+            "fw_version 不一致：调用方给出 %d，而新镜像头里是 %d。\n"
+            "设备侧会把信封里的版本号写进目标槽镜像头，而该字段被镜像 CRC 覆盖，"
+            "于是这个组合在真机**必然**以 FOTA_DELTA_E_CRC(-19) 失败，"
+            "错误码却指向『内容损坏』。\n"
+            "正确做法：不传 fw_version（默认取新镜像头里的值），或让生成新镜像时"
+            "用的 FW_VERSION 与这里一致。"
+            % (int(fw_version), new_hdr_version))
+    fw_version = int(fw_version)
 
     old = split_image(old_image)["image"]
     new = apply_header_placeholders(new_image)
@@ -846,8 +879,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
     p_build.add_argument("--new", required=True,
                          help="新 slot 镜像（同上；注意新旧应在**不同槽基址**上链接）")
     p_build.add_argument("-o", "--output", required=True)
-    p_build.add_argument("--version", type=lambda x: int(x, 0), required=True,
-                         help="升级后的固件版本号")
+    p_build.add_argument("--version", type=lambda x: int(x, 0), default=None,
+                         help="升级后的固件版本号（写入信封，设备再写进目标槽镜像头）。"
+                              "默认从 --new 镜像头里读取 —— 两者必须相等，否则设备"
+                              "必然以 E_CRC(-19) 失败；显式给出不一致的值会被拒绝")
     p_build.add_argument("--compress-mode", choices=("none", "always", "auto"),
                          default="auto",
                          help="none=只用 compress_type=0；always=强制 tinyuz；"

@@ -185,11 +185,24 @@ class Ymodem:
         self.block_timeout_ms = int(hs["block_timeout_ms"])
         self.nak_max_retries = int(hs["nak_max_retries"])
         self.can_before_abort = int(hs["can_count_before_abort"])
+        self.crc_after_header_ack = int(hs["crc_after_header_ack"])
 
         self._self_check()
 
-    # ---- 自检 --------------------------------------------------------------
+    @property
+    def header_ack_response(self) -> bytes:
+        """块 0 被 ACK 之后设备会发回的字节：ACK，**以及紧随的 'C'**。
 
+        'C' 由真源的 `crc_after_header_ack` 派生。它是规范里接收方的固定次序，
+        不是可选项 —— 早先这里（和设备侧）都漏了它，自研两侧完全自洽、
+        主机测试全绿，只有对接外部发送端时才暴露。见 batch_plan 的注释。
+        """
+        resp = bytes([self.ACK])
+        if self.crc_after_header_ack:
+            resp += bytes([self.CRC_REQUEST])
+        return resp
+
+    # ---- 自检 --------------------------------------------------------------
     def _self_check(self) -> None:
         if self.total_128 != self.size_128 + self.overhead:
             raise ValueError(
@@ -313,18 +326,26 @@ class Ymodem:
         期望值按设备侧 `drv_fota_ymodem.c` 的行为推出（协议本身只规定了
         单块应答，EOT 那两拍在实现之间有分歧，所以拍数写在真源里）：
 
-          · 块 0            → ACK
+          · 块 0            → ACK **紧跟一个 'C'**（邀请第一个数据块）
           · 每个数据块       → ACK
           · 第 1 个 EOT      → NAK（给接收方一次"上一拍是不是噪声"的复核机会）
           · 第 2 个 EOT      → ACK，紧跟一个 'C'（邀请结束块）
           · 结束块           → ACK
+
+        ⚠️ 块 0 之后那个 'C' **不是可选项**：规范里接收方的固定次序就是
+        "发 'C' → 收块 0 → ACK → 再发 'C' → 收数据块"。早期这里只写 ACK，
+        设备侧也漏发，于是自研两侧完全自洽、所有主机测试全绿，直到接上
+        真正的第三方发送端（python-ymodem 包：块 0 被 ACK 后等这个 'C' 等
+        60 s 才放弃）才暴露。真机实测见
+        `docs/reviews/onboard-capture-2026-09-17.txt`。
         """
         if block_size is None:
             block_size = self.size_1024
 
         plan = []
         plan.append((self.header_block(name, len(data)),
-                     bytes([self.ACK]), "block 0: %s (%d B)" % (name, len(data))))
+                     self.header_ack_response,
+                     "block 0: %s (%d B)" % (name, len(data))))
 
         blocks = self.split_payload(data, block_size)
         for blk_no, payload in blocks:
@@ -379,7 +400,7 @@ class Ymodem:
         real_no, payload = blocks[0]
         bad = self.desync_block(real_no, payload, (real_no + 1) % self.modulus)
 
-        plan = [(self.header_block(name, len(data)), bytes([self.ACK]), "block 0")]
+        plan = [(self.header_block(name, len(data)), self.header_ack_response, "block 0")]
         for i in range(self.nak_max_retries):
             plan.append((bad, bytes([self.NAK]),
                          "desynced block, NAK %d/%d" % (i + 1, self.nak_max_retries)))
@@ -395,7 +416,7 @@ class Ymodem:
         """
         if block_size is None:
             block_size = self.size_1024
-        plan = [(self.header_block(name, len(data)), bytes([self.ACK]), "block 0")]
+        plan = [(self.header_block(name, len(data)), self.header_ack_response, "block 0")]
         blocks = self.split_payload(data, block_size)
         for i, (blk_no, payload) in enumerate(blocks):
             plan.append((self.block(blk_no, payload), bytes([self.ACK]),
@@ -421,7 +442,7 @@ class Ymodem:
         blocks = self.split_payload(data, block_size)
         blk_no, payload = blocks[0]
         return [
-            (self.header_block(name, len(data)), bytes([self.ACK]), "block 0"),
+            (self.header_block(name, len(data)), self.header_ack_response, "block 0"),
             (self.block(blk_no, payload), bytes([self.ACK]), "data block %d" % blk_no),
             (self.header_block(second_name, len(data)), self.can_can(),
              "second header mid-transfer -> reject"),
@@ -440,7 +461,7 @@ class Ymodem:
         blocks = self.split_payload(data, block_size)
         blk_no, payload = blocks[0]
         return [
-            (self.header_block(name, len(data) + delta), bytes([self.ACK]),
+            (self.header_block(name, len(data) + delta), self.header_ack_response,
              "block 0 declares %d (real %d)" % (len(data) + delta, len(data))),
             (self.block(blk_no, payload), self.can_can(),
              "first data block -> length mismatch, reject"),
@@ -449,7 +470,7 @@ class Ymodem:
     def header_only_plan(self, name: str, data: bytes, block_size: int = None) -> list:
         """只发块 0，然后 CAN CAN 中止（模拟操作员在中途按了取消）。"""
         return [
-            (self.header_block(name, len(data)), bytes([self.ACK]), "block 0"),
+            (self.header_block(name, len(data)), self.header_ack_response, "block 0"),
             (self.can_can(), self.can_can(), "host cancels at block boundary"),
         ]
 
@@ -468,7 +489,7 @@ class Ymodem:
         blocks = self.split_payload(data, block_size)
         blk_no, payload = blocks[0]
         return [
-            (self.header_block(name, len(data)), bytes([self.ACK]), "block 0"),
+            (self.header_block(name, len(data)), self.header_ack_response, "block 0"),
             (self.block(blk_no, payload), self.can_can(),
              "first data block -> session refused, abort"),
         ]
