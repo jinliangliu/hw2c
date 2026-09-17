@@ -6,13 +6,138 @@ Bootloader / FOTA / IWDG / LED pin configuration helpers.
 import json
 import os
 
-from ..paths import FOTA_FORMAT_PATH
+from ..paths import FOTA_FORMAT_PATH, YMODEM_FORMAT_PATH
 
 
 def load_fota_format() -> dict:
     """读取格式真源（`generator/data/fota_format.json`）。"""
     with open(FOTA_FORMAT_PATH, "r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def load_ymodem_format() -> dict:
+    """读取 YMODEM 真源（`generator/data/ymodem_format.json`）。"""
+    with open(YMODEM_FORMAT_PATH, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def ymodem_for_templates() -> dict:
+    """把 YMODEM 真源压成 C 模板直接可用的扁平常量。
+
+    与 `fota_transport_for_templates()` 同样的理由：模板里但凡出现一个字面量
+    控制字节（`0x43` / `0x18`），它就与 Python 侧构成第二份定义。
+
+    这里额外做两条**生成期**自检，它们挡住的是整整一类"能编过、但对不上任何
+    真实终端软件"的实现：
+
+      · 块长算式自洽（`total == 1 + 2 + size + 2`）—— 写错一处，所有块都
+        少/多几个字节，症状是"发得出去、永远收不完"；
+      · CRC 的 check 值必须真是 CRC-16/XMODEM（用 stdlib 独立复算）。
+        判据是**标准**，不是"另一侧的实现也这么算" —— 复用 `fota_crc16`
+        （CCITT-FALSE）时两侧自洽、与所有真实 YMODEM 软件不通，正是这条
+        自检要拦下的形态。
+    """
+    import binascii
+
+    spec = load_ymodem_format()
+    ctl = spec["control"]
+    blk = spec["block"]
+    crc = spec["crc16"]
+    hs = spec["handshake"]
+    hdr = spec["header_block"]
+    term = spec["terminator_block"]
+
+    for size_key, total_key in (("size_128", "total_128"),
+                                ("size_1024", "total_1024")):
+        want = 1 + blk["number_field_size"] * 2 + blk[size_key] + blk["crc16_size"]
+        if blk[total_key] != want:
+            raise ValueError(
+                "ymodem block.%s (%d) != 1 + 2*number_field_size + %s + crc16_size (%d)"
+                % (total_key, blk[total_key], size_key, want))
+
+    if blk["overhead"] != 1 + blk["number_field_size"] * 2 + blk["crc16_size"]:
+        raise ValueError("ymodem block.overhead 与字段尺寸之和不符")
+
+    got = binascii.crc_hqx(crc["check_input"].encode("ascii"), crc["init"])
+    if got != crc["check"]:
+        raise ValueError(
+            "ymodem crc16.check 声明 %s，但用 %s(init=%#x) 独立复算是 %#x —— "
+            "真源写错了，或者有人把它改成了 CCITT-FALSE（初值 0xFFFF）"
+            % (hex(crc["check"]), crc["python_oracle"], crc["init"], got))
+
+    # 注：『YMODEM 的 CRC 必须与帧协议那一侧的 CRC-16/CCITT-FALSE 不同』这条
+    # 判据放在 `generator/tests/test_fota_ymodem.py` 里 —— 帧协议的初值没有
+    # 写进 fota_format.json（对 C 侧是常量 0xFFFF，对 Python 侧是实现细节），
+    # 在这里断言会变成"对着一个没被真源记录的数字比大小"，看着严格实则空转。
+
+    out = {
+        # ---- 控制字节 ----
+        "ctl_soh": ctl["soh"]["value"],
+        "ctl_stx": ctl["stx"]["value"],
+        "ctl_eot": ctl["eot"]["value"],
+        "ctl_ack": ctl["ack"]["value"],
+        "ctl_nak": ctl["nak"]["value"],
+        "ctl_can": ctl["can"]["value"],
+        "ctl_pad": ctl["pad"]["value"],
+        "ctl_crc_request": ctl["crc_request"]["value"],
+        # ---- 块 ----
+        "blk_size_128": blk["size_128"],
+        "blk_size_1024": blk["size_1024"],
+        "blk_overhead": blk["overhead"],
+        "blk_total_128": blk["total_128"],
+        "blk_total_1024": blk["total_1024"],
+        "blk_complement_of": blk["complement_of"],
+        "blk_number_modulus": blk["number_modulus"],
+        "blk_max_payload": blk["max_payload"],
+        # 接收侧单块缓冲：1 个起始字节 + 2 个块号字节 + 最大载荷 + 2 个 CRC 字节
+        "blk_max_frame": blk["total_1024"],
+        # ---- CRC ----
+        "crc_poly": crc["poly"],
+        "crc_init": crc["init"],
+        "crc_check": crc["check"],
+        # ---- 文件头块 ----
+        "hdr_block_number": hdr["block_number"],
+        "hdr_max_name_len": hdr["max_name_len"],
+        "hdr_size_radix": hdr["size_radix"],
+        # ---- 结束块 ----
+        "term_block_number": term["block_number"],
+        "term_block_size": term["size"],
+        # ---- 握手时序 ----
+        "hs_interval_ms": hs["interval_ms"],
+        "hs_max_attempts": hs["max_attempts"],
+        "hs_block_timeout_ms": hs["block_timeout_ms"],
+        "hs_nak_max_retries": hs["nak_max_retries"],
+        "hs_can_before_abort": hs["can_count_before_abort"],
+        "hs_eot_nak_before_ack": hs["eot_nak_before_ack"],
+        "hs_terminator_timeout_ms": hs["terminator_timeout_ms"],
+    }
+
+    # 分派前提：三个互不相等的起始字节（SOH/STX/EOT）才能只靠首字节决定去向。
+    # EOT 与 SOH/STX 撞车时，"发送结束"会被当成"一个块开始了"。
+    marks = [out["ctl_soh"], out["ctl_stx"], out["ctl_eot"]]
+    if len(set(marks)) != len(marks):
+        raise ValueError("ymodem SOH/STX/EOT 撞车: %r" % (marks,))
+
+    # ---- 设备侧**硬编码**了语义、因而必须在生成期钉住的那几项 ----
+    #
+    # 这几项设备实现里用的是"结构性的 0/十进制数字字符"，没法（也不值得）
+    # 做成运行时可配置。真源改动它们时，设备不会跟着改，而症状是静默的：
+    # 比如 radix 改成 16 之后，块 0 的长度字段里 `A`..`F` 会被当成"数字结束"，
+    # 于是一个 0x1F4 这样的长度被解析成 0 —— 随后一切正常，只是收不到东西。
+    # 所以在**生成期**就拒掉，而不是留到设备上。
+    if int(hdr["size_radix"]) != 10:
+        raise ValueError(
+            "ymodem header_block.size_radix 必须是 10（设备侧用 '0'..'9' 逐位解析）："
+            "真源写的是 %r" % (hdr["size_radix"],))
+    if int(hdr["name_terminator"]) != 0:
+        raise ValueError(
+            "ymodem header_block.name_terminator 必须是 0（设备侧按 NUL 截断文件名）："
+            "真源写的是 %r" % (hdr["name_terminator"],))
+    if int(term["payload_value"]) != 0:
+        raise ValueError(
+            "ymodem terminator_block.payload_value 必须是 0（设备侧用『载荷全零』"
+            "判定结束块，不比较具体值）：真源写的是 %r" % (term["payload_value"],))
+    return out
 
 
 def fota_format_for_templates() -> dict:
@@ -686,6 +811,27 @@ def inject_bootloader_drivers(has_bootloader: bool, has_uart: bool,
             },
         })
         has_fota_receive = True
+
+        # ── YMODEM 传输通道（同一条接收链路的第二种"怎么把字节送进来"）──────
+        #
+        # 与 `fota` **同时注入、不做开关**。理由不是省事：
+        #   · 它不改变接收语义，只换一种传输；关掉它并不能省下任何 Flash
+        #     （模板是同一个接收链路的一部分），只省下约 1 KB 单块缓冲；
+        #   · 而给它加一个 `bootloader.ymodem: false` 之类的开关，等于制造一种
+        #     **只在部分示例里被编译/被测试**的配置 —— 本仓库最贵的一类缺陷
+        #     （模板里写死一个本应派生的值、只在特定硬件配置下暴露）正是这么来的。
+        #     无条件生成，意味着每个开了引导器的示例都会在生成期编译它、
+        #     在主机测试里跑它。
+        drivers_additions.append({
+            'name': 'fota_ymodem',
+            'template': 'drivers/drv_fota_ymodem.c.j2',
+            'header_template': 'drivers/drv_fota_ymodem.h.j2',
+            'model': {'type': 'Internal_FOTA'},
+            'peripheral': {
+                'name': 'fota_ymodem',
+                'uart_name': uart_name,
+            },
+        })
 
     has_fota = has_bootloader and has_uart
 

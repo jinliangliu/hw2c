@@ -186,8 +186,8 @@ BOM 格式要求：**CSV**，需包含 `Designator`、`Value`、`Footprint` 三�
 | 红外 NEC/SIR | `drv_ir.c` | — | `test_ir.c` | — |
 | MQTT 3.1.1 | `drv_mqtt.c` | — | `test_mqtt.c` | — |
 | Modbus RTU 主/从 | `drv_modbus.c` | — | `test_modbus.c` | modbus_demo |
-| CLI 调试终端 | `drv_cli.c` | — | `test_cli.c` | base（12 命令，STOP 模式 UART 唤醒） |
-| FOTA 差分升级 | `drv_fota.c` + `fota_bspatch.c` | — | `test_fota_*.c` | — |
+| CLI 调试终端 | `drv_cli.c` | — | `test_cli.c` | base（12 命令，STOP 模式 UART 唤醒；启用 FOTA 接收时 +`fota`） |
+| FOTA 差分升级 | `drv_fota.c` + `drv_fota_ymodem.c` + `fota_delta.c` + `fota_meta.c` | — | `test_fota_*.c` | fota_demo / mhde_mainboard（帧协议与 YMODEM 双通道） |
 | Bootloader (A/B) | `boot_*.c` | — | `test_boot_*.c` | — |
 | Log（日志） | `drv_log.c` | — | — | 环形缓冲 + 中断 TXE，GPIO/AF 可配 |
 | Sleep（低功耗） | `sleep.c` | — | — | base（RUN/SLEEP/STOP0/STOP1，USART 唤醒） |

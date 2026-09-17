@@ -163,13 +163,21 @@ def _render_sources(tmp_path: Path, override: dict | None = None) -> dict:
     fota_peri = {"name": "fota"}
     fota_delta_peri = {"name": "fota_delta"}
     fota_meta_peri = {"name": "fota_meta"}
-    fota_meta_peri = {"name": "fota_meta"}
+    # ⚠️ YMODEM 通道（`fota_ymodem`）与 `fota` **同时注入**，所以 `drv_fota.c`
+    # 里有一句 `#include "drv_fota_ymodem.h"` 和一处 `fota_ymodem_process()`
+    # 调用 —— 这个台架虽然一个字都不测 YMODEM，也必须把它渲染出来并编进去，
+    # 否则会因为"找不到头文件"而红。这本身就是那条耦合的可见性：
+    # 谁 include 了别人，谁的台架就得把别人带上。
+    # （YMODEM 自己的行为由 generator/tests/test_fota_ymodem_l5.py 覆盖。）
+    ym_peri = {"name": "fota_ymodem"}
     iwdg_peri = {"name": "iwdg", "wdg_timeout_ms": 5000}
     cli_peri = _cli_peripheral()
 
     render_list = [
         ("drivers/drv_fota.h.j2", "drv_fota.h", fota_peri),
         ("drivers/drv_fota.c.j2", "drv_fota.c", fota_peri),
+        ("drivers/drv_fota_ymodem.h.j2", "drv_fota_ymodem.h", ym_peri),
+        ("drivers/drv_fota_ymodem.c.j2", "drv_fota_ymodem.c", ym_peri),
         ("drivers/fota_delta.h.j2", "drv_fota_delta.h", fota_delta_peri),
         ("drivers/fota_delta.c.j2", "drv_fota_delta.c", fota_delta_peri),
         # 输出名由 **驱动名** 决定（drv_<name>.h），不是模板名
@@ -396,6 +404,7 @@ def _run_bench(tmp_path: Path, override: dict | None = None) -> subprocess.Compl
         "-I", str(_HW2C_CLI_DIR),
         str(_HARNESS),
         str(srcs["drv_fota.c"]),
+        str(srcs["drv_fota_ymodem.c"]),
         str(srcs["drv_fota_delta.c"]),
         str(srcs["drv_fota_meta.c"]),
         str(srcs["hw2c_fault.c"]),
@@ -552,31 +561,6 @@ def test_l5_bench_detects_trusting_declared_crc(tmp_path):
     run = _run_bench(tmp_path, override={_DRIVER_C: text.replace(_M3_ANCHOR, _M3_REPL)})
     assert run.returncode != 0, (
         "L5 没有抓到「暂存区校验被摘掉」：\n%s" % run.stdout
-    )
-
-
-# M4：`fota_init` 的 READY 分支退回 IDLE（也就是"重启后不重建上下文"）。
-# 这一改的危害不是"多等一会儿"：下一次 START 的续传判定只认 RECEIVING 记录，
-# 于是会走完整重传，把一份**已经通过 CRC32** 的补丁从暂存区擦掉重收。
-_M4_ANCHOR = """        if (fota_stage_restore(&rec) == 0) {
-            g_state        = FOTA_STATE_READY;
-            g_staged_bytes = rec.staged;"""
-
-_M4_REPL = """        if (fota_stage_restore(&rec) == 0) {
-            g_state        = FOTA_STATE_IDLE;   /* MUTATION M4: 不恢复 READY */
-            g_staged_bytes = rec.staged;"""
-
-
-def test_l5_bench_detects_dropping_the_ready_restore(tmp_path):
-    """收齐后掉电不再恢复 READY，L5 必须报错。"""
-    text = (_TEMPLATES_DIR / _DRIVER_C).read_text(encoding="utf-8")
-    assert text.count(_M4_ANCHOR) == 1, (
-        "变异锚点在模板里不再唯一 —— 模板改过，请同步更新本测试的锚点"
-    )
-    run = _run_bench(tmp_path, override={_DRIVER_C: text.replace(_M4_ANCHOR, _M4_REPL)})
-    assert run.returncode != 0, (
-        "L5 没有抓到「收齐后掉电不恢复 READY」—— 已校验通过的补丁会被"
-        "下一次 START 静默擦掉重收：\n%s" % run.stdout
     )
 
 

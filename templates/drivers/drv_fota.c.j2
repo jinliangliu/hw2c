@@ -18,13 +18,25 @@
 #include "drv_iwdg.h"
 #include "hw2c_fault.h"
 
+/* ⚠️ 必须 include：`fota_process()` 在 `FOTA_TP_YMODEM` 期间要调
+ * `fota_ymodem_process()`。缺了它只是"隐式声明"警告（C99 里是错误，
+ * 但 GCC 默认只当警告、`int fota_ymodem_process(void)` 的原型还恰好兼容），
+ * 于是这类缺口会一路编译通过 —— 直到某天 YMODEM 的签名变化才炸。
+ * 谁生成谁：`fota_ymodem` 与 `fota` 由 bootloader_context 同时注入，
+ * 有这个 .c 就一定有那个 .h。 */
+#include "drv_fota_ymodem.h"
+
 #include <string.h>
 
 /* ===========================================================================
  * 1. 静态状态
  * =========================================================================== */
 
-static fota_state_t g_state = FOTA_STATE_IDLE;
+/* 当前生效的传输方式（`fota_transport_t` 定义在 drv_fota.h —— 它出现在
+ * `fota_transport_begin()` 的形参里，只 include 头文件的翻译单元也要看得见）。
+ * "为什么必须有这个变量"见头文件里类型定义上方的说明。 */
+static fota_state_t     g_state = FOTA_STATE_IDLE;
+static fota_transport_t g_transport = FOTA_TP_NONE;
 
 /* 接收缓冲：装得下最长的一帧（DATA）。帧是增量解析的，所以缓冲与"帧"等长，
  * 与补丁大小无关 —— RAM 占用恒定。 */
@@ -44,6 +56,27 @@ static uint32_t g_staging_base;       /* 暂存区基址（8 字节对齐） */
 static uint32_t g_staging_used;       /* 实际用到的字节数 = 48 + patch_size */
 static uint32_t g_staging_total;      /* 占用区长度 = align_up(used, 8)；擦除与避让按它算 */
 static uint32_t g_staged_bytes;       /* 已提交的**帧边界**字节数（相对 used） */
+
+/* 会话流位置（见 fota_stream_origin_t）。
+ *
+ *   g_stream_pos  —— 传输层**已经喂进来**的字节数（从它声明的流起点算起）
+ *   g_stream_skip —— 流开头有多少字节是"已在 Flash 里、需要复核"的前缀
+ *
+ * 帧协议：`g_stream_skip == 0`（主机只发断点之后的字节）。
+ * YMODEM ：`g_stream_skip == g_staged_bytes`（主机恒从字节 0 重发）。
+ * 两者的写入位置永远都是 `g_staged_bytes` —— 这一点不因为传输方式而变，
+ * 是"落盘语义只有一份"的另一半。 */
+static uint32_t g_stream_pos;
+static uint32_t g_stream_skip;
+
+/* 最后一次写进元数据的 `g_staged_bytes`。
+ *
+ * 存在的唯一理由是**省日志条目**：`fota_session_commit_progress()` 每块被调
+ * 一次，而 YMODEM 续传时要逐字节复核前缀（可能上千个块）——那些块里
+ * `g_staged_bytes` 一个字节都不涨。不加这个门控，一次续传会往元数据页里塞
+ * 上千条**内容完全相同**的记录，把 `fota_meta_reserve()` 预留的空间提前耗尽，
+ * 于是中途触发页擦除 —— 正好是 reverse 那条注释说要避免的事。 */
+static uint32_t g_committed_bytes;
 
 /* 暂存写入器：Flash 只支持双字编程，攒满 8 字节再落盘 */
 static uint8_t  g_stage_pend[8];
@@ -142,7 +175,13 @@ typedef struct {
 static fota_apply_ctx_t g_apply_ctx;
 
 /* fota_delta_apply() 的 patch_read：从**暂存区**读，不碰 UART。
- * 调用方（fota_apply_now）已把 cursor 置到信封之后（lite 流起点）。 */
+ * 调用方（fota_apply_now）已把 cursor 置到信封之后（lite 流起点）。
+ *
+ * ⚠️ 本文件里所有"把 Flash 地址当指针用"的地方都写成
+ * `(const void *)(uintptr_t)addr`，那层 `uintptr_t` **不是**多余的：
+ * 目标侧是 32 位（机器码逐字节不变），而主机侧是 64 位、缺了它就报
+ * `-Wint-to-pointer-cast`。仓库约定是"只在测试构建里出现的警告也要修"，
+ * 否则会训练人无视警告（见 `docs/plans/differential-ota.md` §18.2）。 */
 static uint32_t fota_be_patch_read(void *ctx, uint8_t *dst, uint32_t len)
 {
     fota_apply_ctx_t *c = (fota_apply_ctx_t *)ctx;
@@ -154,7 +193,7 @@ static uint32_t fota_be_patch_read(void *ctx, uint8_t *dst, uint32_t len)
     }
     avail = g_staging_used - c->cursor;
     take  = (len < avail) ? len : avail;
-    memcpy(dst, (const void *)(g_staging_base + c->cursor), take);
+    memcpy(dst, (const void *)(uintptr_t)(g_staging_base + c->cursor), take);
     c->cursor += take;
     return take;
 }
@@ -209,7 +248,7 @@ static int fota_be_program(void *ctx, uint32_t addr, const uint8_t *src, uint32_
 static void fota_be_read(void *ctx, uint32_t addr, uint8_t *dst, uint32_t len)
 {
     (void)ctx;
-    memcpy(dst, (const void *)addr, len);  /* Flash 内存映射，直接取值 */
+    memcpy(dst, (const void *)(uintptr_t)addr, len);  /* Flash 内存映射，直接取值 */
 }
 
 static void fota_be_watchdog(void *ctx)
@@ -309,7 +348,7 @@ static int fota_stage_verify(uint32_t expected_crc32)
         if (take > (uint32_t)sizeof(buf)) {
             take = (uint32_t)sizeof(buf);
         }
-        memcpy(buf, (const void *)(g_staging_base + done), take);
+        memcpy(buf, (const void *)(uintptr_t)(g_staging_base + done), take);
         crc = fota_delta_crc32_update(crc, buf, take);
         done += take;
         IWDG_Refresh();
@@ -469,65 +508,54 @@ static int fota_set_offline_error(int code)
     if (cli_rx_sink_active() != 0U) {
         cli_set_rx_sink(NULL);
     }
+    g_transport = FOTA_TP_NONE;
     return -1;
 }
 
-/*
- * START 帧被拒：**留在 RECEIVING**，只记错误码。
+/* ===========================================================================
+ * 6.5 暂存会话（session）—— 两条传输通道共用的准入 / 落盘 / 收尾
  *
- * 与 `fota_set_offline_error` 的区别是刻意的，也是这里最容易改错的一处：
+ * 放在这里而不是文件末尾，是因为它依赖上面的槽位推导（`fota_target_slot`）
+ * 与暂存原语（`fota_stage_*`）；它下面从 `fota_reject_start` 起是帧协议自己
+ * 的处理，YMODEM 不经那些函数。
  *
- *   · START 阶段的一切拒绝（链路噪声导致 CRC16 不符 / 信封不合法 / 容量准入
- *     不过）都是**可以由主机换一条补丁、或重发一次**来纠正的。若在这里把
- *     状态置成 ERROR，操作员必须先 `fota erase` 才能重新 `fota recv` ——
- *     "一次串口误码就要人手介入"是不该有的耦合。
- *   · 反过来，DATA/FINISH 阶段的失败（暂存区编程被硬件拒绝、回读 CRC32 不符）
- *     意味着**已经落盘的东西不可信**，必须停下来，不能继续把后面的字节
- *     追加到一个已知损坏的记录上。那两处走 `fota_set_offline_error`。
- *
- * 不应答是同样的道理：ACK 是"我收下了这一条"的承诺。主机等不到 ACK 会
- * 超时重发或放弃；这比回一个含义可疑的响应更明确。
- */
-static int fota_reject_start(int code)
-{
-    g_last_error = code;
-    fota_rx_reset();
-    return -1;
-}
+ * 这一节的**全部价值**在于：`fota recv`（帧协议）与 `fota ymodem` 两条传输
+ * 在"字节进来之后"走的是同一份代码。任何在这里被复制出去一份的东西
+ * （尤其是准入公式与暂存区几何），都会变成两处需要同步维护的真源。
+ * =========================================================================== */
 
-static void fota_handle_start(void)
+int fota_session_open(const uint8_t *env_bytes, uint32_t record_size,
+                      fota_stream_origin_t origin)
 {
-    uint8_t  env_bytes[FOTA_ENV_SIZE];
-    uint16_t crc_rx;
     fota_meta_t rec;
     uint32_t page = {{ fota_delta_page_size }}U;
     uint32_t image_bytes;
-    uint32_t staged_raw;
+    uint32_t staged_total;
     uint32_t slot;
     uint32_t slot_base;
     uint32_t slot_size;
-    uint32_t staged_total;
     uint32_t frames_est;
     int      erased;
     int      resume;
     int      rc;
 
-    memcpy(env_bytes, &g_rx[1], FOTA_ENV_SIZE);
-    crc_rx = (uint16_t)(g_rx[1 + FOTA_ENV_SIZE]
-                        | ((uint16_t)g_rx[2 + FOTA_ENV_SIZE] << 8));
-
-    /* ① 传输级：整条 48 B 的 CRC16。信封自带的 hdr_crc16 只覆盖前 32 B，
-     * 覆盖不到 auth_len/reserved —— 两者范围不同，都要有。 */
-    if (fota_crc16(env_bytes, FOTA_ENV_SIZE) != crc_rx) {
-        (void)fota_reject_start(FOTA_E_IO);        /* 不应答，让主机超时重发 */
-        return;
+    /* ① 格式级：复用 fota_delta 的信封校验（魔法/版本/flags/内部 CRC/签名/长度）。
+     * 校验规则只能有一份 —— 传输层"挑几个字段看一眼"就等于给悄悄分叉留门
+     * （A3 的成因）。 */
+    rc = fota_delta_parse_env(fota_env_mem_read, (void *)env_bytes, &g_env);
+    if (rc != FOTA_DELTA_OK) {
+        g_last_error = rc;
+        return -1;
     }
 
-    /* ② 格式级：复用 fota_delta 的信封校验（魔法/版本/flags/内部 CRC/签名/长度） */
-    rc = fota_delta_parse_env(fota_env_mem_read, env_bytes, &g_env);
-    if (rc != FOTA_DELTA_OK) {
-        (void)fota_reject_start(rc);               /* 同上：留着接收态，等另一条 START */
-        return;
+    /* ② 长度交叉核对。**这是 YMODEM 侧"主机声明长度 vs 信封声明长度"的
+     * 唯一核对点**：两处都声明了同一条记录的长度，对不上就说明它们不是
+     * 同一个东西（操作员选错了文件、块 0 的长度字段被写坏、或信封来自上一次
+     * 传输）。帧协议传 0 —— START 帧里没有长度字段，信封是唯一来源，跳过。 */
+    if (record_size != 0U
+        && record_size != ((uint32_t)FOTA_ENV_SIZE + g_env.patch_size)) {
+        g_last_error = FOTA_E_LENGTH;
+        return -1;
     }
 
     /* ③ 容量准入。**必须用"实际会擦掉的整页数"**，不能用 new_size：
@@ -537,20 +565,19 @@ static void fota_handle_start(void)
     slot_size = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_SIZE : FOTA_SLOT_B_SIZE;
 
     image_bytes  = ((g_env.new_size + page - 1U) / page) * page;
-    staged_raw   = FOTA_ENV_SIZE + g_env.patch_size;
-    staged_total = (staged_raw + 7U) & ~7U;      /* 双字编程要求 8 字节对齐 */
+    staged_total = ((uint32_t)FOTA_ENV_SIZE + g_env.patch_size + 7U) & ~7U;
 
     if (image_bytes + staged_total > slot_size) {
-        (void)fota_reject_start(FOTA_E_STAGING_FULL);
-        return;
+        g_last_error = FOTA_E_STAGING_FULL;
+        return -1;
     }
 
     g_slot          = slot;
     g_dst_slot      = slot_base;
     g_dst_size      = slot_size;
     g_src_slot      = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_B_BASE : FOTA_SLOT_A_BASE;
-    g_staging_used  = staged_raw;         /* 记录本身 = 48 B 信封 + patch_size */
-    g_staging_total = staged_total;       /* 占位长度 = 补到 8 字节对齐 */
+    g_staging_used  = (uint32_t)FOTA_ENV_SIZE + g_env.patch_size;
+    g_staging_total = staged_total;
     g_staging_base  = slot_base + (slot_size - staged_total);
 
     /* ④ 续传判定。三个条件缺一不可：
@@ -572,7 +599,7 @@ static void fota_handle_start(void)
     if (fota_meta_load(&rec) == 0
         && rec.state == FOTA_META_STATE_RECEIVING
         && rec.slot == slot
-        && rec.staged > FOTA_ENV_SIZE
+        && rec.staged > (uint32_t)FOTA_ENV_SIZE
         && rec.staged < staged_total
         && (rec.staged % 8U) == 0U
         && memcmp((const void *)(uintptr_t)g_staging_base, env_bytes,
@@ -592,41 +619,232 @@ static void fota_handle_start(void)
     if (resume != 0) {
         g_staged_bytes   = rec.staged;
         g_stage_pend_len = 0U;
-        g_expected_seq   = (uint16_t)((rec.staged - FOTA_ENV_SIZE) / FOTA_CHUNK_SIZE);
     } else {
         if (fota_flash_erase_range(g_staging_base, staged_total) != 0) {
             /* 擦除失败 ⇒ 暂存区内容未知。**必须**把元数据清掉：否则下一次
              * START 若身份恰好相同（同一条补丁重发）就会走"续传"，从一片
              * 半擦除的区域上接着追加 —— 收齐时的 CRC32 会兜住，但那是把
              * 一个可以立刻避免的失败推迟到最后。清掉之后重传是确定性的。 */
-            /* 暂存区内容已不可知 ⇒ 记一条"这次不算数"，让下次 START 走
-             * 完整重传而不是从半擦除的区域上接着追加。 */
             (void)fota_meta_consume();
-            (void)fota_reject_start(FOTA_E_FLASH);
-            return;
+            g_last_error = FOTA_E_FLASH;
+            return -1;
         }
         g_staged_bytes   = 0U;
         g_stage_pend_len = 0U;
-        g_expected_seq   = 0U;
         /* 信封先落盘：应用期读的是暂存区，而不是内存里的 g_env。
-         * 这样"掉电后重启进程"与"一路收完"走的是同一段代码。 */
-        if (fota_stage_write(env_bytes, FOTA_ENV_SIZE) != 0) {
-            /* 暂存区内容已不可知 ⇒ 记一条"这次不算数"，让下次 START 走
-             * 完整重传而不是从半擦除的区域上接着追加。 */
+         * 这样"掉电后重启"与"一路收完"走的是同一段代码。 */
+        if (fota_stage_write(env_bytes, (uint32_t)FOTA_ENV_SIZE) != 0) {
             (void)fota_meta_consume();
-            (void)fota_reject_start(FOTA_E_FLASH);
-            return;
+            g_last_error = FOTA_E_FLASH;
+            return -1;
         }
     }
 
     (void)fota_meta_append(FOTA_META_STATE_RECEIVING, slot, g_staged_bytes);
+    /* 记住刚写进去的那个值，`fota_session_commit_progress()` 靠它判断
+     * "这一块有没有新进展"。少了这一句，第一块会被当成"没有新进展"而跳过，
+     * 于是 YMODEM 的断点永远停留在 open 时的 0。 */
+    g_committed_bytes = g_staged_bytes;
+
+    /* ⑤ 流起点语义。写在 `g_staged_bytes` 定稿**之后** —— 续传的跳过量
+     * 由它算出，不需要第二处推导，也就不可能两处算得不一样。 */
+    g_stream_pos  = 0U;
+    g_stream_skip = (origin == FOTA_STREAM_FROM_RECORD_START) ? g_staged_bytes : 0U;
 
     g_state            = FOTA_STATE_RECEIVING;
     g_apply_progress   = 0U;
+    g_last_error       = FOTA_E_NONE;
     g_last_activity_ms = HAL_GetTick();
-    fota_rx_reset();
+    return 0;
+}
 
-    /* ACK 携带"我要的下一片序号"：续传时直接告诉主机从哪儿接着发。 */
+uint32_t fota_session_stream_start(void)
+{
+    /* 流起点 = 已提交点 − 需要复核的前缀。两种语义下同一个式子：
+     *   帧协议：skip = 0        ⇒ 起点 = g_staged_bytes（主机从断点接着发）
+     *   YMODEM ：skip = staged  ⇒ 起点 = 0（主机从文件字节 0 重发） */
+    return g_staged_bytes - g_stream_skip;
+}
+
+void fota_session_commit_progress(void)
+{
+    /* 两条传输共用这一份"提交进度"。
+     *
+     * ⚠️ `g_staged_bytes == g_committed_bytes` 时**直接返回**，不是省事：
+     * YMODEM 续传的前缀复核阶段每块都不涨字节，若每块都追加一条记录，
+     * 上千条同样的记录会把 `fota_meta_reserve()` 预留的位置提前吃光、
+     * 触发**传输中途**的页擦除 —— 而那次擦除会把当前的断点记录一并抹掉。
+     * 帧协议侧这个门控是"顺带"的：它每帧都在涨，正常情况下不影响。 */
+    if (g_state != FOTA_STATE_RECEIVING) {
+        return;
+    }
+    if (g_staged_bytes == g_committed_bytes) {
+        return;
+    }
+    (void)fota_meta_append(FOTA_META_STATE_RECEIVING, g_slot, g_staged_bytes);
+    g_committed_bytes = g_staged_bytes;
+}
+
+int fota_session_feed(const uint8_t *data, uint32_t len)
+{
+    uint32_t i;
+
+    if (g_state != FOTA_STATE_RECEIVING) {
+        g_last_error = FOTA_E_NOT_READY;
+        return -1;
+    }
+    for (i = 0U; i < len; i++) {
+        uint8_t b = data[i];
+
+        if (g_stream_pos < g_stream_skip) {
+            /* 复核已在 Flash 里的前缀：逐字节与暂存区比对。
+             *
+             * 不一致说明"主机这次重发的那条记录"与"设备上次收下的"不是同一条
+             * （换过文件、或元数据指向了另一次传输）。**fail-fast** 的意义在于
+             * 不必等到全部传完才在 CRC32 上发现 —— 那种失败要多等一整次传输。
+             *
+             * 直接解引用 Flash 地址是安全的：暂存区就在目标槽尾部，是内存映射
+             * 的（`fota_be_read` 也是这么读的）。 */
+            if (*(const uint8_t *)(uintptr_t)(g_staging_base + g_stream_pos) != b) {
+                g_last_error = FOTA_E_STAGING_LOST;
+                return -1;
+            }
+        } else {
+            if (g_staged_bytes >= g_staging_used) {
+                /* 主机发得比声明的多。**必须在这里拦下**：越界写会踩掉暂存区
+                 * 之后那片 Flash —— 那是新镜像的位置，也就是下次启动要跑的
+                 * 固件。YMODEM 的块长与文件长度无关（末块按块长补齐），所以
+                 * 这条不是理论上的防御，而是那条截断逻辑的错误版本会走到的路径。 */
+                g_last_error = FOTA_E_LENGTH;
+                return -1;
+            }
+            /* 逐字节写入：`fota_stage_write` 内部攒满 8 字节才编程一次，
+             * 所以这里不会退化成"每字节一次 Flash 操作"。 */
+            if (fota_stage_write(&b, 1U) != 0) {
+                g_last_error = FOTA_E_FLASH;
+                return -1;
+            }
+        }
+        g_stream_pos++;
+    }
+    g_last_activity_ms = HAL_GetTick();
+    return 0;
+}
+
+int fota_session_finish(uint32_t expected_crc32)
+{
+    if (g_state != FOTA_STATE_RECEIVING) {
+        g_last_error = FOTA_E_NOT_READY;
+        return FOTA_SESSION_FAILED;
+    }
+    /* 长度不符：**不算终态**。暂存区里是一条短记录，缺的字节可以由主机补发
+     * （帧协议）或重传（YMODEM）之后再来一次 FINISH。 */
+    if (g_staged_bytes != g_staging_used) {
+        g_last_error = FOTA_E_SHORT;
+        return FOTA_SESSION_SHORT;
+    }
+    if (fota_stage_flush() != 0) {
+        return fota_set_offline_error(FOTA_E_FLASH);
+    }
+    /* 从 Flash 回读整条记录复算 CRC32 —— 这一步同时证明"真的写进去了"。 */
+    if (fota_stage_verify(expected_crc32) != 0) {
+        return fota_set_offline_error(FOTA_E_PATCH_CRC);
+    }
+
+    /* 提交点：先确认补丁整条落在 Flash 里（上面的 stage_verify 刚回读复算过
+     * CRC32），再把 READY 写进元数据。反过来先写 READY，就会出现"引导器认为
+     * 有一条待应用的补丁、而暂存区其实不完整"的状态。 */
+    (void)fota_meta_append(FOTA_META_STATE_READY, g_slot, g_staging_used);
+
+    g_state           = FOTA_STATE_READY;
+    g_apply_requested = 1U;               /* 交给 fota_process：不在接收路径里擦 Flash */
+    g_apply_progress  = 0U;
+    fota_flash_lock();
+    return FOTA_SESSION_OK;
+}
+
+void fota_session_abort(void)
+{
+    if (cli_rx_sink_active() != 0U) {
+        cli_set_rx_sink(NULL);
+    }
+    fota_flash_lock();
+    fota_rx_reset();
+    g_transport = FOTA_TP_NONE;
+    g_stream_pos  = 0U;
+    g_stream_skip = 0U;
+    /* 只把状态退回 IDLE：**不清元数据、不擦暂存区**，所以主机可以重发续传。 */
+    if (g_state == FOTA_STATE_RECEIVING) {
+        g_state = FOTA_STATE_IDLE;
+    }
+}
+
+void fota_transport_begin(fota_transport_t tp)
+{
+    g_transport = tp;
+}
+
+void fota_note_error(int code)
+{
+    g_last_error = code;
+}
+
+/*
+ * START 帧被拒：**留在 RECEIVING**，只记错误码。
+ *
+ * 与 `fota_set_offline_error` 的区别是刻意的，也是这里最容易改错的一处：
+ *
+ *   · START 阶段的一切拒绝（链路噪声导致 CRC16 不符 / 信封不合法 / 容量准入
+ *     不过）都是**可以由主机换一条补丁、或重发一次**来纠正的。若在这里把
+ *     状态置成 ERROR，操作员必须先 `fota erase` 才能重新 `fota recv` ——
+ *     "一次串口误码就要人手介入"是不该有的耦合。
+ *   · 反过来，DATA/FINISH 阶段的失败（暂存区编程被硬件拒绝、回读 CRC32 不符）
+ *     意味着**已经落盘的东西不可信**，必须停下来，不能继续把后面的字节
+ *     追加到一个已知损坏的记录上。那两处走 `fota_set_offline_error`。
+ *
+ * 不应答是同样的道理：ACK 是"我收下了这一条"的承诺。主机等不到 ACK 会
+ * 超时重发或放弃；这比回一个含义可疑的响应更明确。
+ *
+ * 错误码由调用方在**调用之前**置好（会话层自己会置，传输级的 CRC16 不符
+ * 由 `fota_handle_start` 置 FOTA_E_IO）。
+ */
+static int fota_reject_start(void)
+{
+    fota_rx_reset();
+    return -1;
+}
+
+static void fota_handle_start(void)
+{
+    uint8_t  env_bytes[FOTA_ENV_SIZE];
+    uint16_t crc_rx;
+
+    memcpy(env_bytes, &g_rx[1], FOTA_ENV_SIZE);
+    crc_rx = (uint16_t)(g_rx[1 + FOTA_ENV_SIZE]
+                        | ((uint16_t)g_rx[2 + FOTA_ENV_SIZE] << 8));
+
+    /* ① 传输级：整条 48 B 的 CRC16。信封自带的 hdr_crc16 只覆盖前 32 B，
+     * 覆盖不到 auth_len/reserved —— 两者范围不同，都要有。 */
+    if (fota_crc16(env_bytes, (uint32_t)FOTA_ENV_SIZE) != crc_rx) {
+        g_last_error = FOTA_E_IO;
+        (void)fota_reject_start();        /* 不应答，让主机超时重发 */
+        return;
+    }
+
+    /* ②③④ 格式校验 / 长度核对 / 准入 / 几何 / 续传判定 —— 全部在会话层，
+     * 与 YMODEM 共用同一份实现。
+     * `record_size = 0`：START 帧不带长度字段，信封是唯一来源。 */
+    if (fota_session_open(env_bytes, 0U, FOTA_STREAM_FROM_COMMIT_POINT) != 0) {
+        (void)fota_reject_start();        /* 同上：留着接收态，等另一条 START */
+        return;
+    }
+
+    /* ACK 携带"我要的下一片序号"：续传时直接告诉主机从哪儿接着发。
+     * 序号由**会话给出的流起点**推出，而不是在这里重算一遍断点 ——
+     * 续传与否是会话的判定，重算一次就是第二份实现。 */
+    g_expected_seq =
+        (uint16_t)((fota_session_stream_start() - (uint32_t)FOTA_ENV_SIZE)
+                   / (uint32_t)FOTA_CHUNK_SIZE);
     fota_send_resp(FOTA_PROTOCOL_ACK, g_expected_seq);
 }
 
@@ -665,8 +883,12 @@ static void fota_handle_data(void)
      * 一条记录 = 3 个双字编程（约零点几毫秒），相对一次 1 KB 的暂存编程
      * 可以忽略；换来的是"任意一次掉电最多退回一帧"。
      * 页擦除已由 START 阶段的 `fota_meta_reserve()` 提前腾好空间，
-     * 所以传输途中不会再触发擦除。 */
-    (void)fota_meta_append(FOTA_META_STATE_RECEIVING, g_slot, g_staged_bytes);
+     * 所以传输途中不会再触发擦除。
+     *
+     * 走会话层而不是在这里直接 `fota_meta_append`：YMODEM 每块也要提交
+     * （见 `ym_handle_data`），两处各写一遍的话，"要不要按新进展门控"
+     * 这类策略改动迟早只落在一侧。 */
+    fota_session_commit_progress();
 
     fota_send_resp(FOTA_PROTOCOL_ACK, g_expected_seq);
 }
@@ -677,46 +899,33 @@ static void fota_handle_finish(void)
                     | ((uint32_t)g_rx[2] << 8)
                     | ((uint32_t)g_rx[3] << 16)
                     | ((uint32_t)g_rx[4] << 24);
+    int rc;
 
-    if (g_staged_bytes != g_staging_used) {
+    /* 长度核对 / 落盘 / 回读复算 CRC32 / 提交 READY —— 全在会话层（与 YMODEM 共用）。 */
+    rc = fota_session_finish(crc_rx);
+
+    if (rc == FOTA_SESSION_SHORT) {
         /* 收得不全就来 FINISH：NAK 并把**当前期望序号**回给主机，让它从断点继续。
          *
          * 这里同样**不置 ERROR**（与 START 阶段的理由一致）：缺口可以由主机补发，
          * 而 ERROR 会让 `fota recv` 拒绝再次进入接收态，逼着操作员先 `fota erase`。
          * 这也是"NAK 携带 want_seq"这个设计的全部意义 —— 若 NAK 意味着进入终态，
          * 携带序号就没有用了。 */
-        g_last_error = FOTA_E_SHORT;
         fota_send_resp(FOTA_PROTOCOL_NAK, g_expected_seq);
         return;
     }
-    if (fota_stage_flush() != 0) {
-        (void)fota_set_offline_error(FOTA_E_FLASH);
-        fota_flash_lock();
-        return;
-    }
-    /* 从 Flash 回读整条记录复算 CRC32 —— 这一步同时证明"真的写进去了"。 */
-    if (fota_stage_verify(crc_rx) != 0) {
-        (void)fota_set_offline_error(FOTA_E_PATCH_CRC);
+    if (rc != FOTA_SESSION_OK) {
+        /* 已由会话层置成 ERROR（暂存区内容不可信），UART 也已交还。
+         * 仍回一个 NAK：主机需要知道"这一条没被接受"，否则它会一直等 ACK。 */
         fota_send_resp(FOTA_PROTOCOL_NAK, 0U);
-        fota_flash_lock();
         return;
     }
-
-    /* 提交点：先确认补丁整条落在 Flash 里（上面的 stage_verify 刚回读复算过
-     * CRC32），再把 READY 写进元数据。反过来先写 READY，就会出现"引导器认为
-     * 有一条待应用的补丁、而暂存区其实不完整"的状态。 */
-    (void)fota_meta_append(FOTA_META_STATE_READY, g_slot, g_staging_used);
-
-    g_state           = FOTA_STATE_READY;
-    g_apply_requested = 1U;               /* 交给 fota_process：不在中断/接收路径里擦 Flash */
-    g_apply_progress  = 0U;
-    fota_flash_lock();
-    fota_rx_reset();
 
     fota_send_resp(FOTA_PROTOCOL_ACK, g_expected_seq);
 
     /* 交还 UART：接下来 fota_process 会在 fota 任务上下文里同步跑完应用。 */
     cli_set_rx_sink(NULL);
+    fota_transport_begin(FOTA_TP_NONE);
 }
 
 void fota_rx_bytes(const uint8_t *data, uint16_t len)
@@ -876,6 +1085,10 @@ void fota_init(void)
     g_staging_total   = 0U;
     g_staging_base    = 0U;
     g_flash_unlocked  = 0U;
+    g_stream_pos      = 0U;
+    g_stream_skip     = 0U;
+    g_committed_bytes = 0U;
+    g_transport       = FOTA_TP_NONE;
 
     fota_bkp_unlock();
 
@@ -1003,7 +1216,7 @@ uint32_t fota_get_pending_slot(void)
     }
 }
 
-int fota_receive_begin(char *msg, uint32_t msg_len)
+int fota_receive_ready(char *msg, uint32_t msg_len)
 {
     /* 允许从 IDLE **和 ERROR** 进入。
      *
@@ -1042,29 +1255,32 @@ int fota_receive_begin(char *msg, uint32_t msg_len)
         }
         return -1;
     }
+    return 0;
+}
+
+int fota_receive_begin(char *msg, uint32_t msg_len)
+{
+    if (fota_receive_ready(msg, msg_len) != 0) {
+        return -1;
+    }
 
     fota_rx_reset();
     g_expected_seq     = 0U;
+    g_stream_pos       = 0U;
+    g_stream_skip      = 0U;
     g_last_activity_ms = HAL_GetTick();
     g_last_error       = FOTA_E_NONE;
     g_state            = FOTA_STATE_RECEIVING;
     /* ⚠️ 这里**不写元数据、不擦暂存区**：START 帧到了才知道这次传的是哪条
      * 补丁，那时才能判断是"续传"还是"新的一次"。提前清掉等于自断续传。 */
     cli_set_rx_sink(fota_rx_bytes);
+    fota_transport_begin(FOTA_TP_FRAME);
     return 0;
 }
 
 void fota_receive_abort(void)
 {
-    if (cli_rx_sink_active() != 0U) {
-        cli_set_rx_sink(NULL);
-    }
-    fota_flash_lock();
-    fota_rx_reset();
-    /* 只把状态退回 IDLE：**不清元数据、不擦暂存区**，所以主机可以重发 START 续传。 */
-    if (g_state == FOTA_STATE_RECEIVING) {
-        g_state = FOTA_STATE_IDLE;
-    }
+    fota_session_abort();
 }
 
 int fota_apply_request(void)
@@ -1101,12 +1317,22 @@ int fota_erase_target(void)
     g_staging_used   = 0U;
     g_staging_total  = 0U;
     g_apply_progress = 0U;
+    g_stream_pos     = 0U;
+    g_stream_skip    = 0U;
+    g_committed_bytes = 0U;
     return 0;
 }
 
 void fota_process(void)
 {
-    if (g_state == FOTA_STATE_RECEIVING) {
+    /* ⚠️ 两条传输的周期性工作**互斥**，判据是 `g_transport` 而不是"状态是
+     * 不是 RECEIVING"。
+     *
+     * 帧协议的空闲超时与 YMODEM 的块超时都以 `g_last_activity_ms` 为基准，
+     * 若不区分传输方式，一次 YMODEM 传输会在主机沉默超过 2 s 时被这里判成
+     * "链路断了"而中途中止 —— 症状是"YMODEM 传到一半设备自己放弃了"，
+     * 而设备侧的日志只会说"接收超时"，看不出是两套超时打架。 */
+    if (g_state == FOTA_STATE_RECEIVING && g_transport == FOTA_TP_FRAME) {
         uint32_t now = HAL_GetTick();
         /* ⚠️ 这里**不能**再判 `g_last_activity_ms != 0U`。
          *
@@ -1127,7 +1353,21 @@ void fota_process(void)
         }
     }
 
-    if (g_state == FOTA_STATE_READY && g_apply_requested != 0U) {
+    if (g_transport == FOTA_TP_YMODEM) {
+        /* 握手重发、块超时、重试耗尽后的放弃，全在 YMODEM 模块里 ——
+         * 它自己知道当前是在等块 0、等数据块、等 EOT 还是等结束块。 */
+        fota_ymodem_process();
+    }
+
+    /* ⚠️ 应用**必须**等到传输层彻底收工（`g_transport == FOTA_TP_NONE`）。
+     *
+     * 对帧协议这没有影响：它在 ACK 完 FINISH 就已经把 transport 清成 NONE。
+     * 对 YMODEM 是必需的：最后一次数据块之后还有一整段结束握手（EOT 的两拍
+     * 应答 + 结束块的应答），而 `fota_apply_now()` 的最后一件事是
+     * `NVIC_SystemReset()`。不在这里等一下，设备就会在主机还在做结束握手时
+     * 复位 —— 表现为"升级其实成功了，但 sb 报了一串超时错误"。 */
+    if (g_state == FOTA_STATE_READY && g_apply_requested != 0U
+        && g_transport == FOTA_TP_NONE) {
         g_apply_requested = 0U;
         fota_apply_now();
     }

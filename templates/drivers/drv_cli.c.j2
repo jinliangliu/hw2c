@@ -73,6 +73,9 @@
 #}
 {% if has_fota_receive %}
 #include "drv_fota.h"
+/* YMODEM 通道（`fota ymodem`）。两条传输共用同一个接收链路，但入口与节拍的
+ * 驱动方式是分开的，所以 CLI 两个头都要。 */
+#include "drv_fota_ymodem.h"
 {% endif %}
 {% if has_temp_sensor %}
 {% for p in peripherals if p.type == 'Internal_TempSensor' %}
@@ -982,10 +985,19 @@ static void cmd_mqtt(int argc, char *argv[], cli_output_fn out)
 /*
  * FOTA 命令组。
  *
- * `recv` 是**唯一入口**：它把 UART 的字节流从行编辑器移交给接收状态机
- * （见 drv_cli.h 里 cli_rx_sink_t 的说明）。这不是权宜之计，而是安全属性 ——
- * 只有被明确要求时才接受固件，"一通电就等 START"会让任意串口噪声都可能
- * 触发一次 Flash 擦写。
+ * 两个**入口**，一个接收链路：
+ *
+ *   `recv`   —— 自研帧协议。需要主机侧跑 `generator/fota_sender.py`。
+ *   `ymodem` —— YMODEM（batch / CRC 握手）。用任意终端软件内置的
+ *               "YMODEM 发送"即可，不需要装我们的工具。
+ *
+ * 两条通道收齐之后的处理完全一样（同一个暂存会话层），载荷也是同一串字节
+ * （`.h2cd` 补丁的整条记录）。
+ *
+ * 两个入口都**必须由操作员显式敲命令**，这不是权宜之计而是安全属性：
+ * "一通电就等 START"会让任意串口噪声都可能触发一次 Flash 擦写。
+ * 同理，接管期间行编辑器被旁路，所以**传输中没有"敲个命令取消"这回事** ——
+ * 中止只有三条路：主机发 CAN、本侧重试耗尽、或超时（都对主机可见）。
  */
 static void cmd_fota(int argc, char *argv[], cli_output_fn out)
 {
@@ -995,7 +1007,9 @@ static void cmd_fota(int argc, char *argv[], cli_output_fn out)
     };
 
     if (argc < 2) {
-        out("Usage: fota status | progress | recv | apply | erase\r\n");
+        out("Usage: fota status | progress | recv | ymodem | apply | erase\r\n");
+        out("  recv   - receive via the H2C frame protocol (host: fota_sender.py)\r\n");
+        out("  ymodem - receive via YMODEM (any terminal app: send with YMODEM)\r\n");
         return;
     }
     if (strcmp(argv[1], "status") == 0) {
@@ -1005,6 +1019,11 @@ static void cmd_fota(int argc, char *argv[], cli_output_fn out)
         out("  pending slot: %lu  staged: %lu bytes\r\n",
             (unsigned long)fota_get_pending_slot(),
             (unsigned long)fota_get_staged_bytes());
+        if (fota_ymodem_file_name()[0] != '\0') {
+            /* 上一次 YMODEM 收到的文件名。是**诊断**信息：出错时能一眼看出
+             * 是不是操作员选错了文件（选了另一个版本的 .h2cd）。 */
+            out("  ymodem file: %s\r\n", fota_ymodem_file_name());
+        }
         out("  last error: %d\r\n", fota_get_last_error());
     } else if (strcmp(argv[1], "progress") == 0) {
         out("FOTA progress: %lu%%\r\n", (unsigned long)fota_get_progress());
@@ -1017,6 +1036,17 @@ static void cmd_fota(int argc, char *argv[], cli_output_fn out)
         } else {
             out("FOTA recv refused: %s\r\n", msg);
         }
+    } else if (strcmp(argv[1], "ymodem") == 0) {
+        char msg[48];
+
+        out("FOTA ymodem: waiting for host YMODEM send...\r\n");
+        if (fota_ymodem_begin(msg, sizeof(msg)) != 0) {
+            /* 拒绝时明说"什么都没启动" —— 上一行已经说了"waiting"，
+             * 不澄清的话操作员会去终端里点发送然后等一个不会来的握手。 */
+            out("FOTA ymodem refused: %s (nothing was started)\r\n", msg);
+        }
+        /* 成功时不再多说话：`fota_ymodem_begin()` 已经把第一个 'C' 发出去了，
+         * 操作员看到的就是它。 */
     } else if (strcmp(argv[1], "apply") == 0) {
         out(fota_apply_request() == 0 ? "FOTA apply scheduled\r\n"
                                       : "FOTA apply refused\r\n");
@@ -1220,7 +1250,7 @@ void cli_register_builtin_commands(void)
     cli_register_command("mqtt",    "MQTT operations",              cmd_mqtt);
 {% endif %}
 {% if has_fota_receive %}
-    cli_register_command("fota",    "FOTA firmware update",         cmd_fota);
+    cli_register_command("fota",    "FOTA firmware update (recv/ymodem)", cmd_fota);
 {% endif %}
 {% if has_temp_sensor %}
     cli_register_command("sysinfo", "System info (temp/RAM/flash)", cmd_sysinfo);

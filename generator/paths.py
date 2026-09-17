@@ -29,6 +29,8 @@ RUN_TESTS_PATH = os.path.join(GENERATOR_DIR, "run_tests.py")
 PATCH_CRC_PATH = os.path.join(GENERATOR_DIR, "patch_crc.py")
 # FOTA / 引导镜像格式的唯一真源（C 模板与 Python 工具都从这里取值）
 FOTA_FORMAT_PATH = os.path.join(GENERATOR_DIR, "data", "fota_format.json")
+# YMODEM 传输层格式的唯一真源（设备侧接收器与主机侧发送端都从这里取值）
+YMODEM_FORMAT_PATH = os.path.join(GENERATOR_DIR, "data", "ymodem_format.json")
 TIMEBASE_SRC = os.path.join(STATIC_STM32_HAL_SRC, "stm32g0xx_hal_timebase_tim.c")
 
 # ---------- Template sub-directories ----------

@@ -1393,3 +1393,161 @@ L1（Python 结构检查）跑得快但证明不了 cover 编码正确；L2 用 
   > `fota_bspatch_apply()`，先删被依赖方会让仓库里存在一个"模板 include 了
   > 已删除的头"的悬空提交。P3 重写 `drv_fota` 后该依赖自然消失，
   > 于是两件事合并为一个原子提交。
+
+## 19. 实施记录：P3 接收侧状态机 + P3' YMODEM 通道（2026-09-17）
+
+§18.4 列的 P3 已完成，并在此基础上加了第二个传输通道。P4（引导决策表）与 P5（真板 HIL）
+仍未做 —— §14 的验收标准 4/5 条即对应它们。
+
+### 19.1 已落地
+
+| 位置 | 内容 |
+|---|---|
+| `templates/drivers/drv_fota.{c,h}.j2` | 接收侧状态机重写；`fota_session_*` 暂存会话层（两条传输共用）；`fota_transport_t { NONE, FRAME, YMODEM }` |
+| `templates/drivers/drv_fota_ymodem.{c,h}.j2` | YMODEM batch 接收侧（新） |
+| `templates/drivers/fota_meta.{c,h}.j2` | Flash 页元数据日志（P3 时点已从 BKP 寄存器搬到专用页，见 §18） |
+| `templates/drivers/drv_cli.c.j2` | `fota` 命令组：`status` / `progress` / `recv` / `ymodem` / `apply` / `erase` |
+| `generator/data/ymodem_format.json` | YMODEM 格式**唯一真源**（新） |
+| `generator/fota_ymodem_sender.py` | 测试侧发送器（新）：出字节计划，供 L5 台架与调试用 |
+| `generator/tests/test_fota_ymodem.py` | 渲染层护栏（新） |
+| `generator/tests/test_fota_ymodem_l5.py` + `tests/harness/fota_ymodem_l5_harness.c` | L5 跨实现台架（新，14 用例） |
+| `templates/test/test_fota_ymodem.c.j2` | **生成工程内**的传输层单测（新，15 用例）；`test_fota_protocol.c.j2` 同步补上 `drv_fota_ymodem.c` 的 include（见 19.5） |
+| `docs/user-guide/cli-commands.md` | FOTA 小节按实际子命令重写，含 YMODEM 操作步骤 |
+
+### 19.2 关键设计：两条通道，一份会话
+
+YMODEM 与帧协议的差别**只有"字节怎么进来"**：前者是定长分片 + 显式序号 + 停等 ACK，
+后者是 128/1024 字节块 + 16 位 CRC。字节进来之后的一切必须逐字节相同 ——
+
+- 容量准入公式：`align_up(new_size, page) + align_up(48 + patch_size, 8)`
+- 暂存区几何：`staging_base = slot_base + slot_size - align_up(record, 8)`
+- 续传判定：记录状态 + 槽 + 进度区间 + 信封逐字节相同
+- 信封先落盘、双字对齐攒批、`0xFF` 补尾
+- 收尾的"从 Flash 回读整条记录复算 CRC32"
+
+所以这些收敛进 `fota_session_*`，两条传输都只经由它落盘。**各写一份的结局不是"代码重复"，
+而是两份准入公式**，而"边界少算一页、应用期把暂存区首页擦掉"这类缺陷的难点恰恰在于它
+只在一小段边界上出现 —— 两份实现里总有一份没被那条边界测到。同理，"哪些状态允许进入
+接收"是一条安全策略（READY / DONE 下暂存区里已有一条校验通过的补丁），抽成唯一的
+`fota_receive_ready()`，两个入口各判一次迟早会漏。
+
+`fota_transport_t` 的存在理由是**节拍互斥**：`fota_process()` 里帧协议要做空闲超时
+（超时即 `fota_receive_abort()`），YMODEM 要周期发 `'C'` 并处理块超时，两者的时基都由
+`g_last_activity_ms` 折算。不区分传输方式的话，一次 YMODEM 传输会被帧协议判定为
+"主机静默"而中途中止 —— 而且是在 2 s 之后，表现为"YMODEM 传到一半设备自己放弃了"。
+
+⚠️ `fota_transport_t` 的定义必须在 `.h` 而不是 `.c`：`fota_transport_begin()` 的形参用它，
+而 `drv_shell.c` / `main.c` / `event_mgr.c` 只 include 头文件，类型留在 `.c` 里这些翻译单元
+会以 `unknown type name` 失败（实施时确实这样失败过一次）。
+
+### 19.3 YMODEM 的四个必踩点（每一个都能"自测全绿、接真软件全挂"）
+
+| # | 陷阱 | 后果 | 处置 |
+|---|---|---|---|
+| 1 | **CRC 是两个不同的算法** | 见下 | 设备自己实现 CRC-16/XMODEM，不复用 `fota_crc16()` |
+| 2 | 末块 `0x1A` 填充未按声明长度截断 | 补丁尾部多一截 `0x1A` | 块 0 的十进制长度即整条记录长度，据此截断 |
+| 3 | `CAN`(0x18) 在非块边界被当成中止 | 补丁里随机的 `0x18` 触发假中止 | 只在块起点判 CAN，且**连续两个**才算 |
+| 4 | `(uint8_t)YMODEM_BLK_MODULUS` = `(uint8_t)256U` = `0` | 运行期除零 ⇒ 真机 HardFault | 取模先升 32 位，最后再转 `uint8_t` |
+
+**第 1 条是这个特性最贵的坑**：本仓帧协议用 CRC-16/CCITT-FALSE（init `0xFFFF`，
+`'123456789'` → `0x29B1`），YMODEM 规定 CRC-16/XMODEM（init `0x0000` → `0x31C3`）。
+同一多项式、不同初值。图省事复用 `fota_crc16()` 的话，**自研主机 ↔ 设备之间完全互通**
+（两侧错得一样，自测全绿），但 Tera Term / lrzsz `sb` / ExtraPuTTY **一个都连不上**。
+这是 A3 类缺陷（两侧各自"正确"地实现了一份不同的约定）的教科书形态，而且它天然不会被
+自测暴露 —— 因为自测的两侧来自同一份错代码。
+
+判据因此是**标准**而不是"另一侧也这么算"：`ymodem_format.json` 写死 check 值
+`0x31C3`，测试拿它当 KAT，独立验算方式一并写在真源里
+（`python -c "import binascii; print(hex(binascii.crc_hqx(b'123456789', 0)))"`）。
+
+### 19.4 载荷与续传
+
+- 载荷是 `.h2cd` 差分补丁的**整条记录**（48 B 信封 + lite 流），与帧协议发的是同一串字节。
+- **整文件校验由设备承担**：YMODEM 协议本身没有全文件校验，所以设备在接收过程中累加
+  CRC-32/ISO-HDLC，收尾与帧协议走同一个 `fota_session_finish(expected_crc32)`。
+- **YMODEM 没有部分续传** ⇒ 主机恒从文件字节 0 重发。设备的续传就是"把已提交的前缀当作
+  要复核的重放"（`FOTA_STREAM_FROM_RECORD_START`）：逐字节与 Flash 里的内容比对，
+  不一致立刻 fail-fast。跳过也能保证最终正确（收尾那次回读 CRC32 覆盖整条记录），
+  但校验失败要等全部传完才报出来 —— 操作员会为一个 3 秒就能发现的问题多等一次完整传输。
+- **块 0 的声明长度是"主机声明长度"与"信封声明长度"的唯一交叉核对点**
+  （帧协议的 START 帧没有长度字段，只能由信封推出）。两者不符即拒绝。
+- **一批 = 一个补丁**。传输途中出现第二个非空块 0 时明确拒绝（`CAN CAN`），
+  而不是把它当成另一个补丁默默写进同一个暂存区。
+- **传输层失败不升格成 ERROR**：握手超时 / 重试耗尽 / 主机 CAN 都没有破坏已落盘的内容，
+  元数据里的 RECEIVING 记录仍然有效，主机重发即可续传。升格成 ERROR 会让 `fota status`
+  显示一个需要人工介入的终态（操作员会先去敲 `fota erase`），而实际上再试一次就行。
+  真正的 ERROR 只留给"已落盘内容不可信"那几种（Flash 编程失败、回读 CRC32 不符）。
+
+### 19.5 测试台
+
+**L5 跨实现台架**（`test_fota_ymodem_l5.py` + `harness/fota_ymodem_l5_harness.c`）：
+渲染真模板 → 主机 gcc 编译（真驱动 + vendored 解码器 + `mock_hal`）→ 喂
+`fota_ymodem_sender.py` 产生的字节 → 断言设备行为。编译带 `-Werror=div-by-zero`
+（陷阱 4 就是它抓到的）。
+
+14 个用例：
+
+| # | 用例 | # | 用例 |
+|---|---|---|---|
+| 1 | 握手与噪声免疫 | 8 | 容量准入不过 → 拒绝 |
+| 2 | 正常批次（1024 字节块） | 9 | 传输途中出现第二个文件头 → 拒绝 |
+| 3 | 正常批次（128 字节块 / SOH 路径） | 10 | 块超时 → NAK → 接着收 |
+| 4 | 重复块（ACK 丢失） | 11 | 握手超时（主机一直没开始）→ 退回 IDLE，**不是 ERROR** |
+| 5 | 块号错乱 → 重试耗尽 → 主动中止 | 12 | 主机不发结束块 → 仍算成功 |
+| 6 | 主机 `CAN CAN` 中止 | 13 | 收齐 → `fota_process` 应用 → 目标槽是新镜像 |
+| 7 | 块 0 声明长度与信封不符 → 拒绝 | 14 | 续传前缀不符 → fail-fast |
+
+**变异验证（收敛性是台架可信度的判据）**：M2（CRC 通过后重置重试计数）只红 case 5，
+M4（去掉前缀复核）只红 case 14，M5（重复块不回 ACK）只红 case 4 ——
+每条变异只打掉一个用例，说明用例彼此独立、没有靠"顺手覆盖"过关。
+
+**渲染层护栏**（`test_fota_ymodem.py`）盯的是"真源 → 宏"这一段：
+
+- 数值键 → 宏的**穷尽映射**（`_MACRO_MAP` + `_NOT_A_MACRO`）：真源里加一个键而模板没消费，
+  测试就红。漏一个键的后果是 C 里出现一个手写的字面量 —— 而它看起来完全正常。
+- 模板里**不许出现控制字节字面量**（只能经 `YMODEM_*` 宏）。
+- **窄化溢出检测**：抓 `(uint8_t)YMODEM_BLK_MODULUS` 那一类。⚠️ 扫描前必须先剥 C 注释，
+  否则模板注释里的反例（`(uint8_t)YMODEM_BLK_MODULUS`、`fota_crc16`）会把护栏自己绊倒。
+- **设备侧不得复用帧协议的 CRC**，且 check 值必须是标准值 `0x31C3`。
+
+**生成工程内的传输层单测**（`templates/test/test_fota_ymodem.c.j2` → `test/` 目录）：
+不靠 Python、不靠 vendored 解码器，`python run_tests.py` 就能跑 15 个用例。它的
+分工是"**字节怎么进来**的那一半" —— 握手 'C' 的节奏与上限、块号反码先于 CRC、
+**块尾必须是 CRC-16/XMODEM**、块 0 的文件名/长度解析、CAN 只在块边界且要连续两个、
+载荷里的 `0x18` 是数据、文件头之前来数据块/EOT/结束块各走哪条分支。
+另有两条不显眼但值钱的用例：①测试**自己的**两个 CRC 实现先过标准 KAT
+（`0x31C3` / `0x29B1`）—— 尺子先校准，否则"设备 ACK 了我造的块"只说明两边错得一样；
+②断言 `(uint8_t)YMODEM_BLK_MODULUS == 0`，把"回绕写成窄化 cast 会得到 0"这件事
+写在生成出来的工程里。
+
+**这一节的一次实测回归值得记住**：`drv_fota.c` 的 `fota_process()` 会调用
+`fota_ymodem_process()`，于是**已经存在的** `test_fota_protocol.c` 立刻
+`undefined reference to 'fota_ymodem_process'` —— 编译失败，而它的 pytest /
+L5 用例全绿（那些用例根本不生成、也不编译工程内的测试）。发现它的是
+`output/fota_demo/test/run_tests.py`（CI 的第 157 行也会跑同样的一步）。
+修法是让两个测试都 `#include` 进全部三个 FOTA 源文件，**不给替身**：
+给一个空桩就等于让"drv_fota 调用了不存在的实现"继续静默。
+⇒ 凡给某个生成源码**新增一个跨模块调用**，都要顺手跑一次受影响示例的
+`run_tests.py`，别只看 pytest 的颜色。
+
+### 19.6 实测数字（`output/fota_demo`）
+
+| 项 | 值 |
+|---|---|
+| `fota_demo.elf` | text 109552 / data 1120 / bss 30472 |
+| YMODEM 代码 | 2690 B（17 个函数，`nm` 逐个 text 求和） |
+| YMODEM 静态 RAM | `g_blk` 1029 B（`total_1024`）+ 少量标志位 |
+| `combined.bin` | 118868 B（bootloader + app）；`mhde_mainboard` 为 126192 B |
+
+`/tmp` 级的 RAM 代价（约 1 KB）是**必须的**：块最长 1029 B，去掉它就只能逐字节接收再
+拼块 —— 那样每来一个字节都要过一遍状态机，而 YMODEM 的块是原子的（校验在块尾，
+块内无法边收边判）。§14 第 2 条的 RAM 上限仍是 9 KB（见 §18.2 第 6 条）。
+
+### 19.7 下一步
+
+- **P4**（引导决策表 / 16 B 头部落地）。
+- **P5**（HIL 端到端）：`examples/fota_demo/` 就位，剩下真板 A→B 升级 + 回滚。
+  ⚠️ 主机 L5 全绿**不能**替代它 —— §18.2 与 `test-writing-guardrails` 记录的
+  A3/A9 类缺陷（两侧各自"正确"、mock 造出硅片上没有的东西）恰恰都是"主机全绿、真机没有"。
+  真机上至少要走一次：`fota ymodem` + Tera Term 实际发送（这才真正验证陷阱 1）。
+

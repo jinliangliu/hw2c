@@ -133,6 +133,9 @@ class ProjectIR(IRObject):
     # TAMP 元数据位域。同样由真源展开；模板里不得出现字面量 0xA5 / 1024。
     fota_transport: dict = field(default_factory=dict)
     fota_meta: dict = field(default_factory=dict)
+    # YMODEM 传输通道的控制字节 / 块长 / 握手时序。同一条接收链路的第二入口，
+    # 真源是 generator/data/ymodem_format.json；模板里不得出现字面量 0x43 / 128。
+    ymodem: dict = field(default_factory=dict)
 
     # ---------- EXTI ----------
     exti: ExtiIR = field(default_factory=ExtiIR)

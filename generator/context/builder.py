@@ -20,6 +20,7 @@ from .hal_context import compute_hal_sources
 from .bootloader_context import (build_boot_config, inject_bootloader_drivers,
                                    get_boot_led_pin, fota_format_for_templates,
                                    fota_delta_budget, fota_transport_for_templates,
+                                   ymodem_for_templates,
                                    fota_meta_for_templates)
 
 # Builder registry — auto-discovers all @register_builder classes
@@ -1040,6 +1041,10 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
         # 元数据布局需要 boot_config：页基址由 bootloader.size_kb 决定。
         fota_transport=fota_transport_for_templates(),
         fota_meta=fota_meta_for_templates(boot_config),
+        # YMODEM 传输层常量（同一条接收链路的第二条传输通道）。
+        # 它的控制字节与块长同样只能有一份定义：主机侧发送端、
+        # 设备侧接收器、两侧的测试都从 generator/data/ymodem_format.json 取。
+        ymodem=ymodem_for_templates(),
         has_iwdg=(has_bootloader or peri_result["has_iwdg"]),
         has_event_mgr=True,
         has_tickless=has_tickless,

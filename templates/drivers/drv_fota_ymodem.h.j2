@@ -1,0 +1,162 @@
+#ifndef __DRV_{{ peripheral.name | upper }}_H
+#define __DRV_{{ peripheral.name | upper }}_H
+
+/*
+ * FOTA 接收侧的第二条传输通道：**YMODEM**（batch 模式，CRC 握手）。
+ *
+ * 为什么要有它
+ * ------------
+ * `drv_fota` 的帧协议（`fota recv`）需要一个自研的主机侧发送端
+ * （`generator/fota_sender.py`）。这在 CI 与自动化里没问题，但它把操作员
+ * 绑在了那一个工具上：手边只有 Tera Term / SecureCRT / ExtraPuTTY / lrzsz
+ * 的场合，现场就没有干净的升级手段。YMODEM 是这些终端软件**全都内置**的
+ * 文件传输协议，于是"用任意终端软件升级"变成一个命令的事。
+ *
+ * 与帧协议的关系：**同一个接收链路的两种"字节怎么进来"**。收齐之后的
+ * 一切（准入、暂存、回读校验、提交 READY、应用）都走 `drv_fota.c` 里的
+ * 暂存会话层，一份实现。载荷也是同一串字节：`.h2cd` 补丁的**整条记录**
+ * （48 B 信封 + lite 流），一个字节不差。
+ *
+ * 三个不显然但必须记住的约束
+ * ------------------------
+ * ① **末块按块长补齐（0x1A），必须按块 0 声明的长度截断。**
+ *    YMODEM 的块长恒为 128 或 1024，与文件长度无关；最后一块的尾巴用
+ *    0x1A（CPMEOF）填满。不截断的话补丁尾部会多出一串 0x1A，
+ *    表现为"镜像解出来最后一段是坏的"，而所有块 CRC 都是对的。
+ *    这也是**本实现要求块 0 必须带长度字段**的原因 —— 协议允许省略它，
+ *    但那样接收方只能靠"去掉尾部 0x1A"去猜，而补丁正文里合法地存在 0x1A。
+ *
+ * ② **CRC-16/XMODEM（初值 0x0000），不是本仓库帧协议的 CRC-16/CCITT-FALSE
+ *    （初值 0xFFFF）。** 同一多项式、不同初值，'123456789' 分别得 0x31C3 与
+ *    0x29B1。复用 `fota_crc16()` 的后果很隐蔽：自研主机与设备之间**完全互通**
+ *    （两侧错得一样），但与所有真实 YMODEM 软件不通。所以本文件自己实现
+ *    `ym_crc16()`，并在 `generator/tests/test_fota_ymodem.py` 里用 stdlib
+ *    独立验算 + 标准 check 值钉住它。
+ *
+ * ③ **CAN（0x18）只在"等块起始字节"时才算中止信号。**
+ *    补丁正文是接近随机的字节流，一段 100 KB 的补丁按概率会出现若干个
+ *    0x18；若在块内也把连续两个 0x18 当中止，正常传输会被随机打断。
+ *    发送端的 CAN CAN 本来就发在块边界上，所以在块边界识别既不丢信号
+ *    也不误判。
+ *
+ * 边界替身（主机测试）
+ * ------------------
+ * 本文件**没有** `#ifdef TEST` 分支：主机侧跑的是同一份逻辑。它对外部的
+ * 全部依赖只有四个符号，测试提供替身即可：
+ *   · `cli_set_rx_sink` / `cli_rx_sink_active` / `cli_write_raw`（drv_cli）
+ *   · `HAL_GetTick`（mock_hal / 真 HAL）
+ * 其余一切（会话层、暂存、元数据、CRC）都来自 `drv_fota` 的真实现。
+ */
+
+#ifdef TEST
+#include "mock_hal.h"
+#else
+#include "stm32g0xx_hal.h"
+#endif
+
+#include <stdint.h>
+
+/* 会话层接口（`fota_session_*` / `fota_receive_ready` / `fota_transport_begin`）
+ * 与 `fota_transport_t` 都在这里。 */
+#include "drv_fota.h"
+
+/* ===========================================================================
+ * 协议常量 —— 全部由 generator/data/ymodem_format.json 派生
+ *
+ * 一个都不许写字面量：主机侧发送端（generator/fota_ymodem_sender.py）与
+ * 两侧的测试读的是同一份真源，模板里出现 `0x43` 就等于给"两侧各写一份"
+ * 留了门（A3 类缺陷的成因）。
+ * =========================================================================== */
+
+/* ---- 控制字节 ---- */
+#define YMODEM_CTL_SOH          {{ "0x%02XU" | format(ymodem.ctl_soh) }}   /* 128 B 块起始 */
+#define YMODEM_CTL_STX          {{ "0x%02XU" | format(ymodem.ctl_stx) }}   /* 1024 B 块起始 */
+#define YMODEM_CTL_EOT          {{ "0x%02XU" | format(ymodem.ctl_eot) }}   /* 发送结束 */
+#define YMODEM_CTL_ACK          {{ "0x%02XU" | format(ymodem.ctl_ack) }}
+#define YMODEM_CTL_NAK          {{ "0x%02XU" | format(ymodem.ctl_nak) }}
+#define YMODEM_CTL_CAN          {{ "0x%02XU" | format(ymodem.ctl_can) }}
+#define YMODEM_CTL_PAD          {{ "0x%02XU" | format(ymodem.ctl_pad) }}   /* 块尾补齐（末块截断的依据） */
+#define YMODEM_CTL_CRC_REQUEST  {{ "0x%02XU" | format(ymodem.ctl_crc_request) }}   /* 'C' */
+
+/* ---- 块结构 ---- */
+#define YMODEM_BLK_SIZE_SMALL   {{ ymodem.blk_size_128 }}U
+#define YMODEM_BLK_SIZE_LARGE   {{ ymodem.blk_size_1024 }}U
+#define YMODEM_BLK_OVERHEAD     {{ ymodem.blk_overhead }}U    /* 起始(1) + 块号(1) + 反码(1) + CRC(2) */
+#define YMODEM_BLK_MAX_FRAME    {{ ymodem.blk_max_frame }}U   /* 最长的一块（1K） */
+#define YMODEM_BLK_MODULUS      {{ ymodem.blk_number_modulus }}U
+#define YMODEM_BLK_COMPLEMENT   {{ ymodem.blk_complement_of }}U
+
+/* ---- 块尾校验 ---- */
+#define YMODEM_CRC_POLY         {{ "0x%04XU" | format(ymodem.crc_poly) }}
+#define YMODEM_CRC_INIT         {{ "0x%04XU" | format(ymodem.crc_init) }}
+
+/* ---- 块 0（文件头）---- */
+#define YMODEM_HDR_BLOCK_NO     {{ ymodem.hdr_block_number }}U
+#define YMODEM_HDR_MAX_NAME     {{ ymodem.hdr_max_name_len }}U
+/* 长度字段的进制。⚠️ 设备只实现了**十进制**的逐位解析（数字字符判 '0'..'9'），
+ * 所以 `ymodem_for_templates()` 会在生成期断言真源里的 radix 就是 10 ——
+ * 写成 16 会被生成期拒掉，而不是在设备上悄悄只认前几位数字。 */
+#define YMODEM_HDR_SIZE_RADIX   {{ ymodem.hdr_size_radix }}U
+
+/* ---- 结束块（载荷全 0 的块 0）---- */
+#define YMODEM_TERM_BLOCK_NO    {{ ymodem.term_block_number }}U
+
+/* ---- 握手与时序 ---- */
+#define YMODEM_HS_INTERVAL_MS       {{ ymodem.hs_interval_ms }}U
+#define YMODEM_HS_MAX_ATTEMPTS      {{ ymodem.hs_max_attempts }}U
+#define YMODEM_BLOCK_TIMEOUT_MS     {{ ymodem.hs_block_timeout_ms }}U
+#define YMODEM_NAK_MAX_RETRIES      {{ ymodem.hs_nak_max_retries }}U
+#define YMODEM_CAN_BEFORE_ABORT     {{ ymodem.hs_can_before_abort }}U
+#define YMODEM_EOT_NAK_BEFORE_ACK   {{ ymodem.hs_eot_nak_before_ack }}U
+#define YMODEM_TERMINATOR_TIMEOUT_MS {{ ymodem.hs_terminator_timeout_ms }}U
+
+/* 声明长度字段的合理性上界。
+ *
+ * ⚠️ 这**不是**准入规则 —— 真正决定"装不装得下"的是暂存会话层
+ * （`fota_session_open` 的整页准入公式），而且那一条用的是**信封里**的
+ * `new_size`/`patch_size`，不是这里这个声明值。这里只负责挡住"块 0 的长度
+ * 字段明显荒谬"（解析溢出、或主机发错文件），避免它在换算里产生回绕。
+ * 取两个槽里大的那个：记录必须能放进某个槽，超过它的声明一定不成立。 */
+#define YMODEM_MAX_DECLARED    \
+    ((FOTA_SLOT_A_SIZE > FOTA_SLOT_B_SIZE) ? FOTA_SLOT_A_SIZE : FOTA_SLOT_B_SIZE)
+
+/* ---- API ----------------------------------------------------------------- */
+
+/**
+ * @brief 进入 YMODEM 接收：接管 CLI 的 UART 字节流，开始 CRC 握手。
+ *
+ * 与 `fota_receive_begin()` 共用同一套"能不能进入接收"的判定
+ * （`fota_receive_ready`）—— READY / DONE 下暂存区里有一条已校验通过的补丁，
+ * 两个入口都不许把它静默丢掉。
+ *
+ * @param msg     失败时写入原因（可为 NULL）
+ * @param msg_len 缓冲区长度
+ * @return 0 已进入接收（'C' 已经发出）；非 0 = 拒绝，原因已写进 msg
+ */
+int fota_ymodem_begin(char *msg, uint32_t msg_len);
+
+/**
+ * @brief 由 `cli_task` 在接管状态下调用，喂入收到的字节。
+ * @note   在 CLI 任务上下文执行（不是 ISR）。内部不阻塞、不做 Flash 擦除 ——
+ *         擦写发生在会话层，而它由本层的调用时机决定（第一个数据块）。
+ */
+void fota_ymodem_rx_bytes(const uint8_t *data, uint16_t len);
+
+/**
+ * @brief 周期处理：握手 'C' 的重发、块超时、结束块超时。
+ *
+ * 由 `fota_process()` 在 `fota_transport_t == FOTA_TP_YMODEM` 期间调用
+ * （节拍 10 ms）。**不要**在帧协议生效期间调用它：两套超时都以
+ * `fota` 的活动时刻为基准，同时跑会让一次传输被另一套判定为"主机静默"。
+ */
+void fota_ymodem_process(void);
+
+/**
+ * @brief 最近一次块 0 声明的文件名。
+ *
+ * 只用于诊断（`fota status` 显示"收到的是哪个文件"）。**传输途中不得打印**
+ * 任何日志 —— 那些字节会被主机当成协议帧，把一次正常传输搅乱。
+ */
+const char *fota_ymodem_file_name(void);
+
+#endif /* __DRV_{{ peripheral.name | upper }}_H */

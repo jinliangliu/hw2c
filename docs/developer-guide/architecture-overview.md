@@ -12,7 +12,8 @@ hw2c
 │   ├── context_builder.py   # Template rendering context
 │   ├── models.py            # Pydantic type models
 │   ├── delta_tool.py        # H2CD delta build / repack / apply
-│   ├── fota_sender.py       # FOTA patch delivery
+│   ├── fota_sender.py       # FOTA patch delivery (H2C frame protocol)
+│   ├── fota_ymodem_sender.py # YMODEM byte plans (L5 harness + debugging)
 │   ├── patch_crc.py         # CRC metadata post-processing
 │   ├── allocators/          # Pin assignment engine
 │   ├── backends/            # MCU-specific backends (stm32)

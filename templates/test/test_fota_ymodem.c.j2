@@ -1,0 +1,736 @@
+/**
+ * @file    test_fota_ymodem.c
+ * @brief   YMODEM 传输通道的设备侧单测（drv_fota_ymodem.c）。
+ *
+ * 这个测试覆盖什么、不覆盖什么
+ * ---------------------------
+ * 覆盖**传输层自己就能断言**的那部分 —— 也就是两条传输通道真正不同的那一层：
+ *   · 握手：进入接收后立刻发 'C'、按周期重发、重发次数到上限后退回 IDLE；
+ *   · 块解析：块号 + 反码校验、**块尾 CRC-16/XMODEM**（不是帧协议的
+ *     CCITT-FALSE）、块 0 的文件名与十进制长度解析；
+ *   · 中止判据：CAN 只在**块边界**算中止、且要连续两个；单发一个只是噪声；
+ *     块**载荷里**的 0x18 是数据，不是中止信号；
+ *   · 收尾前的两个"拒绝"：没发文件就来 EOT、文件头之后立刻来结束块。
+ *
+ * **不覆盖**收齐之后的路径（准入、暂存几何、末块 0x1A 截断、EOT 两拍握手、
+ * 结束块、续传前缀复核、apply）。它们要么需要一份真信封（`fota_delta.c`
+ * 的解码器 + vendored 头，见下），要么需要一个能逐块构造完整批次的台架。
+ * 那部分在仓库侧用**真** drv_fota_ymodem.c 覆盖：
+ *
+ *     generator/tests/test_fota_ymodem_l5.py      （L5 跨实现台架，14 用例）
+ *     generator/tests/test_fota_ymodem.py         （渲染层：真源 → 宏）
+ *
+ * 本文件与那两处的分工是刻意的：这里测的是**离硬件最近、改动最频繁**的
+ * 那一层，而它在生成出来的每个工程里都跑得起来（`python run_tests.py`），
+ * 不需要仓库、不需要 Python 发送端。
+ *
+ * 桩只打在**外部边界**上
+ * --------------------
+ * `drv_fota_ymodem.c` 是原样 `#include` 进来的真源码（它没有 `#ifdef TEST`
+ * 分支）。替身只有下面这些，都是外部依赖，不是它自己的逻辑：
+ *   · CLI 字节流（cli_set_rx_sink / cli_rx_sink_active / cli_write_raw）
+ *   · 看门狗与故障原语（IWDG_Refresh / hw2c_fault_trap）
+ *   · 解码器与暂存校验（fota_delta_* / hw2c_safe_state）—— 一律做成**陷阱桩**：
+ *     一旦被调用就判失败。理由见下。
+ *
+ * 为什么解码器一律是陷阱桩（而不是"给个能用的返回值"）
+ * ------------------------------------------------
+ * 本文件的用例**故意**停在会话层之前：块 0 只解析文件名与长度，第一块数据
+ * 才 `fota_session_open()`。于是"有没有偷偷越过这条边界"本身就是一条断言 ——
+ * 任何一次 `fota_delta_parse_env()` 的调用都意味着某个用例已经走到了它没有
+ * 断言的路径上，那种情况下"绿"是假的。陷阱桩让那一刻立刻变红并说明原因。
+ * 这与 `test_fota_protocol.c` 里处理同一批符号的方式一致。
+ */
+#include "unity.h"
+#include "mock_hal.h"
+
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "drv_{{ cli_name }}.h"      /* cli_rx_sink_t */
+#include "drv_fota.h"                /* FOTA_STATE_* / FOTA_E_* / FOTA_ENV_SIZE */
+#include "drv_fota_ymodem.h"         /* YMODEM_* 常量与 API */
+
+/* ===========================================================================
+ * 外部边界的替身
+ * =========================================================================== */
+
+/* ---- CLI 字节流 ----------------------------------------------------------
+ * 与 `test_fota_protocol.c` 里的同名替身有一处**关键差别**：这里必须
+ * **累积**写入的字节，不能只记最后一次。设备对 YMODEM 的应答是 1 个字节
+ * （'C' / ACK / NAK），中止是 2 个字节（CAN CAN），而"发了几次 'C'"
+ * 正是握手用例的断言对象 —— 只记最后一次的话，任何计数断言都恒等于 1。 */
+#define OUT_MAX   24U
+static uint8_t  g_out[OUT_MAX];
+static uint16_t g_out_len = 0U;
+static cli_rx_sink_t g_sink = NULL;
+static uint32_t g_fault_traps = 0U;
+
+void cli_set_rx_sink(cli_rx_sink_t sink)      { g_sink = sink; }
+uint8_t cli_rx_sink_active(void)              { return (g_sink != NULL) ? 1U : 0U; }
+void cli_write_raw(const uint8_t *data, uint16_t len)
+{
+    uint16_t i;
+
+    if (data == NULL) {
+        return;
+    }
+    for (i = 0U; i < len; i++) {
+        if (g_out_len < OUT_MAX) {
+            g_out[g_out_len] = data[i];
+            g_out_len++;
+        }
+    }
+}
+
+/* ---- 看门狗 / 故障原语 ---- */
+void IWDG_Refresh(void)                 { /* 单测里不喂狗 */ }
+void hw2c_fault_trap(uint32_t code)     { (void)code; g_fault_traps++; }
+
+/* ---- 解码器与暂存校验：陷阱桩（见文件头）---- */
+static uint32_t g_env_traps = 0U;
+
+int fota_delta_parse_env(uint32_t (*patch_read)(void *, uint8_t *, uint32_t),
+                         void *ctx, fota_delta_env_t *out)
+{
+    (void)patch_read; (void)ctx; (void)out;
+    g_env_traps++;
+    TEST_FAIL_MESSAGE("the session layer was reached: this unit must not open a "
+                      "staging session (see test file header)");
+    return FOTA_DELTA_E_ARG;
+}
+uint32_t fota_delta_crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
+{
+    (void)data; (void)len;
+    TEST_FAIL_MESSAGE("fota_delta_crc32_update is stubbed: this unit must not "
+                      "reach the staging-verify path (see test file header)");
+    return crc;
+}
+int fota_delta_apply(const fota_delta_env_t *env,
+                     const fota_delta_backend_t *io,
+                     uint32_t src_slot, uint32_t dst_slot, uint32_t dst_size,
+                     int *out_err)
+{
+    (void)env; (void)io; (void)src_slot; (void)dst_slot; (void)dst_size;
+    if (out_err != NULL) { *out_err = FOTA_DELTA_E_ARG; }
+    TEST_FAIL_MESSAGE("fota_delta_apply is stubbed: this unit must not reach the "
+                      "apply path (see test file header)");
+    return FOTA_DELTA_E_ARG;
+}
+void hw2c_safe_state(void)
+{
+    TEST_FAIL_MESSAGE("hw2c_safe_state is stubbed: this unit must not reach the "
+                      "apply path (see test file header)");
+}
+
+/* ===========================================================================
+ * 被测源码（原样引入，允许直接调用其 static 函数）
+ *
+ * 三个 .c 都是**产品代码本身**：会话层与元数据由 `drv_fota` 调用，缺一个
+ * 就链接不起来（而"生成一个链接不起来的测试"正是本仓库踩过的坑）。
+ * =========================================================================== */
+#include "../src/drivers/drv_fota_meta.c"
+#include "../src/drivers/drv_fota.c"
+#include "../src/drivers/drv_fota_ymodem.c"
+
+/* ===========================================================================
+ * 测试侧的**独立**CRC 实现
+ *
+ * ⚠️ 这两个函数是本测试的**判据来源**，不是被测对象：它们只用来**构造**
+ * 喂给设备的块。设备算得对不对由"设备是否 ACK 我构造的块"来判定 ——
+ * 也就是说判据必须来自被测代码之外。
+ *
+ * 两者的正确性由 `test_crc_helpers_match_the_standard_kat` 用**标准 KAT**
+ * 钉住（'123456789' → XMODEM 0x31C3 / CCITT-FALSE 0x29B1）。先证明尺子是准的，
+ * 再拿它去量东西 —— 否则"设备 ACK 了我造的块"只说明两边错得一样。
+ *
+ * 为什么帧协议那个 CCITT-FALSE 也要在这里实现一份：**用它构造出来的块必须
+ * 被设备 NAK**。这是本文件里最值钱的一条断言 —— 它把"设备误用
+ * `fota_crc16()`"这个缺陷钉死在离作者最近的地方。
+ * =========================================================================== */
+
+static uint16_t crc16_generic(const uint8_t *data, uint16_t len, uint16_t init)
+{
+    uint16_t crc = init;
+    uint16_t i;
+    uint8_t  bit;
+
+    for (i = 0U; i < len; i++) {
+        crc = (uint16_t)(crc ^ (uint16_t)((uint16_t)data[i] << 8));
+        for (bit = 0U; bit < 8U; bit++) {
+            if ((crc & 0x8000U) != 0U) {
+                crc = (uint16_t)((uint16_t)(crc << 1) ^ 0x1021U);
+            } else {
+                crc = (uint16_t)(crc << 1);
+            }
+        }
+    }
+    return crc;
+}
+
+#define TEST_CRC_XMODEM_INIT      0x0000U
+#define TEST_CRC_CCITT_FALSE_INIT 0xFFFFU
+
+static uint16_t test_crc_xmodem(const uint8_t *data, uint16_t len)
+{
+    return crc16_generic(data, len, (uint16_t)TEST_CRC_XMODEM_INIT);
+}
+static uint16_t test_crc_ccitt_false(const uint8_t *data, uint16_t len)
+{
+    return crc16_generic(data, len, (uint16_t)TEST_CRC_CCITT_FALSE_INIT);
+}
+
+/* ===========================================================================
+ * 组块与喂块
+ * =========================================================================== */
+
+#define TX_MAX  (YMODEM_BLK_MAX_FRAME + 1U)
+static uint8_t  g_tx[TX_MAX];
+static uint16_t g_tx_len = 0U;
+
+static void out_reset(void)  { g_out_len = 0U; }
+static uint8_t out_at(uint16_t i)
+{
+    return (i < g_out_len) ? g_out[i] : 0U;
+}
+static uint8_t out_last(void)
+{
+    return (g_out_len > 0U) ? g_out[g_out_len - 1U] : 0U;
+}
+static void feed_tx(void)
+{
+    fota_ymodem_rx_bytes(g_tx, g_tx_len);
+}
+
+/**
+ * 组一个块：`[起始][块号][255-块号][载荷][crc_hi][crc_lo]`。
+ *
+ * @param kind   起始字节（SOH / STX）
+ * @param blk_no 块号
+ * @param crc    块尾 CRC 的值 —— **由调用方算好并传进来**，因为"用哪个
+ *               算法的 CRC"正是几个用例的自变量（XMODEM vs CCITT-FALSE）。
+ * @param bad_complement 非 0 = 故意把反码字节写坏（测块号自身的校验）
+ */
+static void build_block(uint8_t kind, uint8_t blk_no, uint16_t crc,
+                        uint8_t bad_complement)
+{
+    uint16_t plen = (kind == (uint8_t)YMODEM_CTL_SOH)
+                    ? (uint16_t)YMODEM_BLK_SIZE_SMALL
+                    : (uint16_t)YMODEM_BLK_SIZE_LARGE;
+    uint8_t complement = (uint8_t)(YMODEM_BLK_COMPLEMENT - blk_no);
+    uint16_t i;
+
+    g_tx_len = 0U;
+    g_tx[g_tx_len] = kind;              g_tx_len++;
+    g_tx[g_tx_len] = blk_no;            g_tx_len++;
+    g_tx[g_tx_len] = bad_complement ? (uint8_t)(complement ^ 0x01U) : complement;
+    g_tx_len++;
+    /* 载荷由调用方在这个偏移上先填好（见 fill_payload()）。 */
+    for (i = 0U; i < plen; i++) {
+        g_tx_len++;                     /* 占位：载荷已经在 g_tx[3..] 上 */
+    }
+    g_tx[g_tx_len] = (uint8_t)((crc >> 8) & 0xFFU);  g_tx_len++;
+    g_tx[g_tx_len] = (uint8_t)(crc & 0xFFU);         g_tx_len++;
+}
+
+/**
+ * 把块 0 的载荷摆好：`<文件名> NUL <十进制长度> NUL 补齐`。
+ *
+ * 长度按真源声明的进制逐位写出（不写字面量 10）—— 设备侧解析用的也是那个
+ * 宏，"两侧各写一个 10"正是这个仓库在别处踩过的形状。
+ *
+ * @return 载荷长度（= 块长，YMODEM 的块恒为定长）
+ */
+static uint16_t fill_header_payload(uint8_t kind, const char *name, uint32_t size)
+{
+    uint16_t plen = (kind == (uint8_t)YMODEM_CTL_SOH)
+                    ? (uint16_t)YMODEM_BLK_SIZE_SMALL
+                    : (uint16_t)YMODEM_BLK_SIZE_LARGE;
+    uint16_t i = 0U;
+    uint8_t  digits[16];
+    uint8_t  n = 0U;
+    uint32_t v = size;
+
+    memset(&g_tx[3], 0, (size_t)plen);   /* 补 0（不是 0x1A：块 0 的补齐字节无规定） */
+
+    while ((name[i] != '\0') && (i < (uint16_t)(YMODEM_HDR_MAX_NAME - 2U))) {
+        g_tx[3U + i] = (uint8_t)name[i];
+        i++;
+    }
+    g_tx[3U + i] = 0U;                   /* 文件名的 NUL 终止 */
+    i++;
+
+    do {
+        digits[n] = (uint8_t)((v % (uint32_t)YMODEM_HDR_SIZE_RADIX) + (uint32_t)'0');
+        v /= (uint32_t)YMODEM_HDR_SIZE_RADIX;
+        n++;
+    } while ((v != 0U) && (n < (uint8_t)sizeof(digits)));
+
+    while (n > 0U) {
+        n--;
+        g_tx[3U + i] = digits[n];
+        i++;
+    }
+    g_tx[3U + i] = 0U;                   /* 长度字段的 NUL 终止 */
+    return plen;
+}
+
+static uint16_t payload_crc(uint16_t plen, uint8_t use_ccitt_false)
+{
+    return use_ccitt_false ? test_crc_ccitt_false(&g_tx[3], plen)
+                           : test_crc_xmodem(&g_tx[3], plen);
+}
+
+/* ===========================================================================
+ * 夹具
+ * =========================================================================== */
+
+void setUp(void)
+{
+    /* 冷启动：寄存器清零、整片 Flash 回到 0xFF、tick 归零。
+     * 都是真机上的**合法初始状态**，不是测试特权。 */
+    mock_cmsis_reset();
+    mock_flash_reset();
+    mock_tick_reset();
+
+    g_sink = NULL;
+    g_out_len = 0U;
+    g_tx_len  = 0U;
+    g_fault_traps = 0U;
+    g_env_traps   = 0U;
+
+    fota_init();
+}
+
+void tearDown(void) {}
+
+/* 进入接收态（所有块级用例的前置）。返回 begin 的结果，便于断言。 */
+static int enter_receive(void)
+{
+    char msg[24] = { 0 };
+
+    memset(msg, 0, sizeof(msg));
+    return fota_ymodem_begin(msg, sizeof(msg));
+}
+
+/* ===========================================================================
+ * 常量与判据尺子
+ * =========================================================================== */
+
+/**
+ * 尺子先校准：本测试用的两个 CRC 实现必须给出**标准**的 check 值。
+ *
+ * ⚠️ 判据是标准，不是"另一侧的实现也这么算"。若这里写错，后面所有"设备
+ * ACK/NAK 了我造的块"的结论都不成立（两边错得一样时它们照样是绿的）。
+ */
+void test_crc_helpers_match_the_standard_kat(void)
+{
+    static const uint8_t kat[9] = { '1', '2', '3', '4', '5', '6', '7', '8', '9' };
+
+    TEST_ASSERT_EQUAL_HEX16(0x31C3U, test_crc_xmodem(kat, 9U));
+    TEST_ASSERT_EQUAL_HEX16(0x29B1U, test_crc_ccitt_false(kat, 9U));
+    /* 两者同多项式、不同初值 —— 差值必须真的存在，否则"用错初值"这件事
+     * 在本文件里就无法被区分。 */
+    TEST_ASSERT_TRUE(test_crc_xmodem(kat, 9U) != test_crc_ccitt_false(kat, 9U));
+}
+
+/**
+ * 控制字节必须就是**标准**规定的那几个值。
+ *
+ * 这几行看着像"把真源抄一遍"，但它们判的是**标准**：真源（以及由它渲染出的
+ * `YMODEM_*` 宏）改了之后，这里会红 —— 而这类改动的后果是"设备只跟自研主机
+ * 通、跟 Tera Term / lrzsz 全不通"，自测里永远不会自己浮现。
+ */
+void test_control_bytes_follow_the_standard(void)
+{
+    TEST_ASSERT_EQUAL_HEX8(0x01U, (uint8_t)YMODEM_CTL_SOH);
+    TEST_ASSERT_EQUAL_HEX8(0x02U, (uint8_t)YMODEM_CTL_STX);
+    TEST_ASSERT_EQUAL_HEX8(0x04U, (uint8_t)YMODEM_CTL_EOT);
+    TEST_ASSERT_EQUAL_HEX8(0x06U, (uint8_t)YMODEM_CTL_ACK);
+    TEST_ASSERT_EQUAL_HEX8(0x15U, (uint8_t)YMODEM_CTL_NAK);
+    TEST_ASSERT_EQUAL_HEX8(0x18U, (uint8_t)YMODEM_CTL_CAN);
+    TEST_ASSERT_EQUAL_HEX8(0x1AU, (uint8_t)YMODEM_CTL_PAD);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)'C', (uint8_t)YMODEM_CTL_CRC_REQUEST);
+
+    /* 分派前提：字节流里没有位置信息，去向只能由起始字节决定，所以
+     * SOH/STX/EOT 三者必须互不相等（撞车 = "结束"被当成"块开始了"）。 */
+    TEST_ASSERT_TRUE(YMODEM_CTL_SOH != YMODEM_CTL_STX);
+    TEST_ASSERT_TRUE(YMODEM_CTL_SOH != YMODEM_CTL_EOT);
+    TEST_ASSERT_TRUE(YMODEM_CTL_STX != YMODEM_CTL_EOT);
+}
+
+void test_block_buffer_is_exactly_the_largest_block(void)
+{
+    /* 单块缓冲的开销公式：起始(1) + 块号(1) + 反码(1) + CRC(2)。 */
+    TEST_ASSERT_EQUAL_UINT(5U, (unsigned)YMODEM_BLK_OVERHEAD);
+    TEST_ASSERT_EQUAL_UINT((unsigned)YMODEM_BLK_SIZE_LARGE + 5U,
+                           (unsigned)YMODEM_BLK_MAX_FRAME);
+    /* 最长的一块（1029 B）必须真的放得下 —— 这是本通道唯一的 RAM 代价。 */
+    TEST_ASSERT_EQUAL_UINT((unsigned)YMODEM_BLK_MAX_FRAME, (unsigned)sizeof(g_blk));
+}
+
+/**
+ * 块号回绕的**毒性**：模数不能经 `uint8_t` 截断。
+ *
+ * `g_expect_blk` 的回绕写成 `(uint8_t)YMODEM_BLK_MODULUS` 会得到 0 ——
+ * 编译期能报 `-Wdiv-by-zero`，但那只是警告；一份把警告当噪音的构建会带着
+ * 它上板，而真机上的表现是 HardFault（不是"传输失败"）。所以这个 cast 的
+ * 后果在这里被显式钉住：模数必须大于 255 才需要 32 位回绕。
+ */
+void test_the_block_number_modulus_does_not_survive_a_narrowing_cast(void)
+{
+    TEST_ASSERT_TRUE(YMODEM_BLK_MODULUS > 255U);
+    TEST_ASSERT_EQUAL_UINT(0U, (unsigned)((uint8_t)YMODEM_BLK_MODULUS));
+    /* 反码字节的基准值（块号 + 反码 == 255）。 */
+    TEST_ASSERT_EQUAL_UINT(255U, (unsigned)YMODEM_BLK_COMPLEMENT);
+}
+
+/* ===========================================================================
+ * 握手
+ * =========================================================================== */
+
+void test_begin_sends_one_crc_request_and_takes_over_the_uart(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+
+    /* 接管必须发生在第一个 'C' **之前**：否则主机在 'C' 到达之前按自己的
+     * 节奏发出的块 0，一个字节都进不来。 */
+    TEST_ASSERT_EQUAL_UINT8(1U, cli_rx_sink_active());
+    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CRC_REQUEST, out_at(0U));
+
+    /* 还没有任何字节落盘，所以状态机仍是 IDLE —— 会话在第一块数据才打开
+     * （准入要等信封）。这里钉住的是"没有过早宣称在接收"。 */
+    TEST_ASSERT_EQUAL_INT(FOTA_STATE_IDLE, (int)fota_get_state());
+}
+
+void test_process_does_not_resend_the_crc_request_early(void)
+{
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    mock_tick_advance((uint32_t)YMODEM_HS_INTERVAL_MS - 1U);
+    fota_process();
+    TEST_ASSERT_EQUAL_UINT16(0U, g_out_len);   /* 间隔没到，一个字都不发 */
+
+    mock_tick_advance(1U);
+    fota_process();
+    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CRC_REQUEST, out_at(0U));
+}
+
+/**
+ * 握手超时必须是"退回 IDLE"，**不是 ERROR**。
+ *
+ * 什么都没发生时把它升格成需要人工介入的终态，会让操作员先去敲 `fota erase`
+ * （擦掉整个目标槽），而实际上再敲一次命令就行。这条断言同时覆盖了
+ * `fota_process()` 的**传输分派**：YMODEM 期间不该走帧协议那条空闲超时路径。
+ */
+void test_handshake_timeout_returns_the_uart_as_idle_not_error(void)
+{
+    uint32_t i;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    /* ⚠️ 这里**不**重置输出累积：本用例要断言的是"整场握手总共尝试了几次"，
+     * 而第一次是在 `fota_ymodem_begin()` 里立刻发出的（操作员刚敲完命令就在
+     * 等这个信号），其余按周期重发。重置掉的话就只数得到重发次数，
+     * 而"上限"约束的是**总数**。 */
+
+    for (i = 0U; i < (uint32_t)YMODEM_HS_MAX_ATTEMPTS + 2U; i++) {
+        mock_tick_advance((uint32_t)YMODEM_HS_INTERVAL_MS);
+        fota_process();
+    }
+
+    /* 发满上限即放弃，且一次都不多发。 */
+    TEST_ASSERT_EQUAL_UINT16((uint16_t)YMODEM_HS_MAX_ATTEMPTS, g_out_len);
+    for (i = 0U; i < (uint32_t)g_out_len; i++) {
+        TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CRC_REQUEST, out_at((uint16_t)i));
+    }
+
+    TEST_ASSERT_EQUAL_UINT8(0U, cli_rx_sink_active());   /* UART 交还 CLI */
+    TEST_ASSERT_EQUAL_INT(FOTA_STATE_IDLE, (int)fota_get_state());
+    TEST_ASSERT_NOT_EQUAL(FOTA_STATE_ERROR, (int)fota_get_state());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_IO, fota_get_last_error());
+
+    /* 放弃时不该有任何"暂存层"的动作：一次握手超时没有碰过 Flash。 */
+    TEST_ASSERT_EQUAL_UINT32(0U, g_env_traps);
+}
+
+/* ===========================================================================
+ * 块 0：文件名与长度
+ * =========================================================================== */
+
+void test_header_block_with_an_xmodem_crc_is_acked_and_parsed(void)
+{
+    static const char name[] = "fota_demo.h2cd";
+    uint16_t plen;
+    uint16_t crc;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    plen = fill_header_payload((uint8_t)YMODEM_CTL_SOH, name, 4096U);
+    crc  = payload_crc(plen, 0U);
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO, crc, 0U);
+    feed_tx();
+
+    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+
+    /* 文件名与声明长度都要被真的解析出来：文件名是操作员的诊断信息
+     * （"是不是选错了文件"），声明长度是末块截断与长度交叉核对的依据。 */
+    TEST_ASSERT_EQUAL_STRING(name, fota_ymodem_file_name());
+    TEST_ASSERT_EQUAL_UINT32(4096U, g_declared);
+    TEST_ASSERT_EQUAL_UINT8(1U, g_expect_blk);      /* 下一块是数据块 1 */
+}
+
+/**
+ * 同一个块，只把 CRC 换成帧协议的 CCITT-FALSE 初值 —— 必须被 **NAK**。
+ *
+ * 这是本文件里最值钱的一条：它把"设备图省事复用了 `fota_crc16()`"这个缺陷
+ * 钉在离作者最近的地方。那个缺陷的可怕之处在于**自测永远是绿的** ——
+ * 自研主机与设备两侧错得一样，互通无碍；只有 Tera Term / lrzsz 会失败，
+ * 而在 CI 里没有它们的代言人。判据因此必须是标准（见 KAT 用例）。
+ */
+void test_the_same_block_with_a_ccitt_false_crc_is_naked(void)
+{
+    static const char name[] = "fota_demo.h2cd";
+    uint16_t plen;
+    uint16_t crc_x;
+    uint16_t crc_c;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    plen  = fill_header_payload((uint8_t)YMODEM_CTL_SOH, name, 4096U);
+    crc_x = payload_crc(plen, 0U);
+    crc_c = payload_crc(plen, 1U);
+    /* 前提：两个初值对同一段载荷确实给出不同的 CRC（否则这条用例在
+     * 检验一个不存在的东西）。 */
+    TEST_ASSERT_TRUE(crc_x != crc_c);
+
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO, crc_c, 0U);
+    feed_tx();
+
+    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_NAK, out_last());
+
+    /* 被 NAK 的块**不得**被解析：文件名与声明长度都不能变。 */
+    TEST_ASSERT_EQUAL_STRING("", fota_ymodem_file_name());
+    TEST_ASSERT_EQUAL_UINT32(0U, g_declared);
+}
+
+/**
+ * 块号自身的反码校验必须**先于** CRC 生效。
+ *
+ * 反码不对说明块号本身不可信；继续拿它去做去重判断只会得出无意义的结论
+ * （最坏的情况：块号被打坏成"上一个块"，于是一个新块被当成重复块 ACK 掉，
+ * 传输从此停滞而双方都以为一切正常）。
+ */
+void test_a_broken_block_complement_is_naked_even_with_a_good_crc(void)
+{
+    static const char name[] = "fota_demo.h2cd";
+    uint16_t plen;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    plen = fill_header_payload((uint8_t)YMODEM_CTL_SOH, name, 4096U);
+    /* CRC 是正确的（覆盖载荷），坏的只有块号的反码字节。 */
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO,
+                payload_crc(plen, 0U), 1U);
+    feed_tx();
+
+    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_NAK, out_last());
+    TEST_ASSERT_EQUAL_UINT32(0U, g_declared);
+}
+
+void test_a_data_block_before_the_header_is_naked(void)
+{
+    uint16_t plen;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    /* 还没收到块 0 就来了数据块 1：期望序号是 0（文件头），所以序号不符。
+     * 这里走的是"序号检查"，不是"内容检查" —— §5 里那个
+     * `blk_no != g_expect_blk` 分支。 */
+    memset(&g_tx[3], (int)0xA5, (size_t)YMODEM_BLK_SIZE_SMALL);
+    plen = (uint16_t)YMODEM_BLK_SIZE_SMALL;
+    build_block((uint8_t)YMODEM_CTL_SOH, 1U, payload_crc(plen, 0U), 0U);
+    feed_tx();
+
+    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_NAK, out_last());
+    TEST_ASSERT_EQUAL_UINT16(1U, g_retry);         /* NAK 计了一次失败 */
+}
+
+/**
+ * 重发的块 0 = "上一个 ACK 丢了"，要**再 ACK 一次但不重复处理**。
+ *
+ * 丢弃（既不 ACK 也不 NAK）会让主机一直等不到应答、重发到超时；
+ * 再处理一次则会把同一个文件头解析两遍（这里无害，但对数据块就是"写两遍"）。
+ */
+void test_a_repeated_header_block_is_acked_as_a_duplicate(void)
+{
+    static const char name[] = "fota_demo.h2cd";
+    uint16_t plen;
+    uint16_t crc;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    plen = fill_header_payload((uint8_t)YMODEM_CTL_SOH, name, 4096U);
+    crc  = payload_crc(plen, 0U);
+
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO, crc, 0U);
+    feed_tx();
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+
+    /* 原样再发一次。 */
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO, crc, 0U);
+    feed_tx();
+
+    TEST_ASSERT_EQUAL_UINT16(2U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+    TEST_ASSERT_EQUAL_UINT8(1U, g_expect_blk);     /* 没有前进两次 */
+    TEST_ASSERT_EQUAL_UINT32(4096U, g_declared);
+    TEST_ASSERT_EQUAL_UINT32(0U, g_delivered);
+}
+
+/* ===========================================================================
+ * 中止判据
+ * =========================================================================== */
+
+/**
+ * 结束块（载荷全 0 的块 0）在"还没发文件"时到达 = 操作员在终端里按了取消。
+ * 先 ACK 掉让主机的批处理干净收尾，再本地放弃。
+ */
+void test_an_end_block_after_the_header_aborts_the_batch(void)
+{
+    static const char name[] = "fota_demo.h2cd";
+    uint16_t plen;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+
+    plen = fill_header_payload((uint8_t)YMODEM_CTL_SOH, name, 4096U);
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO,
+                payload_crc(plen, 0U), 0U);
+    feed_tx();
+    out_reset();
+
+    /* 全零载荷的块 0。 */
+    memset(&g_tx[3], 0, (size_t)YMODEM_BLK_SIZE_SMALL);
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_TERM_BLOCK_NO,
+                payload_crc((uint16_t)YMODEM_BLK_SIZE_SMALL, 0U), 0U);
+    feed_tx();
+
+    /* 先 ACK（让主机收尾），再 CAN CAN（告知对方我们这边放弃了）。 */
+    TEST_ASSERT_EQUAL_UINT16(3U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_at(0U));
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CAN, out_at(1U));
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CAN, out_at(2U));
+
+    TEST_ASSERT_EQUAL_UINT8(0U, cli_rx_sink_active());
+    TEST_ASSERT_EQUAL_INT(FOTA_STATE_IDLE, (int)fota_get_state());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_ABORTED, fota_get_last_error());
+}
+
+/**
+ * 单个 CAN 只是噪声；**块边界上连续两个**才是中止。
+ *
+ * 这个不对称是必要的：发送端在块边界发 CAN CAN，而补丁正文里的 0x18 是数据。
+ */
+void test_one_can_is_noise_but_two_at_a_block_boundary_abort(void)
+{
+    static const uint8_t one_can[1] = { 0x18U };
+    static const uint8_t two_can[2] = { 0x18U, 0x18U };
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    fota_ymodem_rx_bytes(one_can, 1U);
+    TEST_ASSERT_EQUAL_UINT16(0U, g_out_len);       /* 一个 CAN：没有任何应答 */
+    TEST_ASSERT_EQUAL_UINT8(1U, cli_rx_sink_active());
+
+    /* 一个 CAN 之后是正常的流，链接仍然是活的。 */
+    {
+        static const char name[] = "fota_demo.h2cd";
+        uint16_t plen = fill_header_payload((uint8_t)YMODEM_CTL_SOH, name, 4096U);
+        build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO,
+                    payload_crc(plen, 0U), 0U);
+        feed_tx();
+    }
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+    out_reset();
+
+    fota_ymodem_rx_bytes(two_can, 2U);
+    TEST_ASSERT_EQUAL_UINT16(2U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CAN, out_at(0U));
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_CAN, out_at(1U));
+    TEST_ASSERT_EQUAL_UINT8(0U, cli_rx_sink_active());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_ABORTED, fota_get_last_error());
+}
+
+/**
+ * **块载荷里的 0x18 是数据，不是中止信号。**
+ *
+ * 一段接近随机的补丁里按概率会出现若干个 0x18；若在块内也把连续两个当中止，
+ * 正常传输会被随机数据打断（而且只在某些补丁上偶发 —— 最难查的一类）。
+ * 这里用"文件名里含 0x18 0x18 的文件头块必须被正常 ACK"来钉住它。
+ */
+void test_can_bytes_inside_a_block_are_payload_not_an_abort(void)
+{
+    /* 文件名里放两个 0x18。用字符串字面量拼接（而不是 `"\x18b"`）是必须的：
+     * C 的 \x 转义会吃尽可能多的十六进制位，`"\x18b"` 会被解析成一个越界的
+     * 转义序列，而不是"0x18 后跟 'b'"。 */
+    static const char name[] = "a" "\x18" "\x18" "b.h2cd";
+    uint16_t plen;
+
+    TEST_ASSERT_EQUAL_INT(0, enter_receive());
+    out_reset();
+
+    plen = fill_header_payload((uint8_t)YMODEM_CTL_SOH, name, 4096U);
+    build_block((uint8_t)YMODEM_CTL_SOH, (uint8_t)YMODEM_HDR_BLOCK_NO,
+                payload_crc(plen, 0U), 0U);
+    feed_tx();
+
+    TEST_ASSERT_EQUAL_UINT16(1U, g_out_len);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)YMODEM_CTL_ACK, out_last());
+    TEST_ASSERT_EQUAL_STRING(name, fota_ymodem_file_name());
+    TEST_ASSERT_EQUAL_UINT8(1U, cli_rx_sink_active());
+    TEST_ASSERT_EQUAL_INT(FOTA_E_NONE, fota_get_last_error());
+    TEST_ASSERT_EQUAL_UINT32(0U, g_fault_traps);
+}
+
+/* ===========================================================================
+ * 运行器
+ * =========================================================================== */
+
+int main(void)
+{
+    UNITY_BEGIN();
+
+    RUN_TEST(test_crc_helpers_match_the_standard_kat);
+    RUN_TEST(test_control_bytes_follow_the_standard);
+    RUN_TEST(test_block_buffer_is_exactly_the_largest_block);
+    RUN_TEST(test_the_block_number_modulus_does_not_survive_a_narrowing_cast);
+
+    RUN_TEST(test_begin_sends_one_crc_request_and_takes_over_the_uart);
+    RUN_TEST(test_process_does_not_resend_the_crc_request_early);
+    RUN_TEST(test_handshake_timeout_returns_the_uart_as_idle_not_error);
+
+    RUN_TEST(test_header_block_with_an_xmodem_crc_is_acked_and_parsed);
+    RUN_TEST(test_the_same_block_with_a_ccitt_false_crc_is_naked);
+    RUN_TEST(test_a_broken_block_complement_is_naked_even_with_a_good_crc);
+    RUN_TEST(test_a_data_block_before_the_header_is_naked);
+    RUN_TEST(test_a_repeated_header_block_is_acked_as_a_duplicate);
+
+    RUN_TEST(test_an_end_block_after_the_header_aborts_the_batch);
+    RUN_TEST(test_one_can_is_noise_but_two_at_a_block_boundary_abort);
+    RUN_TEST(test_can_bytes_inside_a_block_are_payload_not_an_abort);
+
+    return UNITY_END();
+}

@@ -1,0 +1,172 @@
+{
+  "_comment": [
+    "YMODEM 传输层格式的唯一真源。",
+    "",
+    "为什么 YMODEM 的值也要放进真源（它明明是个『标准』）",
+    "--------------------------------------------------",
+    "『标准』不等于『不会写错』。YMODEM 的每一个字节都有两个以上互不相同的",
+    "历史变体，而其中最贵的一个恰好与本仓库已有的实现撞名：",
+    "",
+    "  本仓库 `fota_format.json` 的 transport 段用的是 **CRC-16/CCITT-FALSE**",
+    "  （初值 0xFFFF，'123456789' → 0x29B1），而 YMODEM 规定的是",
+    "  **CRC-16/XMODEM**（初值 0x0000，'123456789' → 0x31C3）。",
+    "  同一多项式、不同初值。若设备侧图省事复用 `fota_crc16()`，",
+    "  『自研主机 ↔ 设备』之间**完全互通**（两侧错得一样），",
+    "  但 Tera Term / lrzsz sb / ExtraPuTTY **一个都连不上**。",
+    "  这类『自己能跟自己说话、跟全世界说不通』的缺陷不会在自测里暴露，",
+    "  所以本文件把 check 值写死，测试拿它当 KAT —— 判据是**标准**，",
+    "  不是『另一侧的实现也这么算』。",
+    "",
+    "取值来源：Chuck Forsberg, \"X/Y/ZMODEM Protocol Reference\"（YMODEM batch 章）",
+    "与 lrzsz 的 sb/rz 行为。凡是『标准没规定死、实现之间会分歧』的地方",
+    "（例如 EOT 的握手拍数），一律**显式写成可配置项并注明分歧**，",
+    "而不是在 C 里埋一个字面量。"
+  ],
+
+  "standard": {
+    "name": "YMODEM (batch mode, CRC handshake)",
+    "spec": "Chuck Forsberg, X/Y/ZMODEM Protocol Reference, YMODEM Batch 章",
+    "reference_implementations": [
+      "lrzsz sb / sx（-b 批模式）",
+      "Tera Term Pro（File > Transfer > YMODEM > Send）",
+      "ExtraPuTTY（YMODEM send）"
+    ],
+    "note": [
+      "本实现是**接收侧**（设备），对应主机上的 `sb` / 各终端软件的 YMODEM send。",
+      "载荷是 `.h2cd` 差分补丁的**整条记录**（48 B 信封 + lite 流），",
+      "与帧协议（transport 段）发的是同一串字节 —— 两条传输通道，一份载荷格式。"
+    ]
+  },
+
+  "control": {
+    "_comment": [
+      "控制字节。C 侧只允许通过 YMODEM_* 宏使用，模板里不许出现字面量。",
+      "数值与 ASCII 一并记下：`crc_request` 在主机的实现里是字符 'C'，",
+      "而 `pad` 在文档里叫 CPMEOF / SUB —— 名字混乱是这一族协议的常态，",
+      "所以真源同时给出数值与文档别名。"
+    ],
+    "soh":         {"value": 1,  "value_hex": "0x01", "comment": "128 字节块的起始字节（Start Of Header）"},
+    "stx":         {"value": 2,  "value_hex": "0x02", "comment": "1024 字节块的起始字节（Start of TeXt）"},
+    "eot":         {"value": 4,  "value_hex": "0x04", "comment": "发送结束（End Of Transmission）"},
+    "ack":         {"value": 6,  "value_hex": "0x06", "comment": "肯定应答"},
+    "nak":         {"value": 21, "value_hex": "0x15", "comment": "否定应答；发送端收到后重发当前块"},
+    "can":         {"value": 24, "value_hex": "0x18", "comment": "取消。**连续两个**才算中止（单个可能只是噪声）"},
+    "pad":         {"value": 26, "value_hex": "0x1A", "aliases": ["CPMEOF", "SUB"],
+                    "comment": "块尾补齐字节。⚠️ 接收侧必须按声明的文件长度**截掉**它，否则补丁尾部会被塞进一堆 0x1A"},
+    "crc_request": {"value": 67, "value_hex": "0x43", "ascii": "C",
+                    "comment": "接收侧周期发送，表示『我用 CRC 校验，请开始』。走 16 位 CRC 路径（非 checksum 路径）"}
+  },
+
+  "block": {
+    "_comment": [
+      "块结构：[SOH|STX][blk][255-blk][data][crc16_hi][crc16_lo]",
+      "块号 blk 从 0 起，**按 256 取模回绕**（第 257 个块又是 0），",
+      "其反码字节 255-blk 是块号自身的校验 —— 块号被打坏时靠它拦下，",
+      "否则序号错位会被当成『重复块』而静默丢弃，传输就此停滞。"
+    ],
+    "size_128": 128,
+    "size_1024": 1024,
+    "overhead": 5,
+    "total_128": 133,
+    "total_1024": 1029,
+    "number_field_size": 1,
+    "complement_of": 255,
+    "number_modulus": 256,
+    "crc16_size": 2,
+    "crc16_byte_order": "big-endian（高位字节在前）",
+    "min_payload": 128,
+    "max_payload": 1024
+  },
+
+  "crc16": {
+    "_comment": [
+      "YMODEM 块尾校验：CRC-16/XMODEM。",
+      "",
+      "⚠️ 与 `fota_format.json` 的 transport 段用的 CRC-16/CCITT-FALSE",
+      "**同多项式、不同初值**，两者的结果没有任何关系：",
+      "    CRC-16/CCITT-FALSE  init 0xFFFF → '123456789' = 0x29B1  ← 本仓库帧协议在用",
+      "    CRC-16/XMODEM       init 0x0000 → '123456789' = 0x31C3  ← YMODEM 用这个",
+      "设备侧**不得**复用 `fota_crc16()`。",
+      "",
+      "check 值的独立验算方式（stdlib，与本仓库任何代码无关）：",
+      "    python -c \"import binascii; print(hex(binascii.crc_hqx(b'123456789', 0)))\"",
+      "generator/tests/test_fota_ymodem.py 会跑这条断言，所以 check 写错会红。"
+    ],
+    "algorithm": "CRC-16/XMODEM",
+    "poly": 4129,
+    "poly_hex": "0x1021",
+    "init": 0,
+    "refin": false,
+    "refout": false,
+    "xorout": 0,
+    "check": 12739,
+    "check_hex": "0x31C3",
+    "check_input": "123456789",
+    "python_oracle": "binascii.crc_hqx(data, 0)"
+  },
+
+  "header_block": {
+    "_comment": [
+      "块 0（文件头）的载荷布局。",
+      "",
+      "    <文件名> NUL <十进制长度> [SPACE <mtime>] [SPACE <mode>] [SPACE <serial>] NUL ... NUL 补齐",
+      "",
+      "接收侧**只需要前两个字段**（文件名与长度）；其后的 mtime/mode/serial 各实现",
+      "差异很大（lrzsz 用八进制 mtime、BSD sb 甚至省略 mode），所以必须**一律容忍**，",
+      "不得因为多出或少掉若干字段而拒绝一个本来能用的文件。",
+      "",
+      "长度字段的作用不是『锦上添花』而是**硬性要求**：末块要用 pad 字节补齐到",
+      "128/1024，没有声明长度就无法知道真实数据到哪儿结束。本实现据此截断，",
+      "并把声明的长度当作 YMODEM 侧的『整条记录长度』（= 48 B 信封 + 补丁）。",
+      "它与信封里的 patch_size 的交叉核对在会话层完成（唯一的源是信封）。"
+    ],
+    "block_number": 0,
+    "name_terminator": 0,
+    "size_radix": 10,
+    "size_terminators": [0, 32],
+    "size_terminators_comment": "长度字段以 NUL 或 SPACE 结束；SPACE 之后是 mtime 等可选字段",
+    "max_name_len": 64,
+    "max_name_len_comment": "设备侧接收缓冲的上界。真实文件名远短于此；给个明确的上界是为了让超长名成为可诊断的拒绝，而不是缓冲区溢出",
+    "payload_offset_after_name": 1,
+    "accept_sizes": [128, 1024],
+    "accept_sizes_comment": "块 0 用 SOH(128) 是 lrzsz sb 的行为，用 STX(1024) 的实现也存在 —— 两种都必须接受"
+  },
+
+  "terminator_block": {
+    "_comment": [
+      "批次结束标志：**载荷全为 NUL 的块 0**（128 字节的 0x00）。",
+      "接收侧在 EOT 之后发送 'C' 邀请下一个文件；收到的若是这个块，",
+      "则 ACK 并结束整批（本设备的『一批』恒等于一个补丁，见下）。",
+      "",
+      "为什么本设备不接受『多文件批次』：一个补丁就是一次升级，",
+      "第二批文件没有语义。收到非空的第二个块 0 时明确拒绝（CAN CAN），",
+      "而不是把它当成另一个补丁默默写进同一个暂存区。"
+    ],
+    "block_number": 0,
+    "payload_value": 0,
+    "size": 128
+  },
+
+  "handshake": {
+    "_comment": [
+      "握手与时序。",
+      "",
+      "crc_request 的间隔与次数取自 lrzsz（每 3 s 一次，共 10 次）。",
+      "总时长因此约 30 s —— 这是操作员敲完命令、在终端里选中文件所需的时间量级，",
+      "短了会让『还没来得及点发送就被设备放弃』变成常见故障。"
+    ],
+    "interval_ms": 3000,
+    "max_attempts": 10,
+    "block_timeout_ms": 3000,
+    "nak_max_retries": 10,
+    "can_count_before_abort": 2,
+    "eot_nak_before_ack": 1,
+    "eot_nak_before_ack_comment": [
+      "第一次 EOT 回 NAK、第二次才 ACK —— 这是 lrzsz rz 的行为，也是 sb 期望的：",
+      "sb 收到 NAK 会重发 EOT，等于给了接收方一次『EOT 是不是噪声』的复核机会。",
+      "写成可配置项是因为存在『EOT 一次即 ACK』的简化实现；把它显式化，",
+      "而不是在 C 的分支里埋一个 1。"
+    ],
+    "terminator_timeout_ms": 3000
+  }
+}

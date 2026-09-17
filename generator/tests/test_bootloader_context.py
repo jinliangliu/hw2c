@@ -111,10 +111,21 @@ def test_inject_bootloader_drivers_with_cli_injects_receiver():
                                        has_cli=True)
     assert result["has_fota_receive"] == True
     names = [d["name"] for d in result["drivers_additions"]]
-    assert names == ["iwdg", "fota_delta", "fota_meta", "fota"]
+    # `fota_ymodem` 与 `fota` **同时注入、不做开关**：它不改变接收语义，只换
+    # 一种"字节怎么进来"。给它加开关等于制造一种只在部分示例里被编译/被测试
+    # 的配置 —— 本仓库最贵的一类缺陷（模板里写死一个本应派生的值、只在特定
+    # 硬件配置下暴露）正是这么来的。
+    assert names == ["iwdg", "fota_delta", "fota_meta", "fota", "fota_ymodem"]
     fota = next(d for d in result["drivers_additions"] if d["name"] == "fota")
     assert fota["template"] == "drivers/drv_fota.c.j2"
     assert fota["header_template"] == "drivers/drv_fota.h.j2"
+
+    ym = next(d for d in result["drivers_additions"] if d["name"] == "fota_ymodem")
+    assert ym["template"] == "drivers/drv_fota_ymodem.c.j2"
+    assert ym["header_template"] == "drivers/drv_fota_ymodem.h.j2"
+    # UART 名字必须与 `fota` 拿到的是同一个 —— 两条传输抢的是同一路串口，
+    # 其中一个拿错名字的症状是"命令能敲、字节永远进不来"。
+    assert ym["peripheral"]["uart_name"] == fota["peripheral"]["uart_name"] == "uart1"
 
 
 def test_fota_delta_driver_carries_decoder_include_paths():

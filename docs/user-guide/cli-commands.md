@@ -115,10 +115,55 @@ Woke up after 240 ms, RTC keeps time, RAM intact.
 
 ### FOTA Commands
 
+Available when the example enables the FOTA receiver (`fota_receive:` / bootloader with
+differential OTA). Two **entry points**, one receive chain — both end up in the same staging
+session and take the same payload (the whole `.h2cd` patch record: 48 B envelope + lite stream).
+
 | Command | Description | Availability |
 |---------|-------------|-------------|
-| `fota version` | Show current firmware version | When FOTA enabled |
-| `fota start` | Enter FOTA receive mode | When FOTA enabled |
+| `fota status` | State (IDLE/RECEIVING/READY/APPLYING/DONE/ERROR), pending slot, staged bytes, last YMODEM file name, last error code | FOTA receive enabled |
+| `fota progress` | Progress 0–100 % (receive progress, then `dst_pos/new_size` during apply) | FOTA receive enabled |
+| `fota recv` | Enter receive mode for the **H2C frame protocol**; host runs `generator/fota_sender.py` | FOTA receive enabled |
+| `fota ymodem` | Enter receive mode for **YMODEM**; send the file with any terminal app's built-in YMODEM send | FOTA receive enabled |
+| `fota apply` | Apply the staged patch (auto-scheduled once a transfer completes) | FOTA receive enabled |
+| `fota erase` | Erase the target slot incl. the staging tail, drop the upgrade, reset metadata to IDLE | FOTA receive enabled |
+
+Both entry points must be typed explicitly by the operator — this is a security property, not a
+convenience: "wait for START from power-on" would let any serial noise trigger a Flash erase.
+While a transfer is in progress the line editor is bypassed, so there is no "type a command to
+cancel": the only ways out are a host `CAN`, retry exhaustion on the device side, or a timeout
+(all of them visible to the host).
+
+#### Upgrading over YMODEM (no host tool required)
+
+```
+> fota ymodem
+CCC...          <- device sends 'C' every 3 s, about 10 times
+                <- now pick the .h2cd file and send it with YMODEM
+> fota status   <- after the batch finishes: READY, then DONE
+```
+
+Steps in any terminal app (Tera Term / SecureCRT / ExtraPuTTY / `sb`):
+
+1. Build the patch on the host: `python generator/delta_tool.py ...` → `xxx.h2cd`.
+2. On the device, type `fota ymodem`. The device starts sending `C` (CRC handshake) every 3 s,
+   for about 30 s — that is the window for you to start the send.
+3. In the terminal, choose *Send file… → YMODEM* and pick the `.h2cd` file.
+4. The device writes into the staging tail as the blocks arrive, then applies the patch
+   synchronously, writes the image, fixes the image header CRC and schedules the reboot.
+
+Notes and limitations:
+
+- The protocol itself has no whole-file check, so the **device accumulates CRC-32/ISO-HDLC while
+  receiving**; a corrupted patch is rejected at the end rather than silently accepted.
+- YMODEM has no partial-resume, so the host always re-sends from byte 0. The device treats the
+  already-committed prefix as a **replay to be re-verified byte by byte** and fails fast on the
+  first mismatch — that is what makes resume work at all (the host does not need to know where
+  the break was).
+- A batch is exactly one patch. A second, non-empty block 0 mid-transfer is rejected with `CAN CAN`
+  instead of being silently written into the same staging area.
+- Cost: ~2.7 KB of code and a 1029 B block buffer (RAM), see
+  `docs/plans/differential-ota.md` §19.
 
 ## Customization
 

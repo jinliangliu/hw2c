@@ -649,6 +649,13 @@ def render_templates(env: Environment, context: dict, output_dir: str,
     # 不存在的 static 函数（UART 字节流由 CLI 显式移交，见 drv_cli.h）。
     if context.get("has_fota_receive"):
         test_templates["test/test_fota_protocol.c.j2"] = os.path.join(test_dir, "test_fota_protocol.c")
+        # YMODEM 通道（第二条传输）自己的传输层单测。它与 test_fota_protocol.c
+        # 有明确分工：后者测**收齐之后**的那一半（元数据日志语义、跨复位状态映射、
+        # 暂存区几何），前者测**字节怎么进来**的那一半（握手、块解析、
+        # CRC-16/XMODEM、中止判据）。收齐之后的完整批次行为（末块截断、
+        # EOT 两拍、结束块、续传复核）在仓库侧由 L5 台架覆盖，
+        # 工程内跑不起来（需要 vendored 解码器与逐块构造的完整批次）。
+        test_templates["test/test_fota_ymodem.c.j2"] = os.path.join(test_dir, "test_fota_ymodem.c")
 
     # 状态机测试
     if context.get("has_behavior"):

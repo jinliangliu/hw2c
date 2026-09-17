@@ -35,7 +35,9 @@ templates/
 │   ├── drv_modbus.c.j2 + .h.j2   # Modbus RTU protocol driver
 │   ├── drv_mqtt.c.j2 + .h.j2     # MQTT 3.1.1 client driver
 │   ├── drv_cli.c.j2 + .h.j2      # UART CLI debug shell driver
-│   ├── drv_fota.c.j2 + .h.j2     # FOTA receive state machine (frames + staging)
+│   ├── drv_fota.c.j2 + .h.j2     # FOTA receive state machine + shared staging session
+│   ├── drv_fota_ymodem.c.j2 + .h.j2 # FOTA over YMODEM (second byte-delivery channel)
+│   ├── fota_meta.c.j2 + .h.j2    # Flash-page metadata journal (shared with the bootloader)
 │   └── fota_delta.c.j2 + .h.j2   # H2CD delta decoder (pure algorithm + injectable I/O)
 ├── bootloader/
 │   ├── boot_main.c.j2            # Bootloader entry point
@@ -440,17 +442,107 @@ never contain a literal offset.
 **Condition:** Generated when `has_bootloader`, `has_uart` **and** a CLI driver
 are all present (`has_fota_receive`).
 
-FOTA receive state machine. Parses the three transport frames (START / DATA /
-FINISH), acknowledges in order, re-ACKs duplicates and out-of-order chunks, NAKs
-bad CRCs, and stages the patch into the **tail of the destination slot** so that
-a power loss does not require re-transmission. Transfer state lives in TAMP
-backup registers (`BKP5R..BKP9R`, with a self-check word); the application step
-runs synchronously in the dedicated low-priority `fota` task after the outputs
-have been driven to their safe state.
+FOTA receive state machine — **transport and persistence**, not algorithm.
+Parses the three transport frames (START / DATA / FINISH), acknowledges in order,
+re-ACKs duplicates and out-of-order chunks, NAKs bad CRCs, and stages the patch
+into the **tail of the destination slot** so that a power loss does not require
+re-transmission. The application step runs synchronously in the dedicated
+low-priority `fota` task after the outputs have been driven to their safe state.
+
+Transfer state lives in a **Flash metadata journal** (`fota_meta.c`, a dedicated
+page — *not* TAMP backup registers: on STM32G0B1 the TAMP only has `BKP0R..BKP4R`
+and they are already taken by `boot_nvm` / `boot_main`). The journal must be
+self-describing (`magic` / `state` / `slot` / `progress` / `fmt_ver` / crc) rather
+than positional, because the bootloader reads the same records and both sides
+must agree byte for byte.
 
 The UART byte stream is handed over explicitly by the `fota recv` CLI command
 (`cli_set_rx_sink()`), because the CLI's line editor is otherwise the only
 consumer of those bytes.
+
+**`fota_session_*` — the shared staging session.** Both transports differ *only*
+in how bytes arrive (fixed-size chunks with explicit sequence numbers and
+stop-and-wait ACK vs. 128/1024-byte blocks with a 16-bit CRC). Everything after
+that must be byte-identical: capacity admission formula, staging geometry
+(`staging_base = slot_base + slot_size - align_up(record, 8)`), resume decision,
+envelope-first commit, double-word aligned batching, `0xFF` tail padding, and the
+final "read the whole record back out of Flash and recompute CRC32". Those live
+here once — two copies would not be "duplicated code" but **two admission
+formulas**, and the boundary cases such an off-by-one-page bug lives on are
+exactly the ones one of the two copies fails to test. Likewise "which states may
+enter receive mode" is a security policy, so it has a single gate
+(`fota_receive_ready()`).
+
+`fota_transport_t { NONE, FRAME, YMODEM }` exists because the two transports need
+**mutually exclusive periodic work** in `fota_process()`: the frame protocol's
+idle timeout aborts the receive, while YMODEM needs to re-send `'C'` and honour
+block timeouts. Both derive their time base from the same `g_last_activity_ms`,
+so without the discriminator a YMODEM transfer would be judged "host went silent"
+and aborted mid-flight (after 2 s — it looks like "the device gives up halfway").
+
+> `fota_transport_t` must be declared in the **header**, not the `.c`:
+> `fota_transport_begin()` takes it as a parameter and `drv_shell.c` / `main.c` /
+> `event_mgr.c` only include the header. Leaving it in the `.c` fails those
+> translation units with `unknown type name`.
+
+### `drivers/drv_fota_ymodem.c.j2` / `drivers/drv_fota_ymodem.h.j2`
+
+**Condition:** Same as `drv_fota` (`has_fota_receive`).
+
+YMODEM batch-mode receiver, i.e. the second byte-delivery channel. Lets an
+operator upgrade with **any terminal software's built-in YMODEM send** (Tera Term,
+SecureCRT, ExtraPuTTY, `lrzsz sb`) instead of the repo's own `fota_sender.py`.
+Entry point is the `fota ymodem` CLI command; the payload is the whole `.h2cd`
+patch record (48 B envelope + lite stream) — the same bytes the frame protocol
+sends.
+
+All control bytes, block sizes and timings come from
+`generator/data/ymodem_format.json`; the template contains no control-byte
+literal.
+
+Four traps, each capable of "all-green in self-tests, dead against real
+software":
+
+| # | Trap | Consequence |
+|---|---|---|
+| 1 | **YMODEM uses CRC-16/XMODEM** (init `0x0000`, `'123456789'` → `0x31C3`), while this repo's frame protocol uses CRC-16/**CCITT-FALSE** (init `0xFFFF` → `0x29B1`) | Reusing `fota_crc16()` makes the device talk to our own sender perfectly and to **every real terminal not at all** — an A3-class "both sides implement a different convention, each self-consistently" defect. The device therefore implements its own XMODEM CRC. |
+| 2 | Final block is padded with `0x1A` | Must be truncated to the length declared in block 0, or the patch grows a tail of `0x1A` |
+| 3 | `CAN` (`0x18`) only counts as an abort **at a block boundary**, and only twice in a row | A random `0x18` inside the patch would otherwise abort the transfer |
+| 4 | `(uint8_t)YMODEM_BLK_MODULUS` is `(uint8_t)256U` = `0` | Runtime division by zero → HardFault on real hardware. Do the modulo in 32-bit and cast last. |
+
+Other semantics worth knowing before changing this file:
+
+- YMODEM has **no whole-file check** — the device accumulates CRC-32/ISO-HDLC
+  while receiving and hands it to the same `fota_session_finish()`.
+- YMODEM has **no partial resume**, the host always re-sends from byte 0. The
+  device treats the already-committed prefix as a replay to be re-verified byte
+  by byte (`FOTA_STREAM_FROM_RECORD_START`) and fails fast on mismatch — skipping
+  would also be correct but would report a corrupt stream only after a full
+  transfer.
+- Block 0's decimal length is the **only cross-check** between "length declared by
+  the host" and "length declared by the envelope".
+- A batch is exactly one patch; a second non-empty block 0 mid-transfer is
+  rejected with `CAN CAN` rather than silently written into the same staging area.
+- Transport-layer failures (handshake timeout, retry exhaustion, host `CAN`) do
+  **not** escalate to `ERROR`: nothing on Flash was invalidated, the `RECEIVING`
+  record is still valid and a re-send resumes. Escalating would show the operator
+  a terminal state that calls for `fota erase` when retrying is all that is needed.
+
+**Cost:** ~2.7 KB of code and a 1029 B block buffer (`g_blk`); see
+`docs/plans/differential-ota.md` §19 for the measured numbers and the 14-case L5
+harness.
+
+**Tests:** two host-side test templates are generated alongside it when
+`has_fota_receive` is true — `test_fota_protocol.c` (metadata journal semantics,
+cross-reset state mapping, staging geometry) and `test_fota_ymodem.c` (handshake
+cadence and attempt limit, block-number complement before CRC, CRC-16/XMODEM vs.
+CCITT-FALSE, block-0 name/length parsing, the CAN boundary rule). Both must
+`#include` **all three** FOTA sources (`drv_fota_meta.c`, `drv_fota.c`,
+`drv_fota_ymodem.c`): `fota_process()` calls `fota_ymodem_process()`, so leaving
+one out fails at link time. Full-batch behaviour (final-block `0x1A` truncation,
+the two-packet EOT handshake, terminator block, resume re-verification) is
+covered by the L5 harness instead — it needs the vendored decoder and a
+block-by-block batch builder, neither of which exists in a generated project.
 
 ---
 

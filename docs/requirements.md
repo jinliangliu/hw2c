@@ -52,7 +52,7 @@
 | 代码生成 | 123~158 个 Jinja2 模板 → 完整 CMake + Ninja 工程 |
 | 运行时 | FreeRTOS + 组件框架 + 事件队列 + 层级状态机 + POSIX 风格总线 API |
 | 外设覆盖 | GPIO/EXTI、USART、I2C、SPI、ADC、PWM、RTC、IWDG、RS485、红外、EEPROM、温度传感器、Modbus、MQTT、4G |
-| 高级能力 | 低功耗（RUN/SLEEP/STOP0/STOP1）、Bootloader A/B、FOTA 差分升级、CLI 12 命令、遥测、FOC 电机控制、PID 过程变量控制 |
+| 高级能力 | 低功耗（RUN/SLEEP/STOP0/STOP1）、Bootloader A/B、FOTA 差分升级（帧协议 + YMODEM 双通道）、CLI 12 命令、遥测、FOC 电机控制、PID 过程变量控制 |
 | 测试 | 主机侧 Unity + Mock HAL、SIL 组件仿真、Python 侧 270+ 测试 |
 | 工具链 | arm-none-eabi-gcc + CMake + Ninja，VSCode 配置生成，ST-Link / DAP-Link 烧录 |
 
@@ -209,7 +209,7 @@
 | MQTT 3.1.1 | `drv_mqtt.c` | ✅ |
 | Modbus RTU 主/从（FC03/06/16 + CRC16 + 异常码） | `drv_modbus.c` | ✅ |
 | CLI 调试终端 | `drv_cli.c` | ✅ |
-| FOTA 差分升级 | `drv_fota.c`（接收侧）+ `fota_delta.c`（解码侧） | ⏳ |
+| FOTA 差分升级（帧协议 + YMODEM 两通道） | `drv_fota.c`（接收侧状态机）+ `fota_delta.c`（解码侧）+ `drv_fota_ymodem.c`（YMODEM 通道） | ✅ |
 | Bootloader A/B | `boot_*.c` | ✅ |
 
 ### FR-11 通信协议栈 ✅
@@ -250,8 +250,10 @@
 > `bootloader.enabled`，整条引导/差分路径**从未被生成、编译或测试**。现已由
 > `examples/fota_demo/` 拉进构建闸门：四个编译自检目标全通过，bootloader 主机
 > 单测（crc/nvm/jump）可运行，差分应用层有 L6 掉电注入（含变异测试）。
-> 仍缺：**接收侧传输状态机（`drv_fota`，计划 P3）** 与**真板 HIL 验证（P5）**。
-> 详见 `docs/plans/differential-ota.md` §17、§18。
+> 仍缺：**真板 HIL 验证（P5）** —— 接收侧状态机（`drv_fota`，P3）与其 YMODEM 通道（P3'，
+> FR-14.6）已实现，主机 L5 跨实现台架（真模板 + 主机 gcc + vendored 解码器 + Python 发送器
+> 互喂字节）全绿，但"主机全绿 ≠ 真机可用"这类缺陷（A3/A9）只有上板才能排除。
+> 详见 `docs/plans/differential-ota.md` §17、§18 与 §19（YMODEM 通道）。
 
 | ID | 需求 |
 |----|------|
@@ -259,12 +261,14 @@
 | FR-14.2 | TAMP 备份寄存器记录启动状态 |
 | FR-14.3 | 启动失败自动回退（`max_retries`） |
 | FR-14.4 | 差分 FOTA：H2CD v1 信封 + HPatchLite 兼容 lite 流 + tinyuz 压缩（`delta_tool.py` 自研写侧），减小 OTA 传输体积，完整性校验 + 幂等重放 |
+| FR-14.5 | 接收侧传输状态机：帧协议（START/DATA/END/ABORT，带序号与重传）驱动同一个 staging 会话；掉电续传、幂等重放、越界拒绝 |
+| FR-14.6 | **YMODEM 传输通道**：CLI `fota ymodem` 进入接收态后，任何终端软件（Tera Term / SecureCRT / lrzsz `sb`）用**内置的 YMODEM 发送功能**即可完成升级，不需要专用上位机；与帧协议共用同一个 staging 会话与准入判据，不引入第二套 OTA 流程 |
 
 ### FR-15 调试与可观测性 ✅
 
 | ID | 需求 |
 |----|------|
-| FR-15.1 | 交互式 CLI，内置 12 命令：`help` / `version` / `uptime` / `free` / `tasks` / `reset` / `gpio` / `led` / `rtc` / `telemetry` / `power` / `sysinfo` |
+| FR-15.1 | 交互式 CLI，内置 12 命令：`help` / `version` / `uptime` / `free` / `tasks` / `reset` / `gpio` / `led` / `rtc` / `telemetry` / `power` / `sysinfo`；示例启用 FOTA 接收时追加第 13 个命令 `fota`（`status` / `progress` / `recv` / `ymodem` / `apply` / `erase`，见 FR-14.5 / FR-14.6） |
 | FR-15.2 | CLI 在 STOP 模式下可通过 UART 唤醒交互 |
 | FR-15.3 | 遥测：单块时间戳快照（心跳 / 栈水位 / 堆 / 组件健康），`telemetry on/off` 开关 |
 | FR-15.4 | 日志：环形缓冲区 + 中断驱动 USART TX，ISR 安全、零阻塞 |
@@ -507,7 +511,7 @@ hw2c 的处理方式（**不修改 vendor**）：
 | FR-11 协议栈 | `templates/drivers/drv_{modbus,mqtt,cellular,uart}.c.j2`、`examples/modbus_demo/` |
 | FR-12 控制中间件 | `templates/app/pid_*.j2`、`foc_*.j2`、`fall_detect*.j2`、`attitude.c.j2`、`examples/{solenoid_valve,thermo,knob}_*/` |
 | FR-13 低功耗/RTC | `templates/src/{sleep,power_mgr}.c.j2`、`templates/drivers/drv_rtc.c.j2`、`templates/rtos/tickless_idle.c.j2` |
-| FR-14 Bootloader/FOTA | `templates/bootloader/`、`templates/drivers/drv_fota.{c,h}.j2`（接收侧状态机）、`templates/drivers/fota_delta.{c,h}.j2`（解码与应用）、`generator/delta_tool.py`、`generator/data/fota_format.json`、`generator/tests/test_fota_delta_l6.py`、`generator/tests/test_fota_protocol*`、`examples/fota_demo/`（旧的 `generator/bsdiff_tool.py` 与 `fota_bspatch.{c,h}.j2` 已退役，见 `docs/plans/differential-ota.md` §11.1 / §16.6） |
+| FR-14 Bootloader/FOTA | `templates/bootloader/`、`templates/drivers/drv_fota.{c,h}.j2`（接收侧状态机）、`templates/drivers/drv_fota_ymodem.{c,h}.j2`（YMODEM 通道）、`templates/drivers/fota_delta.{c,h}.j2`（解码与应用）、`generator/delta_tool.py`、`generator/fota_ymodem_sender.py`（测试侧发送器）、`generator/data/{fota_format,ymodem_format}.json`、`generator/tests/test_fota_delta_l6.py`、`generator/tests/test_fota_protocol*`、`generator/tests/test_fota_ymodem*.py`、`examples/fota_demo/`（旧的 `generator/bsdiff_tool.py` 与 `fota_bspatch.{c,h}.j2` 已退役，见 `docs/plans/differential-ota.md` §11.1 / §16.6） |
 | FR-15 调试可观测 | `templates/drivers/drv_{cli,log}.c.j2`、`templates/src/telemetry.c.j2`、`docs/user-guide/cli-commands.md` |
 | FR-16 测试体系 | `templates/test/`、`generator/run_tests.py`、`generator/tests/`、`tests/`、`parser/tests/` |
 | FR-17 工具链/CI | `templates/project/*`、`templates/vscode/*`、`.github/workflows/build_and_test.yml` |

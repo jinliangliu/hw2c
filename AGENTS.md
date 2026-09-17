@@ -212,6 +212,40 @@ python flash_capture.py                                  # COM4 @115200 抓日�
       即可排除「失效安全捕获 / 复位循环」，把问题限定为纯挂死。
     - `pyocd cmd` 连接后**不会自动停机**，读寄存器前必须先 `-c halt`。
     - `read32 <addr> <count>` 的 count 单位是**字节**，不是字。
+12. **新增"第二条投递通道"时，别抄第一份的约定**（YMODEM 通道，2026-09-17）。
+   FOTA 接收现在有两条传输通道（HWC 帧协议 `fota recv`、YMODEM `fota ymodem`），
+   它们**只允许在"字节怎么进来"上不同**：定长分片 + 显式序号 + 停等 ACK，还是
+   128/1024 字节块 + 16 位 CRC。字节进来之后的一切（容量准入公式、暂存区几何、
+   续传判定、落盘与回读校验）必须逐字节相同，因此收敛在 `drv_fota.c` 的
+   `fota_session_*` 里由两条通道共用 —— 各写一份的结局不是"代码重复"，而是
+   **两份准入公式**，而"边界少算一页、应用期擦掉暂存区首页"这类缺陷的难点
+   恰恰在于它只在一小段边界上出现，两份实现里总有一份没被那条边界测到。
+   同理"哪些状态允许进入接收"是**安全策略**，只有一个gate
+   （`fota_receive_ready()`），两个入口各判一次迟早会漏一个状态。
+
+   ⚠️ **最贵的坑是"标准同名、实现不同"的校验**：帧协议用 CRC-16/CCITT-FALSE
+   （init `0xFFFF`，`'123456789'` → `0x29B1`），而 YMODEM 规定 CRC-16/**XMODEM**
+   （init `0x0000` → `0x31C3`）。图省事复用 `fota_crc16()` 会得到一个
+   **"自研主机 ↔ 设备完全互通，但与 Tera Term / lrzsz sb / ExtraPuTTY 一个都
+   连不上"**的实现——两侧错得一样，所以任何自测都不会红。判据因此必须是**标准**
+   （`generator/data/ymodem_format.json` 写死 check 值当 KAT，独立验算用
+   `python -c "import binascii; print(hex(binascii.crc_hqx(b'123456789', 0)))"`），
+   不能是"另一侧的实现也这么算"。同一通道的另外三个必踩点（末块 `0x1A` 填充必须
+   按块 0 声明长度截断、`CAN` 只在块边界且连续两个才算中止、
+   `(uint8_t)256U == 0` 导致运行期除零）见 `docs/plans/differential-ota.md` §19。
+   护栏：`generator/tests/test_fota_ymodem.py`（渲染层）+ `test_fota_ymodem_l5.py`
+   （跨实现台架，14 用例，3 处变异各自只打掉一个用例）+
+   `templates/test/test_fota_ymodem.c.j2`（生成工程内 15 用例，跟着
+   `run_tests.py` 跑）。
+
+   ⚠️ 同一件事的第二个教训：`drv_fota.c` 调 `fota_ymodem_process()` 之后，
+   **已经存在的** `templates/test/test_fota_protocol.c.j2` 立刻链接失败
+   （`undefined reference to 'fota_ymodem_process'`），而它的 pytest/L5 用例
+   全绿 —— 那些用例不生成、也不编译工程内的测试。是
+   `output/<demo>/test/run_tests.py` 报出来的（CI 也跑这一步）。
+   ⇒ 给生成源码**新增一个跨模块调用**时，必须跑一次受影响示例的
+   `run_tests.py`；并让相关测试 `#include` 进完整的源码集合，
+   **不要给它加空桩**（空桩会让"调用了不存在的实现"继续静默）。
 
 ## CI（.github/workflows/build_and_test.yml）
 

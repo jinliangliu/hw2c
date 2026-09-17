@@ -1,0 +1,676 @@
+{#
+    drv_fota_ymodem.c.j2 - FOTA 接收侧的第二条传输通道：YMODEM（batch / CRC 握手）
+
+    职责：把"主机用任意终端软件的 YMODEM 发送功能发过来的文件字节流"还原成
+    **一条完整的 `.h2cd` 记录**，然后交给 `drv_fota` 的暂存会话层。
+
+    这个文件里**只有传输**：块解析、应答、超时、重试。准入公式、暂存区几何、
+    续传判定、落盘、回读校验、提交 READY 全部在 `drv_fota.c` 的会话层里 ——
+    两条传输通道共用一份实现（否则就是两份准入公式，而"边界少算一页、
+    应用期擦掉暂存区"这类缺陷的全部难点就在于它只在一小段边界上出现）。
+
+    ⚠️ 本文件没有 `#ifdef TEST` 分支：主机侧跑的是同一份逻辑。
+    见 drv_fota_ymodem.h 头部的说明。
+#}
+#include "drv_fota_ymodem.h"
+
+#include "drv_{{ cli_name }}.h"      /* cli_set_rx_sink / cli_rx_sink_active / cli_write_raw */
+#include "drv_fota_delta.h"          /* FOTA_CRC32_INIT / _FINAL_XOR / fota_delta_crc32_update */
+
+#include <string.h>
+
+/* ===========================================================================
+ * 静态状态
+ * =========================================================================== */
+
+typedef enum {
+    YM_ST_IDLE = 0,      /* 未在接收 */
+    YM_ST_WAIT_HEADER,   /* 周期发 'C'，等块 0（文件头）*/
+    YM_ST_WAIT_DATA,     /* 等数据块 */
+    YM_ST_WAIT_EOT,      /* 最后一个数据块已 ACK，等 EOT（或直接来的结束块）*/
+    YM_ST_WAIT_TERM,     /* EOT 已 ACK、'C' 已发，等结束块 */
+    YM_ST_DONE           /* 本批结束，UART 已交还（终态）*/
+} ym_state_t;
+
+static ym_state_t g_st = YM_ST_IDLE;
+
+/* 单块缓冲：起始字节(1) + 块号(1) + 反码(1) + 最长载荷(1024) + CRC(2)。
+ *
+ * 与 `drv_fota.c` 的 `g_rx`（帧协议的分片缓冲）是两份，因为两条传输**不可能
+ * 同时在跑**——但把它们合并成一个跨模块共享的 extern 缓冲区，换来的是 1 KB
+ * RAM 和一处难查的耦合（谁在什么时候可以动那个缓冲区）。1 KB 在 144 KB 的
+ * 部件上不值得。 */
+static uint8_t  g_blk[YMODEM_BLK_MAX_FRAME];
+static uint16_t g_blk_len;      /* 本块已收字节数（0 = 还在等起始字节）*/
+static uint16_t g_blk_need;     /* 本块总长 */
+static uint8_t  g_expect_blk;   /* 期望的块号（按 256 回绕）*/
+
+static uint32_t g_declared;     /* 块 0 声明的文件长度（= 整条记录长度）*/
+static uint32_t g_delivered;    /* 已交给会话层的文件字节数（**已按声明长度截断**）*/
+static uint32_t g_crc32;        /* 文件流累加的 CRC-32/ISO-HDLC（尚未做终值异或）*/
+static char     g_name[YMODEM_HDR_MAX_NAME];
+
+static uint32_t g_tick;         /* 最近一次**块事件**的时刻 */
+static uint8_t  g_c_sent;       /* 已发出的 'C' 次数 */
+static uint16_t g_retry;        /* 连续失败次数（块超时 / 块校验不过）*/
+static uint8_t  g_eot_count;    /* 已收到的 EOT 次数 */
+static uint8_t  g_can_count;    /* 块边界上连续收到的 CAN 数 */
+
+/* ===========================================================================
+ * 收发原语
+ * =========================================================================== */
+
+static void ym_send(const uint8_t *data, uint16_t len)
+{
+    cli_write_raw(data, len);
+}
+
+static void ym_send_ctl(uint8_t b)
+{
+    cli_write_raw(&b, 1U);
+}
+
+static void ym_ack(void)
+{
+    ym_send_ctl((uint8_t)YMODEM_CTL_ACK);
+    /* 重试计数在这里复位，而不是在"块 CRC 通过"处：**一次 ACK 就是一次
+     * "链路还活着且我们同步上了"的确认**。放在 CRC 之后的话，一个持续
+     * 块号错乱（或持续收不到完整块）的链路会因为每次都"CRC 通过"而永远
+     * 不复位，重试上限也就永远不会触发。 */
+    g_retry = 0U;
+}
+
+/*
+ * 放弃本次传输。
+ *
+ * 与"置 ERROR"的区别是刻意的：YMODEM 侧的失败（主机 CAN 中止、重试耗尽、
+ * 握手超时）**没有破坏已经落盘的东西**，元数据里的 RECEIVING 记录仍然有效，
+ * 主机重发就能续传（重放时会逐字节复核已提交的前缀）。置成 ERROR 会让
+ * `fota status` 显示一个需要人工介入的终态，实际上再试一次就行。
+ */
+static void ym_abort(int code)
+{
+    static const uint8_t can_can[2] = {
+        (uint8_t)YMODEM_CTL_CAN, (uint8_t)YMODEM_CTL_CAN
+    };
+
+    /* 主动中止也要发**两个** CAN：协议规定连续两个才算中止信号，
+     * 只发一个的话对方会当成噪声。 */
+    ym_send(can_can, 2U);
+
+    fota_note_error(code);
+    /* 交还 UART + 清传输方式 + 退回 IDLE，**不擦暂存区、不动元数据** ——
+     * 这三件事只能有一份实现，所以走会话层的 abort 而不是自己抄一遍。 */
+    fota_session_abort();
+    g_st = YM_ST_DONE;
+}
+
+/* 正常收工：补丁已 READY，把 UART 与节拍交还。 */
+static void ym_end_batch(void)
+{
+    /* **不调用 fota_session_abort()**：它的语义是"这次传输作废"，而此刻
+     * 手里是一条已经通过会话层回读 CRC32 校验、等着应用的补丁。
+     *
+     * 只交还 UART 与节拍 —— `fota_process()` 随即（≤10 ms）会执行
+     * `fota_apply_now()`，复位发生在那一步，而不是在这里。 */
+    if (cli_rx_sink_active() != 0U) {
+        cli_set_rx_sink(NULL);
+    }
+    fota_transport_begin(FOTA_TP_NONE);
+    g_st = YM_ST_DONE;
+}
+
+/*
+ * NAK 并计一次失败。
+ *
+ * ⚠️ 达到上限时这里会**主动中止**（发 CAN CAN + 交还 UART）。所以调用方在
+ * `ym_nak()` 之后必须立刻返回，不能继续用 g_st / g_blk 的状态 —— 它可能已经
+ * 变成 YM_ST_DONE 了。这是本文件里唯一一处"看起来只是个应答函数、其实是
+ * 终止路径"的地方，值得记住。
+ */
+static void ym_nak(void)
+{
+    ym_send_ctl((uint8_t)YMODEM_CTL_NAK);
+    g_retry++;
+    if (g_retry > (uint16_t)YMODEM_NAK_MAX_RETRIES) {
+        /* 同一个位置连续失败到上限：链路大概率已经不在 YMODEM 上了
+         * （主机崩了、线掉了、或两边波特率不一致）。主动放弃并把原因报出去，
+         * 而不是无限重试把 UART 一直占着。 */
+        ym_abort(FOTA_E_ABORTED);
+    }
+}
+
+/* ===========================================================================
+ * 块尾校验：CRC-16/XMODEM
+ *
+ * ⚠️ **初值是 0x0000，不是本仓库帧协议那个 0xFFFF。**
+ *
+ * `drv_fota.c` 用的 `fota_crc16()` 是 CRC-16/CCITT-FALSE（初值 0xFFFF）。
+ * 两者同多项式、不同初值：'123456789' 分别得 0x31C3 与 0x29B1。
+ * 图省事复用它，得到的是一个"自研主机与设备之间完全互通、但与 Tera Term /
+ * lrzsz sb / ExtraPuTTY 一个都连不上"的实现 —— 两侧错得一样，所以自测里
+ * 永远不会红。这就是本函数存在的理由，也是
+ * `generator/tests/test_fota_ymodem.py` 拿标准 check 值（0x31C3）当 KAT 的
+ * 理由：判据必须是**标准**，不能是"另一侧的实现也这么算"。
+ *
+ * 初值与多项式都由真源（`generator/data/ymodem_format.json`）派生。
+ * =========================================================================== */
+
+static uint16_t ym_crc16(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = (uint16_t)YMODEM_CRC_INIT;
+    uint16_t i;
+    uint8_t  bit;
+
+    for (i = 0U; i < len; i++) {
+        crc = (uint16_t)(crc ^ (uint16_t)((uint16_t)data[i] << 8));
+        for (bit = 0U; bit < 8U; bit++) {
+            if ((crc & 0x8000U) != 0U) {
+                crc = (uint16_t)((uint16_t)(crc << 1) ^ (uint16_t)YMODEM_CRC_POLY);
+            } else {
+                crc = (uint16_t)(crc << 1);
+            }
+        }
+    }
+    return crc;
+}
+
+static uint8_t ym_all_zero(const uint8_t *data, uint16_t len)
+{
+    uint16_t i;
+
+    for (i = 0U; i < len; i++) {
+        if (data[i] != 0U) {
+            return 0U;
+        }
+    }
+    return 1U;
+}
+
+/* ===========================================================================
+ * 块 0：文件头
+ * =========================================================================== */
+
+/*
+ * 解析块 0 的载荷：`<文件名> NUL <十进制长度> [SPACE <其余可选字段>] NUL 补齐`
+ *
+ * ⚠️ **只有文件名与长度是必解析的**；其后的 mtime / mode / serial 各实现
+ * 差异很大（lrzsz 用八进制 mtime，BSD sb 干脆省略），**一律不看也不做容忍性
+ * 检查** —— 因为多出或少掉几个可选字段而拒绝一个本来能用的文件，是纯粹的损失。
+ *
+ * 为什么长度字段是**必需**的（协议允许省略）：末块要用 0x1A 补齐到 128/1024，
+ * 不截断就会把一串 0x1A 当成补丁的一部分写进暂存区；而补丁正文里合法地存在
+ * 0x1A，所以"去掉尾部 0x1A"这种猜法是不成立的。见头文件约束 ①。
+ *
+ * @return 0 = 解析成功；-1 = 这不是一份能用的文件头（调用方应当中止，而不是
+ *         继续拿它去猜 —— 块 CRC 已经通过了，所以这不是链路噪声，而是主机
+ *         发的确实不是我们认得的东西）。
+ */
+static int ym_parse_header(const uint8_t *payload, uint16_t plen,
+                           uint32_t *out_size)
+{
+    uint16_t i = 0U;
+    uint16_t n = 0U;
+    uint32_t size = 0U;
+
+    /* ---- 文件名：到 NUL 为止 ---- */
+    while ((i < plen) && (payload[i] != 0U)) {
+        /* 长度上界是硬性的：一段不含 NUL 的载荷会让这里一直扫下去，
+         * 而"载荷里没有 NUL"恰恰是链路或主机出错时的表现。 */
+        if (n >= ((uint16_t)YMODEM_HDR_MAX_NAME - 1U)) {
+            return -1;
+        }
+        g_name[n] = (char)payload[i];
+        n++;
+        i++;
+    }
+    if (i >= plen) {
+        return -1;                       /* 没有 NUL 终止 */
+    }
+    g_name[n] = '\0';
+    if (n == 0U) {
+        return -1;                       /* 空文件名：这不是文件头 */
+    }
+    i++;                                 /* 跳过 NUL */
+
+    /* ---- 长度：十进制，以 NUL 或 SPACE 结束 ---- */
+    if ((i >= plen) || (payload[i] < (uint8_t)'0') || (payload[i] > (uint8_t)'9')) {
+        return -1;                       /* 长度字段缺失 —— 本实现要求它存在 */
+    }
+    while ((i < plen) && (payload[i] >= (uint8_t)'0') && (payload[i] <= (uint8_t)'9')) {
+        size = (size * (uint32_t)YMODEM_HDR_SIZE_RADIX)
+             + (uint32_t)(payload[i] - (uint8_t)'0');
+        if (size > (uint32_t)YMODEM_MAX_DECLARED) {
+            return -1;                   /* 荒谬的声明：拒绝，而不是让它是回绕 */
+        }
+        i++;
+    }
+    if ((i < plen) && (payload[i] != 0U) && (payload[i] != (uint8_t)' ')) {
+        return -1;                       /* 数字后面跟了别的东西 */
+    }
+
+    *out_size = size;
+    return 0;
+}
+
+static void ym_handle_header(const uint8_t *payload, uint16_t plen)
+{
+    uint32_t size = 0U;
+
+    if (ym_parse_header(payload, plen, &size) != 0) {
+        ym_abort(FOTA_E_IO);
+        return;
+    }
+    if (size <= (uint32_t)FOTA_ENV_SIZE) {
+        /* 连 48 B 信封都装不下 —— 不可能是补丁记录。 */
+        ym_abort(FOTA_E_LENGTH);
+        return;
+    }
+
+    /* 本批只接受一个文件（一个补丁 = 一次升级）。块 0 声明了长度就开收，
+     * 但**先不碰 Flash**：准入要等第一批数据里的信封，见 ym_handle_data()。 */
+    g_declared   = size;
+    g_delivered  = 0U;
+    g_crc32      = FOTA_CRC32_INIT;
+    g_expect_blk = 1U;
+    g_st         = YM_ST_WAIT_DATA;
+
+    ym_ack();
+}
+
+/* ===========================================================================
+ * 数据块
+ * =========================================================================== */
+
+static void ym_handle_data(const uint8_t *payload, uint16_t plen)
+{
+    uint32_t remaining;
+    uint32_t take;
+    int      rc;
+
+    if (g_delivered == 0U) {
+        /* 第一个数据块的信封 48 B 就在这里。
+         *
+         * **会话（以及它的 Flash 擦除）在第一块才打开**，而不是在块 0：
+         * 装不装得下取决于信封里的 `new_size` / `patch_size`，块 0 的声明值
+         * 只是长度核对的一方（会话要求它等于 48 + patch_size）。在块 0 就擦
+         * 暂存区的话，一条随后被准入拒绝的补丁会白白擦掉上一次的断点。
+         *
+         * 块长恒 ≥ 128 > 48，所以信封一定完整地落在本块里。 */
+        if (plen < (uint16_t)FOTA_ENV_SIZE) {
+            ym_abort(FOTA_E_IO);         /* 防御：与"块长 ≥128"这条结构事实不符 */
+            return;
+        }
+        if (fota_session_open(payload, g_declared,
+                              FOTA_STREAM_FROM_RECORD_START) != 0) {
+            /* 会话层已置好具体错误码（信封不合法 / 长度与声明不符 / 准入不过）。
+             * 中止而不是 NAK 重试：同一份信封再发一次，结论不会变。 */
+            ym_abort(fota_get_last_error());
+            return;
+        }
+    }
+
+    remaining = g_declared - g_delivered;
+    take      = ((uint32_t)plen < remaining) ? (uint32_t)plen : remaining;
+
+    if (take == 0U) {
+        /* 文件已收满，主机还在发数据块 —— 它发得比声明的多。
+         * 交给会话层去写的话会被它拦下（E_LENGTH），但在这里拦更清楚：
+         * 这是**协议层**的错误，不是落盘错误。 */
+        ym_abort(FOTA_E_LENGTH);
+        return;
+    }
+
+    /* ⚠️ 只喂 `take` 个字节：末块的尾巴是 0x1A 补齐，不属于文件。
+     * 这是本文件里最容易漏掉的一句，漏了的表现是"所有块 CRC 都对，
+     * 但解出来的镜像最后一段是坏的"。 */
+    rc = fota_session_feed(payload, take);
+    if (rc != 0) {
+        ym_abort(fota_get_last_error());
+        return;
+    }
+    g_crc32      = fota_delta_crc32_update(g_crc32, payload, take);
+    g_delivered += take;
+    /* 块号回绕（`YMODEM_BLK_MODULUS` = 256，即 2^8）。
+     *
+     * ⚠️ 千万不要写成 `(uint8_t)YMODEM_BLK_MODULUS` —— 那个 cast 正好把
+     * 256 截成 0，运行时除零。GCC 会在**编译期**报 `-Wdiv-by-zero`，但它只是
+     * 警告：一份把警告当噪音的构建会带着这个缺陷上板（真机上是 HardFault）。
+     * 所以取模在 32 位里做、最后才截断，并且由
+     * `generator/tests/test_fota_ymodem.py` 的"窄化转换不得溢出"检查钉住。 */
+    g_expect_blk = (uint8_t)((((uint32_t)g_expect_blk) + 1U)
+                             % (uint32_t)YMODEM_BLK_MODULUS);
+
+    if (g_delivered >= g_declared) {
+        /* 文件收满：接下来应当是 EOT，而不是另一个数据块。 */
+        g_st = YM_ST_WAIT_EOT;
+    }
+    /* 每块提交一次进度（与帧协议同一份实现，见 fota_session_commit_progress）。
+     *
+     * 放在 ACK **之前**：ACK 的语义是"这一块我收下并记住了"，先 ACK 再落进度
+     * 就让那句话多承诺了一点点。续传的前缀复核阶段 `g_staged_bytes` 不涨，
+     * 会话层会自动跳过重复提交。 */
+    fota_session_commit_progress();
+    ym_ack();          /* ← 重试计数在这里复位，不许在别处复位，见 ym_ack() */
+}
+
+/* ===========================================================================
+ * 块的完成与分派
+ * =========================================================================== */
+
+static void ym_block_handle(void)
+{
+    uint8_t  kind    = g_blk[0];
+    uint8_t  blk_no  = g_blk[1];
+    uint8_t  blk_inv = g_blk[2];
+    uint16_t plen    = (kind == (uint8_t)YMODEM_CTL_SOH)
+                       ? (uint16_t)YMODEM_BLK_SIZE_SMALL
+                       : (uint16_t)YMODEM_BLK_SIZE_LARGE;
+    const uint8_t *payload = &g_blk[3];
+    uint16_t crc_rx;
+
+    g_blk_len  = 0U;
+    g_blk_need = 0U;
+
+    /* ① 块号自身校验（块号 + 反码）。放在 CRC 之前：反码不对说明块号本身
+     * 不可信，继续拿它去做去重判断只会得出无意义的结论。 */
+    if (((uint8_t)(blk_no ^ blk_inv)) != (uint8_t)YMODEM_BLK_COMPLEMENT) {
+        ym_nak();
+        return;
+    }
+
+    /* ② 块尾 CRC-16/XMODEM（高位字节在前）。覆盖**整段载荷（含补齐字节）** ——
+     * 发送端就是这么算的，两侧必须一致。 */
+    crc_rx = (uint16_t)(((uint16_t)payload[plen] << 8)
+                        | (uint16_t)payload[plen + 1U]);
+    if (ym_crc16(payload, plen) != crc_rx) {
+        ym_nak();
+        return;
+    }
+    /* ⚠️ 这里**故意不**复位 `g_retry`。
+     *
+     * 看起来"CRC 都通过了，说明链路是好的，该清零"很自然，但它会让一个
+     * **CRC 合法、块号却持续错乱**的主机永远打不穿重试上限：每轮 CRC 通过
+     * 清零 → 步骤 ⑥ 判块号不符 → NAK → 计数回到 1 → 下一轮再清零……
+     * 结果是无限 NAK 循环，UART 永远不还给 CLI。
+     * 复位的唯一位置是 `ym_ack()`（那才是"双方同步上了"的证据）。 */
+
+    /* ③ 结束块（载荷全 0 的块 0）。
+     *
+     * 判定必须放在**序号检查之前**：结束块的编号从 0 重新开始（它是"下一批
+     * 文件"的块 0），拿数据块的期望序号去衡量它必然失败。 */
+    if ((blk_no == (uint8_t)YMODEM_TERM_BLOCK_NO) && ym_all_zero(payload, plen)) {
+        if ((g_st == YM_ST_WAIT_EOT) || (g_st == YM_ST_WAIT_TERM)) {
+            ym_ack();
+            ym_end_batch();
+        } else {
+            /* 还没开始发文件就收到结束块 = 主机的批次是空的（操作员取消了
+             * 发送）。ACK 掉让主机的批处理干净收尾，然后本地放弃。 */
+            ym_ack();
+            ym_abort(FOTA_E_ABORTED);
+        }
+        return;
+    }
+
+    /* ④ 重复块：上一次的 ACK 丢了，主机重发了同一块。
+     * **再 ACK 一次但不再处理**。丢弃（既不 ACK 也不 NAK）会让主机一直等
+     * 不到应答、重发到超时；再处理一次会把同一段数据写两遍。 */
+    if (((g_st == YM_ST_WAIT_DATA) || (g_st == YM_ST_WAIT_EOT))
+        && (blk_no == (uint8_t)(g_expect_blk - 1U))) {
+        ym_ack();
+        return;
+    }
+
+    /* ⑤ 块 0 = 文件头。 */
+    if (blk_no == (uint8_t)YMODEM_HDR_BLOCK_NO) {
+        if (g_st == YM_ST_WAIT_HEADER) {
+            ym_handle_header(payload, plen);
+        } else {
+            /* 数据传了一半又来一个文件头：**不支持多文件批次**。一个补丁
+             * 就是一次升级，第二个文件没有语义；当成数据块处理会把文件头的
+             * 文本写进暂存区。 */
+            ym_abort(FOTA_E_IO);
+        }
+        return;
+    }
+
+    /* ⑥ 数据块：序号必须正好是期望值。 */
+    if (blk_no != g_expect_blk) {
+        ym_nak();
+        return;
+    }
+    if (g_st != YM_ST_WAIT_DATA) {
+        /* 已经收满（WAIT_EOT）又来数据块 ⇒ 主机发的比声明的多。 */
+        ym_abort(FOTA_E_LENGTH);
+        return;
+    }
+    ym_handle_data(payload, plen);
+}
+
+/* ===========================================================================
+ * EOT
+ * =========================================================================== */
+
+static void ym_handle_eot(void)
+{
+    int rc;
+
+    if (g_st == YM_ST_WAIT_HEADER) {
+        /* 还没开始发文件就 EOT：主机放弃（操作员在终端里按了取消）。
+         * 先 ACK 掉，让主机的会话干净结束，再本地放弃。 */
+        ym_ack();
+        ym_abort(FOTA_E_ABORTED);
+        return;
+    }
+    if ((g_st != YM_ST_WAIT_EOT) && (g_st != YM_ST_WAIT_DATA)) {
+        /* 已经处理过 EOT 了（WAIT_TERM / DONE）。重复的 EOT 直接忽略 ——
+         * 不能重复 ACK，那会让主机以为还有下一拍。 */
+        return;
+    }
+
+    g_eot_count++;
+
+    if (g_eot_count <= (uint8_t)YMODEM_EOT_NAK_BEFORE_ACK) {
+        /* 第一拍回 NAK。这是 lrzsz `rz` 的行为，也是 `sb` 期望的：
+         * sb 收到 NAK 会重发 EOT，等于给了接收方一次"上一拍的 EOT 是不是
+         * 链路噪声"的复核机会。拍数写在真源里（实现之间有分歧），
+         * 不在代码里埋一个 1。 */
+        ym_nak();
+        return;
+    }
+
+    if (g_delivered != g_declared) {
+        /* 文件没收满就来 EOT。**不能在这里"从缺口续传"**：YMODEM 没有
+         * "从偏移续传"这回事，主机只会重发整个文件。回 NAK 并保持接收态，
+         * 让主机的批处理停下来并报出失败。 */
+        ym_nak();
+        return;
+    }
+
+    /* 收尾：落盘 → 从 Flash 回读复算 CRC32 → 提交 READY。
+     *
+     * 放在 ACK **之前**：YMODEM 里 EOT 的 ACK 语义是"这一份文件我完整地
+     * 收到了"，先 ACK 再校验会让那句话变成谎话。 */
+    rc = fota_session_finish(g_crc32 ^ (uint32_t)FOTA_CRC32_FINAL_XOR);
+    if (rc != FOTA_SESSION_OK) {
+        ym_nak();
+        if (rc == FOTA_SESSION_SHORT) {
+            /* 缺字节：会话仍是 RECEIVING，交还 UART 但**不动暂存区与元数据**，
+             * 主机重发整份文件时会逐字节复核已提交的前缀、从断点接着收。 */
+            fota_session_abort();
+        }
+        /* FOTA_SESSION_FAILED 时会话层已经置 ERROR 并交还了 UART。 */
+        g_st = YM_ST_DONE;
+        return;
+    }
+
+    ym_ack();
+
+    /* EOT 之后发 'C' 邀请结束块。⚠️ 结束块**从 0 重新编号**（它是"下一批文件"
+     * 的块 0），所以这里必须把期望序号复位 —— 不复位的话，那个合法的结束块
+     * 会被当成"序号不对"而 NAK，主机会一直卡在结束阶段。 */
+    g_st         = YM_ST_WAIT_TERM;
+    g_expect_blk = (uint8_t)YMODEM_TERM_BLOCK_NO;
+    g_tick       = HAL_GetTick();
+    ym_send_ctl((uint8_t)YMODEM_CTL_CRC_REQUEST);
+}
+
+/* ===========================================================================
+ * 对外接口
+ * =========================================================================== */
+
+int fota_ymodem_begin(char *msg, uint32_t msg_len)
+{
+    /* 与帧协议共用同一套判定：READY / DONE 下暂存区里有一条**已校验通过、
+     * 等着启动**的补丁，两个入口都不许把它静默丢掉。 */
+    if (fota_receive_ready(msg, msg_len) != 0) {
+        return -1;
+    }
+
+    (void)memset(g_name, 0, sizeof(g_name));
+    g_blk_len    = 0U;
+    g_blk_need   = 0U;
+    g_expect_blk = (uint8_t)YMODEM_HDR_BLOCK_NO;
+    g_declared   = 0U;
+    g_delivered  = 0U;
+    g_crc32      = FOTA_CRC32_INIT;
+    g_c_sent     = 0U;
+    g_retry      = 0U;
+    g_eot_count  = 0U;
+    g_can_count  = 0U;
+    g_tick       = HAL_GetTick();
+    g_st         = YM_ST_WAIT_HEADER;
+
+    /* 先接管字节流、再发第一个 'C'。顺序反了的话，主机在 'C' 到达之前
+     * 就可能已经按自己的节奏开始发块 0，而那时一个字节都进不来。 */
+    cli_set_rx_sink(fota_ymodem_rx_bytes);
+    fota_transport_begin(FOTA_TP_YMODEM);
+
+    /* 立刻发第一个 'C'，不等一个握手周期 —— 操作员刚敲完命令就在等这个
+     * 信号（终端软件靠它才知道设备已经准备好）。 */
+    ym_send_ctl((uint8_t)YMODEM_CTL_CRC_REQUEST);
+    g_c_sent = 1U;
+    return 0;
+}
+
+void fota_ymodem_rx_bytes(const uint8_t *data, uint16_t len)
+{
+    uint16_t i;
+
+    for (i = 0U; i < len; i++) {
+        uint8_t b = data[i];
+
+        if ((g_st == YM_ST_DONE) || (g_st == YM_ST_IDLE)) {
+            return;                      /* 本批已结束：余下的字节不再属于它 */
+        }
+
+        if (g_blk_len == 0U) {
+            /* ---- 等一个"新东西"的起始字节 ---- */
+
+            /* ⚠️ **只有在这个位置才把 CAN 当中止信号**（头文件约束 ③）。
+             * 补丁正文是接近随机的字节流，一段 100 KB 的补丁按概率会出现
+             * 若干个 0x18；若在块内也把连续两个 0x18 当中止，正常传输会被
+             * 随机数据打断。发送端的 CAN CAN 本来就发在块边界上，所以在
+             * 块边界识别既不丢信号也不误判。 */
+            if (b == (uint8_t)YMODEM_CTL_CAN) {
+                g_can_count++;
+                if (g_can_count >= (uint8_t)YMODEM_CAN_BEFORE_ABORT) {
+                    ym_abort(FOTA_E_ABORTED);
+                    return;
+                }
+                continue;
+            }
+            g_can_count = 0U;
+
+            if (b == (uint8_t)YMODEM_CTL_SOH) {
+                g_blk[0]   = b;
+                g_blk_len  = 1U;
+                g_blk_need = (uint16_t)(YMODEM_BLK_OVERHEAD + YMODEM_BLK_SIZE_SMALL);
+                g_tick     = HAL_GetTick();
+                continue;
+            }
+            if (b == (uint8_t)YMODEM_CTL_STX) {
+                g_blk[0]   = b;
+                g_blk_len  = 1U;
+                g_blk_need = (uint16_t)(YMODEM_BLK_OVERHEAD + YMODEM_BLK_SIZE_LARGE);
+                g_tick     = HAL_GetTick();
+                continue;
+            }
+            if (b == (uint8_t)YMODEM_CTL_EOT) {
+                g_tick = HAL_GetTick();
+                ym_handle_eot();
+                continue;
+            }
+            /* 其余一律丢弃、继续找起始字节。这样"主机把日志文本混进来"、
+             * "上一块被截断后残留的半块"都能自动重新同步。 */
+            continue;
+        }
+
+        if (g_blk_len >= (uint16_t)sizeof(g_blk)) {
+            /* 防御：need 恒 ≤ sizeof(g_blk)，不应发生。 */
+            g_blk_len  = 0U;
+            g_blk_need = 0U;
+            continue;
+        }
+        g_blk[g_blk_len] = b;
+        g_blk_len++;
+
+        if (g_blk_len == g_blk_need) {
+            ym_block_handle();
+        }
+    }
+}
+
+void fota_ymodem_process(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    switch (g_st) {
+    case YM_ST_WAIT_HEADER:
+        if ((now - g_tick) >= (uint32_t)YMODEM_HS_INTERVAL_MS) {
+            if (g_c_sent >= (uint8_t)YMODEM_HS_MAX_ATTEMPTS) {
+                /* 主机始终没有开始（没选文件、或根本没在听）。
+                 * 交还 UART 并**退回 IDLE 而不是 ERROR**：什么都没有发生，
+                 * 不需要人工清理，再敲一次命令就行。 */
+                fota_note_error(FOTA_E_IO);
+                fota_session_abort();
+                g_st = YM_ST_DONE;
+                return;
+            }
+            ym_send_ctl((uint8_t)YMODEM_CTL_CRC_REQUEST);
+            g_c_sent++;
+            g_tick = now;
+        }
+        break;
+
+    case YM_ST_WAIT_DATA:
+    case YM_ST_WAIT_EOT:
+        if ((now - g_tick) >= (uint32_t)YMODEM_BLOCK_TIMEOUT_MS) {
+            /* 半块也一并丢掉：块一旦被截断，后面的字节只会被当成载荷拼进去，
+             * 拼出来的块 CRC 必然不对、又是 NAK。不如现在就丢，让下一个
+             * 起始字节干净地重新同步。 */
+            g_blk_len  = 0U;
+            g_blk_need = 0U;
+            g_tick     = now;
+            ym_nak();
+        }
+        break;
+
+    case YM_ST_WAIT_TERM:
+        if ((now - g_tick) >= (uint32_t)YMODEM_TERMINATOR_TIMEOUT_MS) {
+            /* 主机没有发结束块。补丁**已经**收齐并通过 CRC32（否则走不到
+             * WAIT_TERM）；结束块只是"这一批结束了"的礼节，而且有些发送端
+             * 根本不发它。因为少一个 ACK 就把一次成功的升级判成失败是错的。 */
+            ym_end_batch();
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+const char *fota_ymodem_file_name(void)
+{
+    return g_name;
+}

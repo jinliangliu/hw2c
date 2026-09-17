@@ -110,6 +110,27 @@ typedef enum {
 #define FOTA_E_IO                108   /* 协议层错误（帧头/长度/序号异常已处理）*/
 #define FOTA_E_ROLLBACK          109   /* 补丁应用成功但新槽没能起来，已回退旧槽 */
 #define FOTA_E_STAGING_LOST      110   /* 记录说"已收齐"，但暂存区里的信封读不回来/对不上 */
+#define FOTA_E_LENGTH            111   /* 主机声明的长度与信封不符，或实际收到的字节数超出声明 */
+#define FOTA_E_ABORTED           112   /* 传输被中止（主机发 CAN，或本侧重试耗尽后主动放弃） */
+
+/* ---- 传输方式 -----------------------------------------------------------
+ *
+ * 为什么必须有这个类型，而不是"看哪个回调被装上"：
+ * `fota_process()` 里有两件**互斥**的周期性工作 —— 帧协议的空闲超时要
+ * `fota_receive_abort()`，YMODEM 的握手要周期发 'C' 并处理块超时。两者的
+ * 时基都由 `g_last_activity_ms` 折算，若不区分传输方式，一次 YMODEM 传输
+ * 会被帧协议的空闲超时判定为"主机静默"而中途中止（而且是在 2 s 之后，
+ * 表现为"YMODEM 传到一半设备自己放弃了"）。
+ *
+ * ⚠️ 定义必须在这里（不是 drv_fota.c）：`fota_transport_begin()` 的形参
+ * 用的就是它，而 `drv_shell.c` / `main.c` / `event_mgr.c` 只 include 本头
+ * 文件 —— 类型留在 .c 里，这些翻译单元会以 `unknown type name` 失败。
+ */
+typedef enum {
+    FOTA_TP_NONE = 0,     /* 没有正在进行的接收 */
+    FOTA_TP_FRAME,        /* 帧协议（fota recv） */
+    FOTA_TP_YMODEM        /* YMODEM（fota ymodem） */
+} fota_transport_t;
 
 /* ---- API ---------------------------------------------------------------- */
 
@@ -128,6 +149,9 @@ void fota_init(void);
  * 负责三件事：接收空闲超时、把 UART 交还 CLI、执行待办的应用任务。
  * 应用（擦 + 解码 + 校验）在本函数里**同步跑完**，不拆成分片 ——
  * 规划 §5.3 的结论：把并发问题消掉，而不是加锁。
+ *
+ * 这里也是**传输层**的节拍来源：帧协议的空闲超时与 YMODEM 的握手重发
+ * 都由本函数按当前生效的传输方式分别驱动（见下面的 `g_transport`）。
  */
 void fota_process(void);
 
@@ -183,5 +207,149 @@ int fota_apply_request(void);
  * @return 0 成功
  */
 int fota_erase_target(void);
+
+/* ===========================================================================
+ * 暂存会话（session）—— 两条传输通道共用
+ *
+ * 为什么要有这一层
+ * ----------------
+ * 帧协议（`fota_rx_bytes`）与 YMODEM（`drv_fota_ymodem.c`）**唯一的差别**是
+ * "字节怎么进来"：前者是定长分片 + 显式序号 + 停等 ACK，后者是 128/1024 字节
+ * 块 + 16 位 CRC。而字节进来**之后**的一切必须逐字节相同 ——
+ *
+ *   · 容量准入公式（`align_up(new_size, page) + align_up(48 + patch_size, 8)`）
+ *   · 暂存区几何（`staging_base = slot_base + slot_size - align_up(record, 8)`）
+ *   · 续传判定（记录状态 + 槽 + 进度区间 + 信封逐字节相同）
+ *   · 信封先落盘、双字对齐攒批、`0xFF` 补尾
+ *   · 收尾的"从 Flash 回读整条记录复算 CRC32"
+ *   · 提交 READY 与元数据追加的先后
+ *
+ * 各写一份的结局不是"代码重复"，而是**两份准入公式**——而"边界少算一页、
+ * 应用期把暂存区首页擦掉"这类缺陷的全部难点就在于它只在一小段边界上出现，
+ * 两份实现里总会有一份没被那条边界测到。所以本文件把这部分收敛成下面这组
+ * 接口，两条传输都只经由它落盘。
+ *
+ * ⚠️ 本组接口是**模块内部契约**（`drv_fota` ↔ `drv_fota_ymodem`），
+ * 应用代码不应当直接调用。
+ * =========================================================================== */
+
+/**
+ * 传输层的字节流从记录的哪个位置开始 —— 由传输层**声明事实**，
+ * 会话据此决定要不要重放复核已提交的前缀。
+ */
+typedef enum {
+    /**
+     * 帧协议：主机按 ACK 里携带的 `next_seq` 续传，所以它只会发"断点之后"
+     * 的字节。此时流里的第一个字节就是记录的第 `fota_session_stream_start()`
+     * 个字节，已提交的前缀**不会再出现**。
+     */
+    FOTA_STREAM_FROM_COMMIT_POINT = 0,
+
+    /**
+     * YMODEM：协议里没有"部分续传"，主机**恒从文件字节 0 开始重发**。
+     * 此时会话把已提交的前缀当作"要复核的重放"：逐字节与 Flash 里的内容
+     * 比对，不一致立刻失败（**fail-fast**）。
+     *
+     * 为什么必须比对而不是直接跳过：跳过也能保证最终正确（收尾那次
+     * 回读 CRC32 覆盖整条记录），但校验失败要等到全部传完才报出来 ——
+     * 操作员会为一个 3 秒就能发现的问题多等一次完整传输。
+     *
+     * 顺带这也是"YMODEM 侧能续传"的全部实现：主机不知道断点在哪，
+     * 设备也不需要知道 —— 它只要一边复核一边等流追上断点。
+     */
+    FOTA_STREAM_FROM_RECORD_START = 1
+} fota_stream_origin_t;
+
+/**
+ * @brief 打开一次暂存会话：校验信封 → 准入 → 定几何 → 判续传 → 落信封。
+ *
+ * @param env_bytes   来帧携带的 48 B 信封（传输层负责取出来）
+ * @param record_size 整条记录长度。
+ *                    **0 = 由信封里的 `patch_size` 推出**（帧协议的 START 帧
+ *                    没有长度字段，信封是唯一来源）；
+ *                    YMODEM 侧必须传块 0 声明的真实长度 —— 于是这里同时成为
+ *                    "主机声明长度"与"信封声明长度"的**唯一交叉核对点**。
+ * @param origin      流起点语义（见 `fota_stream_origin_t`）
+ * @return 0 成功；非 0 失败，`fota_get_last_error()` 已置成具体错误码
+ */
+int fota_session_open(const uint8_t *env_bytes, uint32_t record_size,
+                      fota_stream_origin_t origin);
+
+/** 会话本次的流在记录里的起始偏移（`fota_session_open` 成功之后才有意义）。 */
+uint32_t fota_session_stream_start(void);
+
+/**
+ * @brief 喂入记录字节（信封也走这里）。内部处理续传前缀的复核。
+ * @return 0 成功；-1 = 越界、复核不符或 Flash 编程失败（已置错误码）
+ */
+int fota_session_feed(const uint8_t *data, uint32_t len);
+
+/* `fota_session_finish()` 的返回值。
+ *
+ * 刻意把"还能救"与"必须停"分开，因为两条传输对同一个失败的反应**不同**：
+ * 帧协议可以在主机补发之后重试 FINISH（NAK 里带断点），YMODEM 只能重传整个
+ * 文件。若统一返回 -1，调用方就只能一律进终态 —— 那是把"缺一片"升级成
+ * "必须重新开始"。 */
+#define FOTA_SESSION_OK       0
+#define FOTA_SESSION_SHORT    1    /* 长度不符：可由主机补发 / 重传后重试 */
+#define FOTA_SESSION_FAILED  (-1)  /* 已置 ERROR，暂存区内容不可信 */
+
+/**
+ * @brief 收尾：落盘 → 从 Flash 回读复算 CRC32 → 与期望值比对 → 交叉核对长度
+ *        → 提交 READY 并请求应用。
+ *
+ * @param expected_crc32 整条记录 CRC-32/ISO-HDLC 的期望值。
+ *        帧协议侧来自主机 FINISH 帧（主机算的）；YMODEM 侧由设备在接收过程中
+ *        自己累加（YMODEM 协议本身没有全文件校验，见 drv_fota_ymodem.c 的说明）。
+ * @return `FOTA_SESSION_*`
+ */
+int fota_session_finish(uint32_t expected_crc32);
+
+/**
+ * @brief 提交当前进度（"掉电最多退回一块/一帧"的粒度）。
+ *
+ * 两条传输都调它，**实现只有一份** —— 于是"要不要按新进展门控、什么时候
+ * 可以跳过"这类策略只在一个地方。详见 drv_fota.c 里的说明。
+ */
+void fota_session_commit_progress(void);
+
+/**
+ * @brief 放弃会话：交还 UART、清传输方式、状态退回 IDLE。
+ * @note   **不擦除暂存区、不动元数据** —— 主机可以接着续传。
+ */
+void fota_session_abort(void);
+
+/**
+ * @brief "现在能不能开始接收"的**唯一**判定（两条传输共用）。
+ *
+ * @param msg     失败时写入原因（可为 NULL）
+ * @param msg_len 缓冲区长度
+ * @return 0 可以；非 0 = 拒绝，原因已写进 msg，错误码已置
+ *
+ * 抽成独立函数是因为"哪些状态允许进入接收"是一条**安全策略**
+ * （READY / DONE 下暂存区里有一条已校验通过的补丁，允许进入就等于允许
+ * 静默丢弃它）。两个入口各判一次，迟早会有一个漏掉某个状态。
+ */
+int fota_receive_ready(char *msg, uint32_t msg_len);
+
+/**
+ * @brief 记录一次**传输层**失败的原因（不改状态机状态）。
+ *
+ * 为什么与"置 ERROR"分开：传输层的失败（握手超时、重试耗尽、主机 CAN 中止）
+ * **没有破坏已经落盘的东西** —— 元数据里的 RECEIVING 记录仍然有效，主机重发
+ * 就能续传。把它升格成 ERROR 会让 `fota status` 显示一个需要人工介入的终态
+ * （`fota recv` 虽然仍可用，但操作员会先去敲 `fota erase`），而实际上再试一次
+ * 就行。真正的 ERROR 只留给"已落盘内容不可信"那几种（Flash 编程失败、
+ * 回读 CRC32 不符）。
+ */
+void fota_note_error(int code);
+
+/**
+ * @brief 由传输层在接管 UART 之后声明自己是哪一种。
+ *
+ * `fota_process()` 据此决定驱动哪一套周期性工作（帧协议的空闲超时 /
+ * YMODEM 的握手与块超时）。两者互斥，见 drv_fota.c 里 `g_transport` 的说明。
+ */
+void fota_transport_begin(fota_transport_t tp);
 
 #endif /* __DRV_{{ peripheral.name | upper }}_H */
