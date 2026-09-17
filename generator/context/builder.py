@@ -17,7 +17,9 @@ from .pin_context import process_pins
 from .peripheral_context import detect_peripherals
 from .bearer_context import associate_bearers
 from .hal_context import compute_hal_sources
-from .bootloader_context import build_boot_config, inject_bootloader_drivers, get_boot_led_pin
+from .bootloader_context import (build_boot_config, inject_bootloader_drivers,
+                                   get_boot_led_pin, fota_format_for_templates,
+                                   fota_delta_budget)
 
 # Builder registry — auto-discovers all @register_builder classes
 try:
@@ -130,6 +132,7 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
                                              boot_config, uart_name)
     drivers.extend(boot_result['drivers_additions'])
     has_fota = boot_result['has_fota']
+    has_fota_receive = boot_result['has_fota_receive']
     for hal_file in boot_result['hal_additions']:
         if hal_file not in hal_sources:
             hal_sources.append(hal_file)
@@ -856,6 +859,8 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
 
     # ---------- 预计算：Bootloader 字节大小 ----------
     boot_size_bytes = boot_config.get("size_kb", 8) * 1024 if has_bootloader else 0
+    # 差分应用的 RAM 预算（默认值有实测依据，见 bootloader_context.fota_delta_budget）
+    budget = fota_delta_budget(boot_config)
 
     # ---------- 预计算：状态枚举稳定值（djb2 哈希） ----------
     def _djb2_hash(s: str) -> int:
@@ -1023,6 +1028,12 @@ def build_context(hw: dict, project_name: str, hil_mode: bool = False) -> BuildC
         has_substate=has_substate,
         has_bootloader=has_bootloader,
         has_fota=has_fota,
+        has_fota_receive=has_fota_receive,
+        # 头部/信封布局的唯一真源，转成 C 模板直接可用的常量（防 A3）
+        fota_fmt=fota_format_for_templates(),
+        fota_delta_page_size=budget['page_size'],
+        fota_delta_cache_size=budget['cache_size'],
+        fota_delta_dict_size=budget['dict_size'],
         has_iwdg=(has_bootloader or peri_result["has_iwdg"]),
         has_event_mgr=True,
         has_tickless=has_tickless,

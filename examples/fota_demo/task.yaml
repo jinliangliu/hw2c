@@ -1,0 +1,64 @@
+# ============================================================
+# hw2c minimal system unit — software tasks layer
+#
+# System tasks (FreeRTOS):
+#   events_process_task  Centralized event dispatch via queue
+#   cli_task             CLI interaction + log output via USART2 (auto)
+#
+# Components (hw2c component framework):
+#   led                  LED multi-instance pattern driver
+#   btn                  Button multi-instance gesture detector
+# ============================================================
+
+project:
+  name: base
+  version: "1.0.0"
+  heap_size: 24576
+
+event_task:
+  name: events_process_task
+  entry: vEventTask
+  priority: 3
+  stack_size: 512
+  queue_depth: 16
+
+# Button gesture → LED pattern mapping
+# The btn component detects SHORT_PRESS / DOUBLE_PRESS / LONG_PRESS
+# and publishes them to event_queue. The state machine
+# maps each gesture to a distinct LED pattern.
+behavior:
+  initial_state: IDLE
+  states:
+    - name: IDLE
+      transitions:
+        - event: BUTTON_SHORT_PRESS
+          target: IDLE
+          actions:
+            - led_pattern fast_blink
+            - 'log "button: SHORT_PRESS"'
+            - shell_temp
+        - event: BUTTON_DOUBLE_PRESS
+          target: IDLE
+          actions:
+            - led_pattern slow_blink
+            - 'log "button: DOUBLE_PRESS"'
+            - shell_temp
+        - event: BUTTON_LONG_PRESS
+          target: IDLE
+          actions:
+            - led_pattern fault
+            - 'log "button: LONG_PRESS"'
+            - shell_temp
+
+# Periodic RTC alarm events
+periodic_events:
+  # 30-second telemetry report: heartbeat, stack watermarks, heap, component health
+  - event: SECONDS_30
+    actions:
+      - telemetry_snapshot
+      - power_status
+
+  # 5-minute telemetry report
+  - event: MINUTE_5
+    actions:
+      - telemetry_snapshot

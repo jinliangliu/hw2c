@@ -1,0 +1,58 @@
+# Runtime parameter definitions
+# Parameters are typed, bounded values that can be read/written at runtime
+# via shell CLI (e.g., "param get led_brightness", "param set led_brightness 200").
+
+params:
+  - name: led_brightness
+    component: shell
+    type: uint32
+    default: 200
+    min: 0
+    max: 255
+    description: "LED PWM duty cycle (0..255)"
+
+  - name: log_level
+    component: system
+    type: uint32
+    default: 3
+    min: 0
+    max: 4
+    description: "Log level (0=OFF, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG)"
+
+  - name: telemetry_enabled
+    component: system
+    type: bool
+    default: true
+    description: "Enable periodic telemetry snapshot logging"
+
+  - name: telemetry_interval_s
+    component: system
+    type: uint32
+    default: 30
+    min: 10
+    max: 3600
+    description: "Telemetry report interval in seconds"
+
+  - name: sleep_depth
+    component: system
+    type: uint32
+    default: 0
+    min: 0
+    max: 5
+    description: "Sleep mode depth: 0=RUN, 1=SLEEP, 2=STOP0, 3=STOP1, 4=STOP2, 5=STANDBY"
+
+  - name: btn_BUTTON_long_press_ms
+    component: btn
+    type: uint32
+    default: 3000
+    min: 200
+    max: 10000
+    description: "Button 'BUTTON' long press threshold (ms)"
+
+  - name: btn_BUTTON_double_click_ms
+    component: btn
+    type: uint32
+    default: 500
+    min: 150
+    max: 2000
+    description: "Button 'BUTTON' double click timeout window (ms)"

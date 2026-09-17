@@ -1,0 +1,42 @@
+# Component registry configuration
+# Each component wraps hardware drivers via POSIX interfaces.
+# Component implementations must provide:
+#   {name}_init(component_t *c, void *cfg)  → return 0 on success
+#   {name}_step(component_t *c)             → periodic process
+#   {name}_terminate(component_t *c)        → cleanup
+
+components:
+  - name: shell
+    type: shell_cli
+    driver: usart2
+    period_ms: 50
+    sleep_compat: STOP1
+    config:
+      prompt: "hw2c> "
+      history_size: 8
+    priority: 3
+    stack_size: 1024
+
+  # LED component — multi-instance pattern driver
+  # Discovers all pins labeled "LED*" from hardware.yaml automatically.
+  # Each LED instance supports 4 patterns: OFF/FAST/SLOW/FAULT.
+  - name: led
+    type: led
+    driver: gpio
+    period_ms: 50
+    sleep_compat: STOP1
+    config:
+      default_pattern: off
+
+  # Button component — multi-instance gesture detector
+  # Discovers all pins labeled "BUTTON*" with EXTI from hardware.yaml.
+  # Each button instance detects SHORT_PRESS / DOUBLE_PRESS / LONG_PRESS.
+  - name: btn
+    type: btn
+    driver: gpio
+    period_ms: 10
+    sleep_compat: STOP1
+    config:
+      long_press_ms: 3000
+      double_click_ms: 500
+      debounce_ms: 50

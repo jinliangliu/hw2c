@@ -506,5 +506,5 @@ hw2c 的处理方式（**不修改 vendor**）：
 | FR-17 工具链/CI | `templates/project/*`、`templates/vscode/*`、`.github/workflows/build_and_test.yml` |
 | FR-18 可视化配置台 | `docs/roadmap/phase5-plan.md`、`docs/plans/three-layer-split.md`（Web 章节） |
 | NFR-3 / Phase 6 | `docs/roadmap/milestones.md` |
-| NFR-12 子模块约束 | `AGENTS.md` 教训 1、`generator/generate.py::_apply_vendored_patches()` |
+| NFR-12 子模块约束 | `AGENTS.md` 教训 1、`docs/requirements.md` §6.1、`templates/src/main.c.j2`（以初始化**排序**替代生成期补丁，旧的 `generate.py::_apply_vendored_patches()` 已删除） |
 | 全部 | `README.md`、`AGENTS.md`、`docs/developer-guide/architecture-overview.md` |

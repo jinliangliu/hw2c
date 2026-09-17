@@ -44,10 +44,12 @@ sys.path.insert(0, str(_REPO_ROOT))
 from generator.delta_tool import (  # noqa: E402
     HPI_COMPRESS_TYPE_NO,
     HPI_VERSION_CODE,
+    apply_header_placeholders,
     build,
     crc16_ccitt_false,
     diff_to_covers,
     encode_lite_stream,
+    image_crc32,
     info,
     lite_body,
     pack_lite_header,
@@ -57,6 +59,16 @@ from generator.delta_tool import (  # noqa: E402
     split_image,
     verify_host,
 )
+from generator.tests.delta_fixtures import (  # noqa: E402
+    SLOT_A_BASE,
+    SLOT_B_BASE,
+    VECTOR_BYTES,
+    expected_target,
+    finalize_image,
+    firmware_like as _firmware_like,
+    slot_image,
+)
+from generator.patch_crc import load_spec  # noqa: E402
 
 
 def _posix(p) -> str:
@@ -144,15 +156,27 @@ def apply_oracle(old: bytes, patch: bytes, tmp_path: Path,
     return out_f.read_bytes(), stats
 
 
-def assert_roundtrip(old: bytes, new: bytes, tmp_path: Path, *, version: int = 3,
-                     compress=False) -> bytes:
-    """核心判据：old + patch 必须逐字节还原出 new。"""
+def assert_roundtrip(old_code: bytes, new_code: bytes, tmp_path: Path, *,
+                     version: int = 3, compress=False) -> bytes:
+    """核心判据：old + patch 必须逐字节还原出 new。
+
+    入参是**代码区**（不是整镜像）。差分域是整个 slot 镜像，所以这里先把两段
+    代码包成合法的 slot 镜像 —— 且刻意放在**不同的槽基址**上（A→B），因为真实
+    的 A/B 更新正是这样：两个槽的向量表与绝对地址都不同，这是差分必须吸收的
+    差异。若夹具把两侧生成得一样，就测不出这一类问题。
+
+    比对基准是 `expected_target(new)` 而不是 `new`：头部里 `image_size`/`crc32`
+    两个字段由设备事后回填，差分流里恒为 0xFFFFFFFF（见
+    `delta_tool.apply_header_placeholders`）。真值另由单独用例断言。
+    """
+    old = slot_image(old_code, fw_version=version - 1, slot_base=SLOT_A_BASE)
+    new = slot_image(new_code, fw_version=version, slot_base=SLOT_B_BASE)
     patch = build(old, new, fw_version=version, compress=compress)
     verify_host(old, new, patch)                       # L1
     got, _ = apply_oracle(old, patch, tmp_path,
                           with_tuz=(compress is not False))   # L2
-    assert got == new, (
-        "oracle 还原结果与 new 不一致：len %d vs %d" % (len(got), len(new)))
+    assert got == expected_target(new), (
+        "oracle 还原结果与期望镜像不一致：len %d vs %d" % (len(got), len(expected_target(new))))
     return patch
 
 
@@ -169,10 +193,10 @@ def test_oracle_builds_and_is_self_evidently_functional():
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        old = bytes(range(256)) * 4
+        old = slot_image(bytes(range(256)) * 4)
         patch = build(old, old, fw_version=1, compress=False)
         got, stats = apply_oracle(old, patch, td)
-        assert got == old, "oracle 连恒等补丁都还原不了 —— 判据本身失效"
+        assert got == expected_target(old), "oracle 连恒等补丁都还原不了 —— 判据本身失效"
         assert stats.get("tuz_calls", 0) == 0, "未压缩路径不应触发解压"
 
 
@@ -259,12 +283,27 @@ def test_crc16_ccitt_false_check_value():
     assert crc16_ccitt_false(b"123456789") == 0x29B1
 
 
+def _mk(old_code: bytes, new_code: bytes, ver: int = 7):
+    """把两段代码包成 A→B 的一对 slot 镜像（L1 用例的通用入口）。"""
+    return (slot_image(old_code, fw_version=ver - 1, slot_base=SLOT_A_BASE),
+            slot_image(new_code, fw_version=ver, slot_base=SLOT_B_BASE))
+
+
+def _l2_pair(n: int, seed: int):
+    """造一对 A→B 镜像：新代码 = 旧代码前 (n-500) 字节 + 一段新尾部。"""
+    old_code = _firmware_like(n, seed=seed)
+    new_code = old_code[:n - 500] + b"TAIL" * 10
+    return (slot_image(old_code, fw_version=1, slot_base=SLOT_A_BASE),
+            slot_image(new_code, fw_version=2, slot_base=SLOT_B_BASE))
+
+
 def test_envelope_roundtrip_and_field_placement():
-    patch = build(b"payload-old", b"payload-new!!", fw_version=0x123456)
+    old, new = _mk(b"payload-old", b"payload-new!!")
+    patch = build(old, new, fw_version=0x123456)
     env = parse_envelope(patch)
     assert env["fw_version"] == 0x123456
-    assert env["old_size"] == 11
-    assert env["new_size"] == 13
+    assert env["old_size"] == len(old), "old_size 是**差分域**长度（含向量表与头部）"
+    assert env["new_size"] == len(new)
     assert env["compressed"] is False
     assert env["auth_len"] == 0
     assert env["patch_size"] == len(patch) - 48
@@ -272,14 +311,14 @@ def test_envelope_roundtrip_and_field_placement():
 
 def test_envelope_version_is_covered_by_header_crc():
     """篡改 fw_version 必须让信封头 CRC 失败 —— 否则版本号可被伪造。"""
-    patch = bytearray(build(b"a" * 32, b"b" * 32, fw_version=7))
+    patch = bytearray(build(*_mk(b"a" * 32, b"b" * 32), fw_version=7))
     patch[28] ^= 0x01                      # fw_version 位于偏移 28
     with pytest.raises(ValueError, match="CRC16"):
         parse_envelope(bytes(patch))
 
 
 def test_envelope_rejects_unknown_flags():
-    patch = bytearray(build(b"a" * 32, b"b" * 32, fw_version=7))
+    patch = bytearray(build(*_mk(b"a" * 32, b"b" * 32), fw_version=7))
     patch[6] |= 0x80                       # flags 位于偏移 6
     struct.pack_into("<H", patch, 32, crc16_ccitt_false(bytes(patch[:32])))
     with pytest.raises(ValueError, match="未知位"):
@@ -287,7 +326,7 @@ def test_envelope_rejects_unknown_flags():
 
 
 def test_info_rejects_truncated_or_short_patch():
-    patch = build(b"x" * 64, b"y" * 64, fw_version=1)
+    patch = build(*_mk(b"x" * 64, b"y" * 64), fw_version=1)
     with pytest.raises(ValueError):
         info(patch[:20])                   # 装不下信封
     with pytest.raises(ValueError, match="截断"):
@@ -297,24 +336,38 @@ def test_info_rejects_truncated_or_short_patch():
 
 
 def test_info_rejects_wrong_lite_magic():
-    patch = bytearray(build(b"x" * 64, b"y" * 64, fw_version=1))
+    patch = bytearray(build(*_mk(b"x" * 64, b"y" * 64), fw_version=1))
     patch[48] = ord("H")                   # 把 'h' 改成 'H'
     with pytest.raises(ValueError, match="hI"):
         info(bytes(patch))
 
 
 def test_verify_host_rejects_mismatched_old():
-    patch = build(b"x" * 64, b"y" * 64, fw_version=1)
-    verify_host(b"x" * 64, b"y" * 64, patch)
+    """旧镜像不匹配必须以两种方式被拒：
+
+    * 结构上不成立（长度与头部矛盾）→ `split_image` 直接拒绝；
+    * 结构成立但内容不对（例如拿了另一个槽的镜像）→ 信封字段自检失败。
+
+    第二种才是 OTA 现场最容易犯的错：把"为 Slot B 链接的镜像"当成设备上
+    Slot A 的那份。此时补丁"看起来生成成功"，装上却对不上。
+    """
+    old, new = _mk(b"x" * 64, b"y" * 64)
+    patch = build(old, new, fw_version=1)
+    verify_host(old, new, patch)
+
+    with pytest.raises(ValueError):
+        verify_host(old[:-1], new, patch)           # 结构不成立
+
+    other_slot = slot_image(b"x" * 64, fw_version=0, slot_base=SLOT_B_BASE)
+    assert other_slot != old, "两槽镜像本该不同（向量表里的绝对地址不同）"
     with pytest.raises(AssertionError):
-        verify_host(b"x" * 63, b"y" * 64, patch)
+        verify_host(other_slot, new, patch)         # 结构成立但内容不对
 
 
 def test_build_is_deterministic():
     """同一对输入必须产出逐字节相同的补丁（可复现构建）。"""
-    a = build(b"hello" * 40, b"hello" * 39 + b"world", fw_version=5)
-    b = build(b"hello" * 40, b"hello" * 39 + b"world", fw_version=5)
-    assert a == b
+    old, new = _mk(b"hello" * 40, b"hello" * 39 + b"world", ver=5)
+    assert build(old, new, fw_version=5) == build(old, new, fw_version=5)
 
 
 # ---------------------------------------------------------------------------
@@ -422,43 +475,43 @@ def test_encode_lite_stream_has_cover_even_when_nothing_matches():
     assert end == len(body)
 
 
-def test_split_image_extracts_payload_and_version():
-    """从合成 slot 镜像里切出 payload：头部偏移不得越界、版本号要读对。"""
-    from generator.patch_crc import load_spec
-    img = load_spec()["image_header"]
-    fields = img["fields"]
+def test_split_image_extracts_the_delta_domain_not_just_the_code():
+    """差分域必须**含向量表**，且版本号要读对。
 
-    payload = bytes((i * 5 + 1) & 0xFF for i in range(256))
-    blob = bytearray(img["payload_offset_in_slot"] + len(payload))
-    struct.pack_into("<I", blob, img["offset_in_slot"] + fields["image_size"]["offset"],
-                     len(payload))
-    struct.pack_into("<I", blob, img["offset_in_slot"] + fields["magic"]["offset"],
-                     fields["magic"]["value"])
-    struct.pack_into("<I", blob, img["offset_in_slot"] + fields["fw_version"]["offset"], 42)
-    blob[img["payload_offset_in_slot"]:] = payload
+    这是实施中修正的一个真实缺陷：若差分域只取代码区，目标槽 `[0, 0xC0)` 的
+    向量表就没人写，更新后会启动旧固件或静默放弃跳转（详见 split_image 文档）。
+    """
+    code = bytes((i * 5 + 1) & 0xFF for i in range(256))
+    blob = slot_image(code, fw_version=42, slot_base=SLOT_A_BASE)
 
-    got = split_image(bytes(blob))
-    assert got["payload"] == payload
+    got = split_image(blob)
+    assert got["code"] == code
+    assert got["code_size"] == len(code)
     assert got["fw_version"] == 42
+    # 关键断言：差分域从**偏移 0** 开始（含向量表），而不是从代码区开始
+    assert got["image"][:VECTOR_BYTES] == blob[:VECTOR_BYTES]
+    assert len(got["image"]) == len(blob), "差分域应覆盖到代码区末尾、且不含尾部填充"
+
+    # 尾部填充不参与差分
+    padded = blob + b"\xff" * 64
+    assert split_image(padded)["image"] == got["image"]
 
     with pytest.raises(ValueError, match="magic"):
         split_image(b"\x00" * 512)
+
+    # linker 刚产出的裸 .bin：magic 在，但 image_size 还是 0xFFFFFFFF 占位
+    raw = bytearray(blob)
+    img = load_spec()["image_header"]
+    raw[img["offset_in_slot"]:img["offset_in_slot"] + 4] = b"\xff" * 4
+    with pytest.raises(ValueError, match="占位"):
+        split_image(bytes(raw))
 
 
 # ---------------------------------------------------------------------------
 # 4. L2：oracle 逐字节判据（未压缩基线路径）
 # ---------------------------------------------------------------------------
 
-def _firmware_like(n: int, seed: int = 0) -> bytes:
-    """造一段"像固件"的数据：有重复结构，但不是纯随机（更接近真实 .bin）。"""
-    rnd = random.Random(seed)
-    out = bytearray()
-    while len(out) < n:
-        if rnd.random() < 0.5:
-            out += bytes(rnd.getrandbits(8) for _ in range(rnd.randint(4, 64)))
-        else:
-            out += bytes([rnd.getrandbits(8)]) * rnd.randint(8, 128)
-    return bytes(out[:n])
+# `_firmware_like` 现在来自 delta_fixtures（它同时提供 slot 镜像夹具）。
 
 
 def test_roundtrip_identical(tmp_path):
@@ -468,10 +521,11 @@ def test_roundtrip_identical(tmp_path):
 
 def test_roundtrip_completely_different(tmp_path):
     """零匹配 —— 覆盖 coverCount==0 的收尾路径。"""
-    old = bytes([0x00]) * 512
-    new = bytes([0xFF]) * 512
-    patch = assert_roundtrip(old, new, tmp_path)
-    assert len(patch) <= 48 + 16 + len(new), "零匹配时补丁不应超过「信封+字面量」"
+    patch = assert_roundtrip(bytes([0x00]) * 512, bytes([0xFF]) * 512, tmp_path)
+    # 上界 = 信封 + lite 头 + 新镜像全部字面量。镜像比代码区多出向量表(192B)+头部(16B)，
+    # 而两个槽的向量表本就不同，所以这部分也必然是字面量 —— 必须算进去。
+    ceiling = 48 + 16 + (VECTOR_BYTES + 16 + 512)
+    assert len(patch) <= ceiling, "零匹配时补丁不应超过「信封+头+全部字面量」"
 
 
 def test_roundtrip_insertion_shifts_tail(tmp_path):
@@ -507,10 +561,14 @@ def test_roundtrip_uses_backward_oldpos_jump(tmp_path):
 
 
 def test_roundtrip_block_aligned_and_short_payloads(tmp_path):
-    """比匹配窗口还短的 payload，以及空 payload —— 差分器应当退化为全字面量。"""
-    assert_roundtrip(b"", b"", tmp_path)
-    assert_roundtrip(b"", b"short-new", tmp_path)
-    assert_roundtrip(b"short-old", b"", tmp_path)
+    """比匹配窗口还短的代码区 —— 差分器应当退化为全字面量。
+
+    注：代码区长度 0 是**非法镜像**（`split_image` 明确拒绝），所以这里用 1 字节
+    作下界。这不是遗漏：真实固件不可能没有代码。
+    """
+    assert_roundtrip(b"\x01", b"\x01", tmp_path)
+    assert_roundtrip(b"\x01", b"short-new", tmp_path)
+    assert_roundtrip(b"short-old", b"\x02", tmp_path)
     assert_roundtrip(b"abcdefgh", b"abcdefgh", tmp_path)          # 恰短于 block(12)
     assert_roundtrip(b"abcdefgh", b"abcdZZZZ", tmp_path)
 
@@ -550,8 +608,7 @@ def test_roundtrip_rejects_truncated_patch(tmp_path):
     它在解码器不需要更多字节时什么也发现不了。真正的第一道防线是
     `patch_size`：设备在擦任何一页之前先核对「实到字节数 == 声明字节数」。
     """
-    old = _firmware_like(2000, seed=9)
-    new = old[:1500] + b"TAIL" * 10
+    old, new = _l2_pair(2000, seed=9)
     patch = build(old, new, fw_version=1)
     verify_host(old, new, patch)
 
@@ -581,8 +638,7 @@ def _run_oracle_raw(old: bytes, body: bytes, tmp_path: Path):
 
 def test_decoder_rejects_truncated_stream(tmp_path):
     """缺字节导致解码器需要更多输入 ⇒ 被 EOF 抓住并拒绝。"""
-    old = _firmware_like(2000, seed=11)
-    new = old[:1500] + b"TAIL" * 10
+    old, new = _l2_pair(2000, seed=11)
     body = lite_body(build(old, new, fw_version=1, compress=False))
 
     rc, _ = _run_oracle_raw(old, body[:-8], tmp_path)
@@ -595,54 +651,105 @@ def test_decoder_silently_ignores_trailing_garbage(tmp_path):
     后果：设备不能相信"解码器返回成功"就等于"补丁完整"。垃圾可能来自传输层
     尾部拼接、Nor Flash 残留等，必须在擦页前用 patch_size 卡死。
     """
-    old = _firmware_like(2000, seed=12)
-    new = old[:1500] + b"TAIL" * 10
+    old, new = _l2_pair(2000, seed=12)
     body = lite_body(build(old, new, fw_version=1, compress=False))
 
     rc, got = _run_oracle_raw(old, body + b"\xde\xad\xbe\xef" * 8, tmp_path)
     assert rc == 0, "预期解码器无视尾部垃圾（这正是薄弱点）"
-    assert got == new, "本次内容仍然正确，但解码器没有任何机制保证这一点"
+    assert got == expected_target(new), "本次内容仍然正确，但解码器没有任何机制保证这一点"
 
 
 def test_decoder_silently_accepts_midstream_corruption_with_wrong_output(tmp_path):
     """**核心证据**：中段 1 字节翻转后，解码器返回成功，但产出的是错误镜像。
 
-    实测（2000 B old / 1540 B new）：补丁中段翻转 1 字节 ⇒ `hpatch_lite_patch()`
-    返回 TRUE，输出长度也对，但内容已错。
+    实测（整镜像域）：补丁中间翻转 1 字节 ⇒ `hpatch_lite_patch()` 返回 TRUE、
+    输出长度也对，但内容已错。
 
     所以 `new_crc32` 不是"锦上添花"，而是**唯一**能拦住这类静默损坏的手段：
     设备必须在把新镜像提交到 Slot 之前复算 CRC32 并比对。同理，`old_crc32`
     保证我们是在正确的旧镜像上做差分。
+
+    本用例刻意只挑**落在 CRC 覆盖区内**的损坏位置 —— 覆盖区之外的那一段
+    另有其问题，由下一个用例单独记录（它是个真实缺口，不是本用例的课题）。
     """
-    old = _firmware_like(2000, seed=13)
-    new = old[:1500] + b"TAIL" * 10
+    img = load_spec()["image_header"]
+    crc_start = img["crc_region"]["start_offset_in_slot"]
+
+    old, new = _l2_pair(2000, seed=13)
+    want = expected_target(new)
+    env = parse_envelope(build(old, new, fw_version=1, compress=False))
     body = bytearray(lite_body(build(old, new, fw_version=1, compress=False)))
 
-    # 找一个「翻转后解码器仍返回成功」的位置（中段，落在 cover 数据里）
-    corrupted_positions = []
+    # 找一个「翻转后解码器仍返回成功、且只有 CRC 覆盖区之内发生变化」的位置。
+    # 必须限定在覆盖区内，否则测的就不是 new_crc32 的能力了。
+    # 同时要求 magic 完好，否则镜像根本解析不出来（那是"结构损坏"，不是本用例）。
+    hit = None
     for off in range(16, len(body) - 2):
         probe = bytearray(body)
         probe[off] ^= 0xFF
         rc, got = _run_oracle_raw(old, bytes(probe), tmp_path)
-        if rc == 0 and got is not None and got != new:
-            corrupted_positions.append(off)
-            if len(corrupted_positions) >= 3:
-                break
+        if rc != 0 or got is None or got == want:
+            continue
+        if got[:crc_start + 4] != want[:crc_start + 4]:
+            continue                      # 改动落在了覆盖区之外（或破坏了 magic）
+        hit = (off, got)
+        break
 
-    assert corrupted_positions, (
+    assert hit is not None, (
         "未能复现「静默产出错误镜像」—— 若解码器真的变强了，应更新规划 §16.4 的结论，"
         "但在那之前不要把 new_crc32 去掉")
 
-    # 内容完整性只能由信封的 new_crc32 判定
-    from generator.patch_crc import stm32_crc32
-    off = corrupted_positions[0]
-    probe = bytearray(body)
-    probe[off] ^= 0xFF
-    rc, got = _run_oracle_raw(old, bytes(probe), tmp_path)
-    assert rc == 0 and got != new
-    assert stm32_crc32(got) != stm32_crc32(new), (
+    off, got = hit
+    assert image_crc32(finalize_image(got)) != env["new_crc32"], (
         "new_crc32 竟然没能识别出被损坏的输出 —— 设备侧将无判据可用")
-    assert parse_envelope(build(old, new, fw_version=1))["new_crc32"] == stm32_crc32(new)
+    assert env["new_crc32"] == image_crc32(new)
+
+
+def test_crc_coverage_excludes_the_vector_table_a_real_gap(tmp_path):
+    """**实测到的缺口（记录下来，不是"通过"）**：向量表不在任何校验覆盖区内。
+
+    CRC 覆盖区从 `magic`（`0xC8`）起，而影像开头 `[0, 0xC0)` 的**192 B 向量表
+    不在其中**。于是：
+
+    * 补丁流在向量表区间被损坏（传输层 CRC16 未覆盖到的场景：暂存区 bit-rot、
+      我们自己的编码器在这一段出错）时，解码器返回成功、`new_crc32` 也一致；
+    * `boot_crc_verify()` 同样看不见这一段（它验的就是同一个覆盖区）；
+    * 而 `boot_jump_to_app()` 恰恰**只**依赖这一段（`slot+0` 取初始 SP、
+      `slot+4` 取 Reset_Handler）。
+
+    后果：设备会把一个向量表被破坏的槽标记为"校验通过"并跳进去。
+
+    本用例把这个缺口**钉死**，以免日后有人以为 CRC 覆盖了整份镜像。
+    处置见 `fota_delta.c.j2` 的向量表合法性检查，以及规划 §17.5 的后续项。
+    """
+    img = load_spec()["image_header"]
+    crc_start = img["crc_region"]["start_offset_in_slot"]
+
+    old, new = _l2_pair(2000, seed=17)
+    want = expected_target(new)
+    env = parse_envelope(build(old, new, fw_version=1, compress=False))
+    body = bytearray(lite_body(build(old, new, fw_version=1, compress=False)))
+
+    invisible = None
+    for off in range(16, len(body) - 2):
+        probe = bytearray(body)
+        probe[off] ^= 0xFF
+        rc, got = _run_oracle_raw(old, bytes(probe), tmp_path)
+        if rc != 0 or got is None or got == want:
+            continue
+        if got[:crc_start] == want[:crc_start]:
+            continue                      # 覆盖区之内 → 归上一个用例管
+        invisible = got
+        break
+
+    assert invisible is not None, (
+        "没有找到落在向量表区间的损坏样本 —— 若解码器行为变了，本缺口可能已不存在，"
+        "请复核后更新规划 §17.5 与 fota_delta 的向量表检查是否还有必要")
+    # 缺口的确切含义：内容已错，但 CRC 判据认为"没问题"
+    assert finalize_image(invisible) != new, "向量表确实被改坏了"
+    assert image_crc32(finalize_image(invisible)) == env["new_crc32"], (
+        "预期 CRC 无法发现向量表损坏（这正是缺口的定义）；"
+        "若这里失败说明覆盖区已经扩大到含向量表，请把本用例改成正向断言")
 
 
 # ---------------------------------------------------------------------------
@@ -739,8 +846,10 @@ def test_compressed_path_actually_runs_the_decompressor(tmp_path):
     解压分支，测试只看"打补丁成功"是发现不了的。oracle 的 `tuz_calls` 计数是
     直接证据。
     """
-    old = _firmware_like(8000, seed=41)
-    new = old[:4000] + b"CHANGED" * 30 + old[4000:]
+    old_code = _firmware_like(8000, seed=41)
+    new_code = old_code[:4000] + b"CHANGED" * 30 + old_code[4000:]
+    old = slot_image(old_code, fw_version=8, slot_base=SLOT_A_BASE)
+    new = slot_image(new_code, fw_version=9, slot_base=SLOT_B_BASE)
     patch = build(old, new, fw_version=9, compress=True)
 
     env = info(patch)
@@ -749,7 +858,7 @@ def test_compressed_path_actually_runs_the_decompressor(tmp_path):
     assert env["lite_uncompress_size"] > 0, "解压后长度必须写进 lite 头，设备据此分配缓冲"
 
     got, stats = apply_oracle(old, patch, tmp_path, with_tuz=True)
-    assert got == new
+    assert got == expected_target(new)
     assert stats["tuz_calls"] >= 1, (
         "解压回调一次都没被调用 —— compress_type 成了只写不读的字段")
     assert stats["uncompress_size"] == env["lite_uncompress_size"]
@@ -768,81 +877,86 @@ def test_auto_mode_never_worse_than_either_single_mode(tmp_path):
     old_id = _firmware_like(4000, seed=54)
     cases.append((old_id, old_id[:2000] + b"XYZ" + old_id[2000:]))        # 微小改动
 
-    for old, new in cases:
+    for old_code, new_code in cases:
+        old = slot_image(old_code, fw_version=1, slot_base=SLOT_A_BASE)
+        new = slot_image(new_code, fw_version=2, slot_base=SLOT_B_BASE)
         n_none = len(build(old, new, fw_version=1, compress=False))
         n_always = len(build(old, new, fw_version=1, compress=True))
         auto = build(old, new, fw_version=1, compress="auto")
         assert len(auto) == min(n_none, n_always), (
             "auto 选了 %d，但可选的更优解是 %d（none=%d always=%d）"
             % (len(auto), min(n_none, n_always), n_none, n_always))
-        assert_roundtrip(old, new, tmp_path, compress="auto")
+        assert_roundtrip(old_code, new_code, tmp_path, compress="auto")
 
 
 def test_auto_mode_flags_match_the_chosen_inner_format(tmp_path):
     """信封 flags 与 lite 头的 compressType 必须描述**同一条**被选中的路径。"""
-    old = _firmware_like(5000, seed=61)
-    new = old[:2500] + b"REPLACED-BLOCK" * 20 + old[2500:]
+    old_code = _firmware_like(5000, seed=61)
+    new_code = old_code[:2500] + b"REPLACED-BLOCK" * 20 + old_code[2500:]
+    old = slot_image(old_code, fw_version=1, slot_base=SLOT_A_BASE)
+    new = slot_image(new_code, fw_version=2, slot_base=SLOT_B_BASE)
     patch = build(old, new, fw_version=1, compress="auto")
     env = info(patch)                     # info() 内部就会校验两者一致
     assert env["compressed"] == (env["compress_type"] == 1)
-    assert_roundtrip(old, new, tmp_path, compress="auto")
+    assert_roundtrip(old_code, new_code, tmp_path, compress="auto")
 
 
 def test_build_rejects_unknown_compress_mode():
+    old, new = _mk(b"a" * 64, b"b" * 64)
     with pytest.raises(ValueError):
-        build(b"a" * 64, b"b" * 64, fw_version=1, compress="sometimes")
+        build(old, new, fw_version=1, compress="sometimes")
 
 
 # ---------------------------------------------------------------------------
 # 7. CLI 输入识别（自动模式必须"选对并说清"）
 # ---------------------------------------------------------------------------
 
-def test_load_payload_auto_handles_both_real_inputs(tmp_path):
-    """OTA 现场两种输入都会出现，自动模式必须都能处理，且**说清**选了哪种解释。
+def test_load_image_requires_a_header_filled_slot_image(tmp_path):
+    """输入必须是 **patch_crc.py 回填过头部**的 slot 镜像，且错误信息要指明该走哪一步。
 
-    新固件总是裸 `.bin`（linker 直接产出），设备上那份是带 16 B 头部的 slot 镜像。
-    猜错方向会让补丁"看起来成功"却与设备上的镜像对不上，所以返回值里必须带
-    一句人可读的解释，由 CLI 打印出来。
+    为什么必须 fail-closed：差分域与 CRC 都依赖头部里的 `image_size`。拿 linker
+    刚产出的裸 `.bin`（`image_size` 还是 0xFFFFFFFF 占位）去算，会得到一份
+    「看起来生成成功、装上就砖」的补丁 —— 这比直接报错危险得多。
     """
-    from generator.delta_tool import _load_payload
-    from generator.patch_crc import load_spec
+    from generator.delta_tool import _load_image
 
+    code = bytes((i * 3 + 5) & 0xFF for i in range(400))
+    good = slot_image(code, fw_version=3, slot_base=SLOT_A_BASE)
+    good_p = tmp_path / "fw_crc.bin"
+    good_p.write_bytes(good)
+
+    got, how = _load_image(str(good_p))
+    assert got == good, "差分域就是整个 slot 镜像"
+    assert "slot 镜像" in how, "必须回报一句人可读的解释（CLI 会打印出来）"
+
+    # 裸 linker 产物：magic 在，但 image_size 是占位值
+    raw = bytearray(good)
     img = load_spec()["image_header"]
-    fields = img["fields"]
-    payload = bytes((i * 3 + 5) & 0xFF for i in range(400))
+    raw[img["offset_in_slot"]:img["offset_in_slot"] + 4] = b"\xff" * 4
+    raw_p = tmp_path / "fw_raw.bin"
+    raw_p.write_bytes(bytes(raw))
+    with pytest.raises(ValueError, match="占位"):
+        _load_image(str(raw_p))
 
-    # (a) 裸固件
-    raw_path = tmp_path / "fw.bin"
-    raw_path.write_bytes(payload)
-    got, how = _load_payload(str(raw_path), "auto")
-    assert got == payload and "payload" in how
-
-    # (b) slot 镜像（带头部）
-    blob = bytearray(img["payload_offset_in_slot"] + len(payload))
-    struct.pack_into("<I", blob, img["offset_in_slot"] + fields["image_size"]["offset"],
-                     len(payload))
-    struct.pack_into("<I", blob, img["offset_in_slot"] + fields["magic"]["offset"],
-                     fields["magic"]["value"])
-    blob[img["payload_offset_in_slot"]:] = payload
-    slot_path = tmp_path / "fw_slot.bin"
-    slot_path.write_bytes(bytes(blob))
-    got, how = _load_payload(str(slot_path), "auto")
-    assert got == payload and "slot" in how
-
-    # (c) 强制模式要能覆盖自动判断
-    assert _load_payload(str(slot_path), "raw")[0] == bytes(blob)
+    # 完全不是镜像
+    junk_p = tmp_path / "junk.bin"
+    junk_p.write_bytes(b"\x00" * 512)
     with pytest.raises(ValueError, match="magic"):
-        _load_payload(str(raw_path), "slot")
-    with pytest.raises(ValueError):
-        _load_payload(str(raw_path), "有时是裸的")
+        _load_image(str(junk_p))
+
+    # 错误信息必须指出「先经 patch_crc.py」—— 否则使用者只会看到"格式不对"
+    with pytest.raises(ValueError, match="patch_crc"):
+        _load_image(str(junk_p))
 
 
 def test_cli_build_and_info_round_trip(tmp_path):
     """CLI 走一遍 build → info，并确认产物能被 oracle 消费。"""
     from generator.delta_tool import _main
 
-    old = _firmware_like(5000, seed=71)
-    new = old[:2500] + b"CLI-TEST-BLOCK" * 15 + old[2500:]
+    old_code = _firmware_like(5000, seed=71)
+    new_code = old_code[:2500] + b"CLI-TEST-BLOCK" * 15 + old_code[2500:]
+    old = slot_image(old_code, fw_version=1, slot_base=SLOT_A_BASE)
+    new = slot_image(new_code, fw_version=2, slot_base=SLOT_B_BASE)
     old_p, new_p = tmp_path / "old.bin", tmp_path / "new.bin"
     old_p.write_bytes(old)
     new_p.write_bytes(new)
@@ -860,22 +974,39 @@ def test_cli_build_and_info_round_trip(tmp_path):
     # 用 info() 判断内层格式：patch[48] 是 'h'，不是 compress_type
     got, _ = apply_oracle(old, patch, tmp_path,
                           with_tuz=(env["compress_type"] == 1))
-    assert got == new
+    assert got == expected_target(new)
+
+
+def test_cli_refuses_raw_linker_output(tmp_path):
+    """CLI 必须拒绝未经 patch_crc.py 的裸 .bin，并把该走的那一步写进提示。"""
+    from generator.delta_tool import _main
+
+    raw = bytearray(slot_image(b"code" * 100))
+    img = load_spec()["image_header"]
+    raw[img["offset_in_slot"]:img["offset_in_slot"] + 4] = b"\xff" * 4
+    p = tmp_path / "raw.bin"
+    p.write_bytes(bytes(raw))
+
+    with pytest.raises(ValueError, match="patch_crc"):
+        _main(["build", "--old", str(p), "--new", str(p),
+               "-o", str(tmp_path / "x.h2cd"), "--version", "1"])
 
 
 def test_cli_lite_only_output_is_consumable_by_decoder(tmp_path):
     """`--lite-only` 必须吐出纯 lite 流（无信封），这正是 oracle/设备直连调试要的。"""
     from generator.delta_tool import _main
 
-    old = _firmware_like(3000, seed=81)
-    new = old[:1500] + b"X" + old[1500:]
+    old_code = _firmware_like(3000, seed=81)
+    new_code = old_code[:1500] + b"X" + old_code[1500:]
+    old = slot_image(old_code, fw_version=1, slot_base=SLOT_A_BASE)
+    new = slot_image(new_code, fw_version=2, slot_base=SLOT_B_BASE)
     old_p, new_p = tmp_path / "old.bin", tmp_path / "new.bin"
     old_p.write_bytes(old)
     new_p.write_bytes(new)
     lite_p = tmp_path / "p.lite"
 
     assert _main(["build", "--old", str(old_p), "--new", str(new_p), "-o", str(lite_p),
-                  "--version", "1", "--lite-only", "--input-mode", "raw"]) == 0
+                  "--version", "1", "--lite-only"]) == 0
     body = lite_p.read_bytes()
     assert body[0:2] == b"hI", "输出应当以 lite 魔数开头（而不是信封）"
     assert len(body) == len(lite_body(build(old, new, fw_version=1,

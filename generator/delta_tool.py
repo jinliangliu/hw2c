@@ -28,7 +28,10 @@ HPatchLite 没有格式规范文档，唯一权威是**解码器源码本身**�
 ----
     python -m generator.delta_tool build --old old.bin --new new.bin -o p.h2cd --version 3
     python -m generator.delta_tool info p.h2cd
-    python -m generator.delta_tool build ... --raw-payload      # 输入是裸 payload
+    python -m generator.delta_tool build ... --input-mode raw    # 输入没有镜像头
+
+差分域 = **整个 slot 镜像**（向量表 + 头部 + 代码）。不含向量表会让目标槽在更新后
+启动旧固件或静默放弃跳转 —— 详见 `split_image()`。
 """
 
 from __future__ import annotations
@@ -512,10 +515,29 @@ def parse_envelope(blob: bytes) -> dict:
 # ===========================================================================
 
 def split_image(image: bytes) -> dict:
-    """从完整 slot 镜像里取出 payload 与头部信息。
+    """从 slot 镜像里取出**差分域**与头部信息。
 
-    设备侧的约定是「补丁只搬运 payload，头部由设备自己重写」，
-    所以差分工具需要能把 payload 从镜像里切出来。
+    ⚠️ 差分域 = **整个 slot 镜像** `[0, payload_off + code_size)`，**不是**代码区。
+
+    为什么必须含向量表（这是实施中发现并修正的一个真实缺陷）：
+
+    `boot_jump_to_app()` 的做法是 `SCB->VTOR = slot_base`，再从 `slot+0` / `slot+4`
+    取初始 SP 与 Reset_Handler（见 `templates/bootloader/boot_jump.c.j2`）。
+    也就是说**目标槽的向量表必须已经是新固件的**。若补丁只搬运 `slot+0xD0` 之后的
+    代码区，目标槽 `[0, 0xC0)` 会保留上一次的向量表，后果是：
+
+    * 该槽曾经装过固件 → SP/入口指向**旧版本**的代码 → 更新后启动的仍是旧固件
+      （静默失效，比崩溃更难发现）；
+    * 该槽从未用过（全 0xFF）→ `boot_jump` 的安全检查
+      `(app_entry & 0xFFE00000) != 0x08000000` 命中，跳转被静默放弃。
+
+    两种都不是我们想要的。把向量表纳入差分域后，A→B 更新时向量表里的绝对地址
+    差异由差分器自然吸收（规划 §8.1 已预期："差异集中在向量表 192 B 与承载绝对
+    地址的字面量池"）。
+
+    头部里只有 `image_size` / `crc32` 两个字段是**事后回填**的（见
+    `apply_header_placeholders`），它们在差分流里以 0xFFFFFFFF 占位；设备侧
+    跳过这 8 字节不编程，留到 FLUSH 阶段单独写入（Flash 只能 1→0）。
     """
     img = _fmt()["image_header"]
     fields = img["fields"]
@@ -534,19 +556,75 @@ def split_image(image: bytes) -> dict:
         raise ValueError("头部 magic 出现在偏移 %d，无法容纳 %d 字节的头部"
                          % (magic_off, img["size"]))
     payload_off = hdr_off + img["size"]
-    image_size = int.from_bytes(image[hdr_off:hdr_off + 4], "little")
-    if image_size == 0 or payload_off + image_size > len(image):
-        raise ValueError("镜像头里的 image_size=%d 不合法" % image_size)
+    code_size = int.from_bytes(image[hdr_off:hdr_off + 4], "little")
+    if code_size == 0xFFFFFFFF:
+        raise ValueError("头部 image_size 仍是 0xFFFFFFFF 占位值，说明该文件只是"
+                         "linker 产物，尚未经 patch_crc.py 回填")
+    if code_size == 0 or payload_off + code_size > len(image):
+        raise ValueError("镜像头里的 image_size=%d 不合法" % code_size)
+
+    region = _crc_region(img, hdr_off, code_size)
     ver_off = hdr_off + fields["fw_version"]["offset"]
     return {
-        "payload": image[payload_off:payload_off + image_size],
-        "image_size": image_size,
+        # 差分域：向量表 + 头部 + 代码，首尾连续，没有洞
+        "image": image[:payload_off + code_size],
+        "code": image[payload_off:payload_off + code_size],
+        "code_size": code_size,
+        "payload_offset": payload_off,
         "hdr_offset": hdr_off,
         "fw_version": int.from_bytes(image[ver_off:ver_off + 4], "little"),
         "crc32_field": int.from_bytes(
             image[hdr_off + fields["crc32"]["offset"]:
                   hdr_off + fields["crc32"]["offset"] + 4], "little"),
+        "crc_region": region,
     }
+
+
+def _crc_region(img: dict, hdr_off: int, code_size: int) -> Tuple[int, int]:
+    """镜像 CRC 覆盖区 `(start, length)`，取值全部来自格式真源。
+
+    起点是 **magic** 而非 payload 起点：`image_size` 与 `crc32` 两个字段被刻意排除，
+    这样 CRC 可以在回填这两者**之前**算出，也就与「是否已回填」无关。
+    设备侧因此可以在应用完成后先算 CRC、再回填，两者自洽。
+    """
+    start = hdr_off + img["crc_region"]["start_offset_in_slot"] - img["offset_in_slot"]
+    length = code_size + img["crc_region"]["length_addend"]
+    return start, length
+
+
+def image_crc32(image: bytes) -> int:
+    """slot 镜像的 CRC32 —— 与引导器 `boot_crc_verify()` 覆盖的是**同一段**。
+
+    于是信封里的 `new_crc32` 可以直接当作要回填进镜像头的 `crc32` 字段值，
+    不需要第二套算法或第二份定义。
+    """
+    parts = split_image(image)
+    start, length = parts["crc_region"]
+    if start + length > len(image):
+        raise ValueError("CRC 覆盖区 [%d,+%d) 超出镜像长度 %d"
+                         % (start, length, len(image)))
+    return stm32_crc32(image[start:start + length])
+
+
+def apply_header_placeholders(image: bytes) -> bytes:
+    """把镜像头里两个**事后回填**的字段置为 0xFFFFFFFF。
+
+    原因：Flash 只能 1→0。`image_size` 与 `crc32` 要等 payload 全部落盘后才能确定，
+    但设备是按页编程的 —— 若差分流已经把真值写进那一页，就没有第二次写入的机会。
+    置成 0xFFFFFFFF 后，设备可以「整页编程（该双字留 0xFF）→ 单独补写该双字」。
+
+    这不影响 `new_crc32`：CRC 覆盖区从 magic 开始，本就排除这两个字段，
+    所以无论是否占位，算出来的值相同。
+    """
+    img = _fmt()["image_header"]
+    fields = img["fields"]
+    parts = split_image(image)
+    off = parts["hdr_offset"]
+    out = bytearray(image)
+    for name in ("image_size", "crc32"):
+        o = off + fields[name]["offset"]
+        out[o:o + 4] = b"\xff\xff\xff\xff"
+    return bytes(out[:parts["payload_offset"] + parts["code_size"]])
 
 
 def _make_lite(old: bytes, new: bytes, covers: Sequence[Cover],
@@ -583,10 +661,20 @@ def _make_lite(old: bytes, new: bytes, covers: Sequence[Cover],
     return compressed if len(compressed) < len(uncompressed) else uncompressed
 
 
-def build(old_payload: bytes, new_payload: bytes, *, fw_version: int,
+def build(old_image: bytes, new_image: bytes, *, fw_version: int,
           compress="auto", block: int = _BLOCK, min_gain: int = _MIN_GAIN,
           dict_size: int = 4096) -> bytes:
     """生成完整补丁（48 B 信封 + lite 流）。
+
+    两个入参是**完整 slot 镜像**（含向量表与头部），不是代码区 —— 理由见
+    `split_image()` 的文档：不含向量表会让更新后启动旧固件或静默放弃跳转。
+
+    新旧两侧的处理**刻意不对称**：
+
+    * `old` 原样参与差分 —— 它必须与设备上活动槽的实际字节逐字节一致，
+      否则差分器匹配不到，补丁会白白变大甚至错位；
+    * `new` 先经 `apply_header_placeholders()` 把 `image_size`/`crc32` 置 0xFFFFFFFF ——
+      这两个字段由设备事后回填，先占位才能保证"页内那个双字写入时仍是擦除态"。
 
     `compress=False` 走 `compress_type=0`，是**必须始终可用**的基线路径
     （规划 §16.6：先用它把 L2 跑绿，再叠加 tinyuz）。
@@ -601,17 +689,34 @@ def build(old_payload: bytes, new_payload: bytes, *, fw_version: int,
     设备侧 RAM 从 16 KB 降到 4 KB。这与规划 §16.7 的实测结论一致：
     差分流对 dict_size 不敏感。
     """
-    covers = diff_to_covers(old_payload, new_payload, block=block, min_gain=min_gain)
-    lite = _make_lite(old_payload, new_payload, covers, compress, dict_size)
+    # 入参自检：头部里的 crc32 字段必须与按覆盖区算出来的一致。
+    # 不一致说明镜像没经 patch_crc.py 回填（或回填用的是另一套算法），
+    # 此时生成的补丁在设备侧必然过不了 new_crc32 复核 —— 与其让设备在
+    # 擦完页之后才发现，不如在主机侧就拒绝。
+    for tag, img in (("old", old_image), ("new", new_image)):
+        parts = split_image(img)
+        start, length = parts["crc_region"]
+        want = stm32_crc32(img[start:start + length])
+        if parts["crc32_field"] != want:
+            raise ValueError(
+                "%s 镜像头部 crc32=0x%08X 与按覆盖区算出的 0x%08X 不符："
+                "该镜像未经 patch_crc.py 回填，或回填算法不一致"
+                % (tag, parts["crc32_field"], want))
+
+    old = split_image(old_image)["image"]
+    new = apply_header_placeholders(new_image)
+
+    covers = diff_to_covers(old, new, block=block, min_gain=min_gain)
+    lite = _make_lite(old, new, covers, compress, dict_size)
 
     # 压缩与否以**实际选中的 lite 头**为准，避免 flags 与内层格式不一致
     is_compressed = lite[2] == HPI_COMPRESS_TYPE_TUZ
 
     envelope = pack_envelope(
-        old_size=len(old_payload),
-        old_crc32=stm32_crc32(old_payload),
-        new_size=len(new_payload),
-        new_crc32=stm32_crc32(new_payload),
+        old_size=len(old),
+        old_crc32=image_crc32(old_image),
+        new_size=len(new),
+        new_crc32=image_crc32(new_image),
         patch_size=len(lite),
         fw_version=fw_version,
         compressed=is_compressed,
@@ -677,23 +782,25 @@ def info(patch: bytes) -> dict:
     return env
 
 
-def verify_host(old_payload: bytes, new_payload: bytes, patch: bytes) -> dict:
+def verify_host(old_image: bytes, new_image: bytes, patch: bytes) -> dict:
     """主机侧自洽性检查（**不含** oracle）：信封、lite 头、CRC 必须自相一致。
 
     这是"补丁与这对 old/new 相配"的必要条件，但不是充分条件 —— 只有 oracle
     逐字节比对才能证明 cover 编码正确。两者都要跑。
     """
     env = info(patch)
-    if env["old_size"] != len(old_payload):
-        raise AssertionError("信封 old_size=%d 与实际旧 payload=%d 不符"
-                             % (env["old_size"], len(old_payload)))
-    if env["old_crc32"] != stm32_crc32(old_payload):
-        raise AssertionError("信封 old_crc32 与旧 payload 不符")
-    if env["new_size"] != len(new_payload):
-        raise AssertionError("信封 new_size=%d 与实际新 payload=%d 不符"
-                             % (env["new_size"], len(new_payload)))
-    if env["new_crc32"] != stm32_crc32(new_payload):
-        raise AssertionError("信封 new_crc32 与新 payload 不符")
+    old = split_image(old_image)["image"]
+    new = apply_header_placeholders(new_image)
+    if env["old_size"] != len(old):
+        raise AssertionError("信封 old_size=%d 与实际旧镜像差分域=%d 不符"
+                             % (env["old_size"], len(old)))
+    if env["old_crc32"] != image_crc32(old_image):
+        raise AssertionError("信封 old_crc32 与旧镜像 CRC 不符")
+    if env["new_size"] != len(new):
+        raise AssertionError("信封 new_size=%d 与实际新镜像差分域=%d 不符"
+                             % (env["new_size"], len(new)))
+    if env["new_crc32"] != image_crc32(new_image):
+        raise AssertionError("信封 new_crc32 与新镜像 CRC 不符")
     return env
 
 
@@ -706,29 +813,27 @@ def _read(path: str) -> bytes:
         return fh.read()
 
 
-def _load_payload(path: str, mode: str) -> Tuple[bytes, str]:
-    """按 `mode` 取出待差分的 payload，返回 (payload, 说明)。
+def _load_image(path: str) -> Tuple[bytes, str]:
+    """读入一个 **slot 镜像** 并取出差分域，返回 (域, 说明)。
 
-    OTA 的真实工作流里两种输入都会出现：
-      * **裸固件**：编译器/linker 直接产出的 `.bin`，没有头部（新固件总是这种）；
-      * **slot 镜像**：经 `patch_crc.py` 回填过 16 B 头部的镜像（设备上那份）。
-
-    两者必须都支持，所以默认 `auto`：先试着当 slot 镜像解析，成功就取 payload，
-    否则整份文件就是 payload。**并把选中的解释打印出来**，不做静默猜测 ——
-    猜错方向会让补丁"看起来成功"却对不上设备上的镜像。
+    输入必须是**已经 patch_crc.py 回填过头部**的镜像（生成目录里的
+    `*_crc.bin`），不能是 linker 刚产出的裸 `.bin`：后者的 `image_size`/`crc32`
+    还是 `0xFFFFFFFF` 占位。这不是刁难 —— 差分域与 CRC 都依赖头部里的
+    `image_size`，拿占位值去算会得到一份"看起来正常、装上就砖"的补丁。
+    所以这里一律 fail-closed，并把该走的那一步写进错误信息。
     """
     data = _read(path)
-    if mode == "raw":
-        return data, "裸 payload（按参数强制）"
-    if mode == "slot":
-        return split_image(data)["payload"], "slot 镜像 → 取 payload"
-    if mode != "auto":
-        raise ValueError("input_mode 取值应为 auto/slot/raw，实际 %r" % (mode,))
-
     try:
-        return split_image(data)["payload"], "自动识别：slot 镜像 → 取 payload"
-    except ValueError:
-        return data, "自动识别：未发现镜像头 → 整份文件视为 payload"
+        parts = split_image(data)
+    except ValueError as exc:
+        raise ValueError(
+            "%s 不是合法的 slot 镜像：%s\n"
+            "（裸 .bin 需先经 generator/patch_crc.py 回填头部 —— 生成流程里的 "
+            "*_crc.bin 就是这一步的产物）" % (path, exc)) from exc
+    return parts["image"], ("slot 镜像：向量表 %d B + 头部 %d B + 代码 %d B = 差分域 %d B"
+                            % (parts["hdr_offset"],
+                               parts["payload_offset"] - parts["hdr_offset"],
+                               parts["code_size"], len(parts["image"])))
 
 
 def _main(argv: Optional[List[str]] = None) -> int:
@@ -736,8 +841,10 @@ def _main(argv: Optional[List[str]] = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_build = sub.add_parser("build", help="生成差分补丁")
-    p_build.add_argument("--old", required=True, help="旧固件（slot 镜像或裸 payload）")
-    p_build.add_argument("--new", required=True, help="新固件（slot 镜像或裸 payload）")
+    p_build.add_argument("--old", required=True,
+                         help="旧 slot 镜像（必须是 patch_crc.py 回填过的那份）")
+    p_build.add_argument("--new", required=True,
+                         help="新 slot 镜像（同上；注意新旧应在**不同槽基址**上链接）")
     p_build.add_argument("-o", "--output", required=True)
     p_build.add_argument("--version", type=lambda x: int(x, 0), required=True,
                          help="升级后的固件版本号")
@@ -747,9 +854,6 @@ def _main(argv: Optional[List[str]] = None) -> int:
                               "auto(默认)=两条都算、取更小的那个")
     p_build.add_argument("--dict-size", type=int, default=4096,
                          help="tinyuz 回溯窗口上限，直接决定设备侧 RAM 用量")
-    p_build.add_argument("--input-mode", choices=("auto", "slot", "raw"), default="auto",
-                         help="auto(默认)=先按 slot 镜像解析、失败则整份当 payload；"
-                              "slot=必须带镜像头；raw=整份就是 payload")
     p_build.add_argument("--lite-only", action="store_true",
                          help="只输出 lite 流（丢掉信封），供 oracle 使用")
 
@@ -760,19 +864,19 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd == "build":
         mode = {"none": False, "always": True, "auto": "auto"}[args.compress_mode]
-        old, old_how = _load_payload(args.old, args.input_mode)
-        new, new_how = _load_payload(args.new, args.input_mode)
+        old, old_how = _load_image(args.old)
+        new, new_how = _load_image(args.new)
         patch = build(old, new, fw_version=args.version, compress=mode,
                       dict_size=args.dict_size)
         d = verify_host(old, new, patch)
         out = lite_body(patch) if args.lite_only else patch
         with open(args.output, "wb") as fh:
             fh.write(out)
-        print("旧 payload: %d B   (%s)" % (len(old), old_how))
-        print("新 payload: %d B   (%s)" % (len(new), new_how))
-        print("补丁:       %d B  (%.2f%% of new)" % (len(patch), len(patch) * 100.0 / max(1, len(new))))
-        print("压缩:       %s (compress_type=%d)" % (d["compressed"], d["compress_type"]))
-        print("输出:       %s%s" % (args.output, "（lite 流，无信封）" if args.lite_only else ""))
+        print("旧镜像: %d B 差分域   (%s)" % (len(old), old_how))
+        print("新镜像: %d B 差分域   (%s)" % (len(new), new_how))
+        print("补丁:   %d B  (%.2f%% of new)" % (len(patch), len(patch) * 100.0 / max(1, len(new))))
+        print("压缩:   %s (compress_type=%d)" % (d["compressed"], d["compress_type"]))
+        print("输出:   %s%s" % (args.output, "（lite 流，无信封）" if args.lite_only else ""))
         return 0
 
     if args.cmd == "info":

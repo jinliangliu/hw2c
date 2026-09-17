@@ -144,6 +144,24 @@ def patch_firmware(input_path: str, output_path: str = None, version: int = 0,
     if header_offset < 0:
         raise ValueError("magic 位于 0x%X，其前无足够空间容纳头部" % magic_offset)
 
+    # --- 头部位置必须**恰好**是真源声明的槽内偏移（fail-closed）---
+    #
+    # 为什么不能"搜到哪儿就按哪儿写"：这个脚本曾经用 magic 的实际位置反推
+    # header_offset，于是任何位移都被它**顺着**接受了。真正的事故是这样发生的
+    # （2026-09-16 实测）：`.isr_vector` 在 STM32G0B1 上只有 47 项 = 188 B = 0xBC，
+    # 链接脚本里 `.app_header` 紧随其后 → 落在 0xBC，而不是真源写的 0xC0。
+    # 本脚本照 0xBC 回填，"成功"了；而引导器 / fota_delta 按 `slot_base + 0xC0`
+    # 读取 ⇒ magic 对不上 ⇒ **在板上拒掉每一个镜像**。
+    # 生成与编译都一路绿灯，缺陷只在机器上显形 —— 这正是最贵的一类。
+    if header_offset != fmt["offset_in_slot"]:
+        raise ValueError(
+            "镜像头位于槽内偏移 0x%X，但格式真源声明的是 0x%X（generator/data/fota_format.json"
+            " 的 image_header.offset_in_slot）。\n"
+            "这几乎总是链接脚本的问题：`.app_header` 必须被**钉在**该偏移上，"
+            "不能依赖向量表自然长度（STM32G0B1 实测为 0xBC）。\n"
+            "引导器与 fota_delta 都按 0x%X 读取，偏移不符会让它们拒掉所有镜像。"
+            % (header_offset, fmt["offset_in_slot"], fmt["offset_in_slot"]))
+
     payload_offset = header_offset + hdr_size
     version_offset = header_offset + fields["fw_version"]["offset"]
     crc_region_start = header_offset + (crc_region["start_offset_in_slot"] - fmt["offset_in_slot"])

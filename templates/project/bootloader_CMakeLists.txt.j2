@@ -49,8 +49,21 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_compile_options(${PROJECT_NAME} PRIVATE
     -Os -g0 -Wall
-    $<$<COMPILE_LANGUAGE:ASM>:${CMAKE_ASM_FLAGS}>
 )
+
+# ⚠️ 这里**不要**再写 `$<$<COMPILE_LANGUAGE:ASM>:${CMAKE_ASM_FLAGS}>`。
+#
+# CMAKE_ASM_FLAGS_INIT 是**带空格的一个字符串**（"-mcpu=cortex-m0plus -mthumb"），
+# 而生成器表达式的内容不做空格切分 —— 整串会作为**单个 argv 元素**传给编译器：
+#     arm-none-eabi-gcc ... "-mcpu=cortex-m0plus -mthumb" ...
+# 于是 GCC 报
+#     error: unrecognized -mcpu target: cortex-m0plus -mthumb
+#     error: missing argument to '-march='
+# 而且它只影响启动汇编 startup_stm32g0b1xx.s —— 所有 .c 都编得过，
+# 错误看起来毫无头绪。
+#
+# 正确做法是**什么都不写**：CMAKE_ASM_FLAGS 由 CMake 自动应用于所有 target，
+# 这一行既冗余又有害。根工程 CMakeLists 从不写它，所以一直没暴露。
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
     SUFFIX ".elf"

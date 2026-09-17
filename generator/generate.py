@@ -605,9 +605,15 @@ def render_templates(env: Environment, context: dict, output_dir: str,
         test_templates["test/test_boot_jump.c.j2"] = os.path.join(test_dir, "test_boot_jump.c")
 
     # FOTA unit tests
-    if context.get("has_fota"):
+    #
+    # ⚠️ 目前**不生成** `test_fota_protocol.c` / `test_fota_bspatch.c`：
+    #    · 前者测的 `drv_fota` 接收驱动编不过（调用了 `drv_uart.c` 里的 static 函数），
+    #      协议本身也要按规划 §10 重写 —— 一并归 P3；
+    #    · 后者测的是 `fota_bspatch`，已被 `fota_delta` 取代（规划 §11.1）。
+    # 留在这里的两个模板若继续生成，会让 `run_tests.py` 编译失败，
+    # 而"生成一个从不编译的测试"正是本仓库反复踩到的坑（见 fota_demo 的说明）。
+    if context.get("has_fota_receive"):
         test_templates["test/test_fota_protocol.c.j2"] = os.path.join(test_dir, "test_fota_protocol.c")
-        test_templates["test/test_fota_bspatch.c.j2"] = os.path.join(test_dir, "test_fota_bspatch.c")
 
     # 状态机测试
     if context.get("has_behavior"):
@@ -770,8 +776,24 @@ def render_templates(env: Environment, context: dict, output_dir: str,
             logger.info("Copied fota_format.json")
 
 
-def _run_compile_check(staging_dir: str, verbose: bool = False) -> tuple[bool, str]:
+def _run_compile_check(staging_dir: str, verbose: bool = False,
+                       extra_targets: Optional[list] = None) -> tuple[bool, str]:
     """Run cmake --build in staging directory to verify generated code compiles.
+
+    Args:
+        staging_dir: generated project root.
+        verbose: log every build line at debug level.
+        extra_targets: additional cmake targets to build after the default one.
+
+            This matters more than it looks. The default target is *not* the whole
+            project: the bootloader is an ``add_custom_target`` (built out of tree
+            with its own linker script), and ``app`` / ``combined`` are custom
+            targets too. So a bootloader-enabled project could pass the compile
+            check while the bootloader itself, the CRC patch step and the combined
+            image were all broken — which is exactly what happened the first time
+            ``examples/fota_demo`` was generated (see the fota_demo hardware.yaml
+            header comment). Passing the FOTA targets here makes the whole
+            `has_bootloader` path part of the compile gate instead of a hope.
 
     Returns:
         (success: bool, output: str) - combined stdout+stderr from cmake.
@@ -817,13 +839,37 @@ def _run_compile_check(staging_dir: str, verbose: bool = False) -> tuple[bool, s
             logger.info("Compile check PASSED")
         else:
             logger.error(f"Compile check FAILED (exit code {result_build.returncode})")
+            return False, output
 
-        return success, output
+        # Step 3: Extra targets (bootloader / app / combined for bootloader builds)
+        for tgt in (extra_targets or []):
+            logger.info(f"Running compile check: cmake --build --target {tgt} ...")
+            res = subprocess.run(
+                ["cmake", "--build", build_dir, "--target", tgt],
+                cwd=staging_dir,
+                capture_output=True,
+                text=True,
+                timeout=240,
+            )
+            out = res.stdout + res.stderr
+            output += out
+            if res.returncode != 0:
+                for line in out.splitlines():
+                    logger.error(f"[cmake {tgt}] {line}")
+                logger.error(f"Compile check FAILED for target '{tgt}' "
+                             f"(exit code {res.returncode})")
+                return False, output
+            if verbose:
+                for line in out.splitlines():
+                    logger.debug(f"[cmake {tgt}] {line}")
+            logger.info(f"Compile check PASSED for target '{tgt}'")
+
+        return True, output
     except FileNotFoundError:
         logger.warning("Skipping compile check: 'cmake' or 'ninja' not found in PATH")
         return True, ""  # skip check if cmake not available
     except subprocess.TimeoutExpired:
-        logger.error("Compile check timed out after 120s")
+        logger.error("Compile check timed out")
         return False, "TIMEOUT"
     except Exception as e:
         logger.error(f"Compile check error: {e}")
@@ -863,6 +909,15 @@ def _atomic_commit(staging_dir: str, target_dir: str) -> None:
     """Move staging directory content to target directory atomically.
 
     Creates a .bak backup of the existing target before overwriting.
+
+    `build/` is deliberately **not** copied: it is the by-product of the compile
+    self-check and its `CMakeCache.txt` hard-codes the temp staging path. Copying
+    it leaves the target with a cache that points at a directory that (a) no
+    longer exists after a successful run and (b) is rejected outright by cmake
+    with "The current CMakeCache.txt directory ... is different than the
+    directory ... where CMakeCache.txt was created". The very next step the
+    generator prints ("cmake -B build -G Ninja ...") then fails, for every
+    project, on a directory the user never created.
     """
     if os.path.exists(target_dir):
         backup_dir = target_dir + ".bak"
@@ -871,7 +926,10 @@ def _atomic_commit(staging_dir: str, target_dir: str) -> None:
         shutil.move(target_dir, backup_dir)
         logger.info(f"Backed up existing to {backup_dir}")
 
-    shutil.copytree(staging_dir, target_dir, dirs_exist_ok=True)
+    def _skip_transient(src: str, names: list) -> set:
+        return {n for n in names if n == "build" and os.path.basename(src) == os.path.basename(staging_dir)}
+
+    shutil.copytree(staging_dir, target_dir, dirs_exist_ok=True, ignore=_skip_transient)
     logger.info(f"Atomic commit: {staging_dir} -> {target_dir}")
 
 
@@ -922,6 +980,10 @@ def generate_project(
     # ---------- Atomic write: generate to temp dir first ----------
     actual_output = output_dir
     tmp_build_dir: Optional[str] = None
+    # 编译自检失败时保留暂存目录供排查。下面的 `finally` 无论如何都会 rmtree，
+    # 与第 1161 行"Staging directory preserved for inspection"的承诺直接矛盾 ——
+    # 于是排查时拿不到产物，只能重跑。用这个显式标志让两条路径一致。
+    keep_staging_on_failure = False
 
     if not dry_run and not show_diff:
         tmp_build_dir = tempfile.mkdtemp(prefix="hw2c_build_")
@@ -1148,13 +1210,20 @@ def generate_project(
 
         # ---------- Compile check ----------
         if tmp_build_dir and not dry_run and not force:
+            # 引导器工程里默认目标**不包含** bootloader / app / combined：
+            # 它们是 add_custom_target。不额外点名，整条 has_bootloader 路径
+            # 就不在编译闸门内 —— 正是 fota_demo 首次生成时踩到的洞。
+            extra_targets = (["bootloader", "app", "combined"]
+                             if context.get("has_bootloader") else None)
             compile_ok, compile_output = _run_compile_check(
-                tmp_build_dir, verbose=logger.isEnabledFor(logging.DEBUG)
+                tmp_build_dir, verbose=logger.isEnabledFor(logging.DEBUG),
+                extra_targets=extra_targets,
             )
             if not compile_ok:
                 logger.critical("Compile check failed. Staging directory preserved for inspection.")
                 logger.critical(f"Temp dir: {tmp_build_dir}")
                 # Do NOT cleanup temp dir on compile failure - preserve for debugging
+                keep_staging_on_failure = True
                 sys.exit(1)
 
         # ---------- Print dry-run file tree ----------
@@ -1196,8 +1265,11 @@ def generate_project(
         sys.exit(1)
     finally:
         if tmp_build_dir and os.path.exists(tmp_build_dir):
-            shutil.rmtree(tmp_build_dir)
-            logger.debug(f"Cleaned up temp dir: {tmp_build_dir}")
+            if keep_staging_on_failure:
+                logger.info(f"Staging preserved at: {tmp_build_dir}")
+            else:
+                shutil.rmtree(tmp_build_dir)
+                logger.debug(f"Cleaned up temp dir: {tmp_build_dir}")
 
     logger.info(f"\n{banner}")
     logger.info(f"SUCCESS! Project '{project_name}' generated in '{actual_output}'")

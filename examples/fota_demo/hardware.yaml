@@ -1,0 +1,139 @@
+# ============================================================
+# hw2c FOTA demo — hardware description layer
+#
+# 与 examples/base 完全相同，**只多开 bootloader**。
+#
+# 为什么必须单独有一个示例：在它之前，仓库里**没有任何示例开启 bootloader**
+# （`grep -rn "bootloader:" examples/` 为空），于是 bootloader / FOTA 的全部模板
+# 从不被渲染、从不被编译、也从不被试跑 —— 这正是 FR-14 被标成 ✅ 而实际
+# 整条路径从未被验证的根因。一个从不参与构建的模板等于不存在。
+#
+# 因此本示例的职责是"当编译对象"：它打开的每一条分支（boot_main 决策表、
+# boot_crc、boot_nvm、drv_fota、fota_delta）都必须能生成并通过编译，
+# 否则 CI 会失败而不是静默略过。
+#
+# 布局（默认值来自 generator/schemas/hardware.py::BootloaderModel）:
+#   Bootloader  [0x00000, 0x02000)   8 KB
+#   Slot A      [0x02000, 0x40000) 248 KB   ← 首次烧录的固件
+#   Slot B      [0x40000, 0x80000) 256 KB   ← OTA 目标 / 回滚备用
+#
+# 其余部分与 base 一致：
+#
+#   MCU        STM32G0B1RET6 @ 16 MHz (HSI)
+#   Shell      USART2 (PA2/PA3) — CLI + log output @ 115200 baud
+#   RTC        LSE 32.768 kHz — 1 s periodic wakeup
+#   SysTick    TIM14 — 1 kHz FreeRTOS timebase (auto)
+# ============================================================
+
+mcu:
+  part: STM32G0B1RET6
+  clock_source: HSI             # HSI or HSE
+  clock_freq_hz: 16000000       # oscillator frequency in Hz
+  core_clock_mhz: 16            # SYSCLK = clock_freq / 1e6
+  hse_freq: 8000000             # HSE frequency (used if clock_source=HSE)
+
+pins:
+  # Indicator LED — startup heartbeat + user controllable via CLI
+  - id: PC0
+    function: GPIO_Output
+    label: "LED"
+    active_level: low
+
+  # Button — EXTI both-edge input (press + release)
+  - id: PC13
+    function: GPIO_Input
+    label: "BUTTON"
+    pull: up
+    exti:
+      enable: true
+      trigger: both
+
+  # Shell UART — debug CLI + log output (ST-Link virtual COM port)
+  - id: PA2
+    function: USART2_TX
+    af: 1
+  - id: PA3
+    function: USART2_RX
+    af: 1
+
+peripherals:
+  # Serial transport for the shell
+  - name: usart2
+    type: UART_Serial
+    instance: USART2
+    interface: uart
+    extra:
+      baudrate: 115200
+
+  # CLI interactive shell (registers commands, prints logs)
+  - name: shell
+    type: Internal_CLI
+    uart: usart2
+    extra:
+      prompt: "hw2c> "
+
+  # RTC (LSE) — 1 s periodic wakeup, timer service for state machines
+  - name: rtc
+    type: Internal_RTC
+    bus: RTC
+    extra:
+      clock_source: LSE
+      wakeup_interval_ms: 1000      # 1 second wakeup tick
+      initial_time: "2026-07-29 22:07:00"
+      # 10 timers: built-in minute/hour periodic + 8 alarms below
+      alarms:
+        - type: periodic_sec
+          period_s: 1               # 1-second periodic tick
+          event: TICK_1S
+        - type: periodic_sec
+          period_s: 15              # 15-second periodic tick
+          event: TICK_15S
+        - type: periodic_sec
+          period_s: 30              # 30-second alarm for telemetry reporting
+          event: SECONDS_30
+        - type: periodic_sec
+          period_s: 120             # 2-minute periodic tick
+          event: TICK_2MIN
+        - type: periodic_sec
+          period_s: 300             # 5 minute alarm for system heartbeat
+          event: MINUTE_5
+        - type: one_shot
+          period_s: 5               # single-shot after 5 seconds
+          event: ONE_SHOT_5S
+        - type: one_shot_ms
+          delay_ms: 500             # single-shot after 500 ms (RTC SSR)
+          event: ONE_SHOT_500MS
+        - type: one_shot_ms
+          delay_ms: 2000            # single-shot after 2 seconds (RTC SSR)
+          event: ONE_SHOT_2S
+
+  # On-chip temperature sensor (ADC1 CH16) — calibrated 0.1°C reading
+  - name: temp_sensor
+    type: Internal_TempSensor
+    
+log:
+  enable: true
+  ring_buf_size: 1024
+
+sleep:
+  mode: STOP1
+  tickless: true
+
+# ============================================================
+# Bootloader / 差分 OTA
+#
+# enabled: true 是**本示例区别于 base 的唯一开关**。它一开，生成器就会：
+#   · 渲染 bootloader/ 子工程（boot_main 决策表 / boot_crc / boot_nvm / boot_jump）
+#   · 渲染 app 侧的 fota_delta（差分应用）与 drv_fota（接收协议）
+#   · 生成两套链接脚本 app_slot_a.ld / app_slot_b.ld，并在 0xC0 预留 16 B 镜像头
+#   · 自动注入 IWDG 驱动（引导器与差分应用期间都必须喂狗）
+# ============================================================
+bootloader:
+  enabled: true
+  size_kb: 8                  # 必须 ≤ app_a_offset/1024，否则 schema 直接拒绝
+  app_a_offset: 0x2000        # Slot A 起始（相对 0x08000000）
+  app_b_offset: 0x40000       # Slot B 起始；两个槽不等大是现有布局的事实
+  crc_method: crc32_hw        # 用 CRC 外设；等价性需上板复核（见规划 §17.2）
+  boot_flag_src: tamp_bkp     # 备份域寄存器保存启动/回滚状态
+  max_retries: 3              # 新槽连续启动失败 3 次即回滚
+  wdg_timeout_ms: 5000        # IWDG 超时；差分擦写期间必须按页喂狗

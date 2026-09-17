@@ -176,9 +176,31 @@ set(APP_SOURCES
 {% if has_power_mgr %}
     src/power_mgr.c
 {% endif %}
+{% if has_bootloader %}
+    # ── 差分 OTA：vendored 解码器 ─────────────────────────────────────────────
+    # HPatchLite 负责 lite 流的 apply，tinyuz 负责压缩正文的解压。
+    # 两者都**不因 TEST 构建而被替换成空桩**（A9 的教训）：主机侧的掉电注入
+    # 测试编译的是**同一份** .c，只是把 Flash 后端换成内存实现。
+    # 供应商源码只读，见 AGENTS.md 与各自目录下的 PROVENANCE.json。
+    #
+    # 门控用 has_bootloader 而不是 has_fota：解码器的唯一消费者是
+    # drv_fota_delta，而它的注入条件就是 has_bootloader（差分应用要往
+    # **另一个槽**写 Flash，没有引导器就没有第二个槽）。若门控写成
+    # has_fota（= bootloader **and** uart），一个"有引导器但没串口"的工程会
+    # 生成 drv_fota_delta.c 却不链解码器 → 链接期未定义符号。
+    ${HW2C_ROOT}/third_party/hpatch_lite/hpatch_lite.c
+    ${HW2C_ROOT}/third_party/tinyuz/decompress/tuz_dec.c
+{% endif %}
 )
 
 # Per-driver includes (each driver may need its own headers)
+#
+# ⚠️ 顺序是硬约束：`target_include_directories` 必须先有 target。
+# 这段曾位于 add_executable 之前，一直没暴露 —— 因为此前没有任何驱动带
+# `includes` 字段，循环体渲染为空。fota_delta 是第一个（需要 vendored
+# 解码器的头目录），于是 cmake configure 直接报
+# "Cannot specify include directories for target ... which is not built by this project"。
+add_executable(${PROJECT_NAME} ${APP_SOURCES})
 {% for drv in drivers %}
 {% if drv.get('includes') %}
 {% for inc in drv.includes %}
@@ -186,8 +208,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE {{ inc | replace('$(HARDWARE2
 {% endfor %}
 {% endif %}
 {% endfor %}
-
-add_executable(${PROJECT_NAME} ${APP_SOURCES})
 target_compile_definitions(${PROJECT_NAME} PRIVATE LWRB_DISABLE_ATOMIC)
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${COMMON_INCLUDES}
@@ -228,11 +248,31 @@ if(NOT STM32_PROG_CLI)
 endif()
 
 {% if has_bootloader %}
-# With bootloader: flash combined image
-# Build bootloader first, then run CRC patch, then flash
+# ── 有引导器时的烧录 ─────────────────────────────────────────────────────────
+#
+# ⚠️ 这两个目标此前是**错的**，而且错得很危险（fota_demo 之前从未暴露，
+#    因为没有示例开启过 bootloader）：
+#   · `flash` 只是一个 `echo "Flashing combined image..."` 的**空壳**，
+#     什么都不烧，却打印得像成功了；
+#   · `flash-daplink` 把 `${PROJECT_NAME}.bin`（**应用镜像，未打镜像头，
+#     且按 Slot A 的 0x08002000 链接**）写到 **0x08000000** —— 正好覆盖
+#     引导器，板子变砖。
+#
+# 正确做法：烧 `combined.bin`（引导器 + Slot A 应用镜像）到 0x08000000。
+# 它由 `combined` 目标产出，依赖链是 bootloader → app → combined。
+set(_HW2C_FLASH_IMG ${CMAKE_BINARY_DIR}/combined.bin)
+
 add_custom_target(flash
-    COMMAND ${CMAKE_COMMAND} -E echo "Flashing combined image..."
-    COMMENT "Flash via STM32_Programmer_CLI"
+    COMMAND "${STM32_PROG_CLI}" -c port=SWD -w ${_HW2C_FLASH_IMG} 0x08000000 -rst
+    DEPENDS combined
+    COMMENT "Flashing combined.bin (bootloader + slot A) via STM32_Programmer_CLI"
+)
+
+add_custom_target(flash-daplink
+    COMMAND openocd -f interface/cmsis-dap.cfg -f target/stm32g0x.cfg
+            -c "program ${_HW2C_FLASH_IMG} 0x08000000 verify reset exit"
+    DEPENDS combined
+    COMMENT "Flashing combined.bin (bootloader + slot A) via OpenOCD (CMSIS-DAP)"
 )
 {% else %}
 add_custom_target(flash
@@ -240,7 +280,6 @@ add_custom_target(flash
     DEPENDS ${PROJECT_NAME}
     COMMENT "Flashing ${PROJECT_NAME}.bin via STM32_Programmer_CLI"
 )
-{% endif %}
 
 # OpenOCD / DAP-Link flash
 add_custom_target(flash-daplink
@@ -249,6 +288,7 @@ add_custom_target(flash-daplink
     DEPENDS ${PROJECT_NAME}
     COMMENT "Flashing via OpenOCD (CMSIS-DAP)"
 )
+{% endif %}
 
 {% if hil_mode %}
 # ── HIL test runner ──────────────────────────────────────────────────────────
@@ -273,6 +313,20 @@ add_custom_target(coverage
 )
 
 {% if has_bootloader %}
+# ── 固件版本号（写入槽内镜像头的 fw_version 字段，24-bit）──────────────────────
+#
+# 原实现直接写 `--version $ENV{FOTA_VERSION}`：环境变量没设时它展开为空，
+# 命令行退化成 `patch_crc.py x.bin --version -o y.bin`，argparse 报
+# "argument --version: expected one argument" —— 也就是 `app` / `combined`
+# 两个目标默认**跑不起来**，而报错完全指不到"你没设环境变量"。
+# 现在给一个可覆盖的默认值：-DFW_VERSION=2，或设环境变量 FOTA_VERSION。
+if(DEFINED ENV{FOTA_VERSION} AND NOT "$ENV{FOTA_VERSION}" STREQUAL "")
+    set(FW_VERSION "$ENV{FOTA_VERSION}" CACHE STRING "固件版本号（24-bit，写入槽内镜像头）" FORCE)
+else()
+    set(FW_VERSION "1" CACHE STRING "固件版本号（24-bit，写入槽内镜像头）")
+endif()
+message(STATUS "hw2c: firmware version (image header fw_version) = ${FW_VERSION}")
+
 # ── Bootloader ───────────────────────────────────────────────────────────────
 # Build via external process (bootloader uses bare-metal, separate linker script)
 add_custom_target(bootloader
@@ -281,50 +335,54 @@ add_custom_target(bootloader
             -B ${CMAKE_BINARY_DIR}/bootloader
             -DCMAKE_TOOLCHAIN_FILE=${CMAKE_SOURCE_DIR}/toolchain.cmake
             -DHARDWARE2CODE_STATIC=${HARDWARE2CODE_STATIC}
+            # 引导器不做任何浮点格式化：关掉 -u _printf_float/-u _scanf_float，
+            # 否则 newlib 的 printf/scanf 机器会被链进来，8 KB 区域直接溢出 23 KB。
+            -DHW2C_FLOAT_PRINTF=OFF
     COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}/bootloader
     COMMENT "Building bootloader..."
 )
 
-# ── App image (with CRC) ─────────────────────────────────────────────────────
+# ── App image (slot A, header patched in place) ──────────────────────────────
 add_custom_target(app
-    COMMAND ${CMAKE_COMMAND} -E echo "Patching CRC32 into App firmware..."
+    COMMAND ${CMAKE_COMMAND} -E echo "Patching CRC32 + version into Slot A image..."
     COMMAND python ${CMAKE_SOURCE_DIR}/patch_crc.py
             ${CMAKE_BINARY_DIR}/${PROJECT_NAME}.bin
-            --version $ENV{FOTA_VERSION}
+            --version ${FW_VERSION}
             -o ${CMAKE_BINARY_DIR}/${PROJECT_NAME}_crc.bin
     DEPENDS ${PROJECT_NAME}
     COMMENT "Creating CRC-patched app image..."
 )
 
 # ── Combined image: Bootloader + App Slot A ──────────────────────────────────
+# ── Combined image: Bootloader + App Slot A ──────────────────────────────────
+# ⚠️ 填充字节写成 `bytes([255])` 而**不是** `b'\xFF'`：CMake 的双引号字符串里
+#    `\x` 是非法转义序列，会让 `add_custom_target` 直接报
+#    "Invalid character escape '\x'" 并导致 configure 失败。
+#    这个缺陷在 fota_demo 出现之前一直存在 —— 因为此前**没有任何示例开启
+#    bootloader**，整个 `has_bootloader` 分支从未被渲染过。
 add_custom_target(combined
     COMMAND ${CMAKE_COMMAND} -E echo "Merging bootloader + app..."
     COMMAND python -c
-            "import sys; bl=open('${CMAKE_BINARY_DIR}/bootloader/bootloader.bin','rb').read(); bl_padded=bl+b'\xFF'*({{ boot_size_bytes }}-len(bl)); app=open('${CMAKE_BINARY_DIR}/${PROJECT_NAME}_crc.bin','rb').read(); open('${CMAKE_BINARY_DIR}/combined.bin','wb').write(bl_padded+app)"
+            "import sys; bl=open('${CMAKE_BINARY_DIR}/bootloader/bootloader.bin','rb').read(); bl_padded=bl+bytes([255])*({{ boot_size_bytes }}-len(bl)); app=open('${CMAKE_BINARY_DIR}/${PROJECT_NAME}_crc.bin','rb').read(); open('${CMAKE_BINARY_DIR}/combined.bin','wb').write(bl_padded+app)"
     DEPENDS bootloader app
     COMMENT "Creating combined image..."
 )
 
-{% if has_fota %}
-# ── FOTA diff generation ─────────────────────────────────────────────────────
-add_custom_target(fota-diff
-    COMMAND ${CMAKE_COMMAND} -E echo "Generating BSDIFF patch..."
-    COMMAND python ${CMAKE_SOURCE_DIR}/generator/bsdiff_tool.py
-            $ENV{FOTA_PREV_FW}
-            ${CMAKE_BINARY_DIR}/${PROJECT_NAME}_crc.bin
-            -o ${CMAKE_BINARY_DIR}/${PROJECT_NAME}_diff.patch
-    DEPENDS app
-    COMMENT "Creating FOTA diff..."
-)
-
-add_custom_target(fota-send
-    COMMAND python ${CMAKE_SOURCE_DIR}/generator/fota_sender.py
-            $ENV{FOTA_PORT}
-            ${CMAKE_BINARY_DIR}/${PROJECT_NAME}_diff.patch
-            --baud $ENV{FOTA_BAUD}
-    COMMENT "Sending FOTA update..."
-)
-{% endif %}
+# ── 差分 OTA 补丁 ────────────────────────────────────────────────────────────
+# 这里**故意不建** `fota-diff` / `fota-send` 目标。此前有一对，但它们是坏的：
+# 调用的 `${CMAKE_SOURCE_DIR}/generator/bsdiff_tool.py` 在生成产物里根本不存在
+# （生成器只把 `patch_crc.py` / `fota_format.json` 拷到产物根目录），而且
+# `bsdiff_tool.py` 按规划 §11.1 已被 `delta_tool.py` 取代。
+#
+# `delta_tool.py` 是 Python **包内模块**（用相对导入取 `patch_crc` / `tinyuz_enc`），
+# 不能像 `patch_crc.py` 那样单独拷贝出来执行。所以补丁生成走主机侧：
+#
+#     python -m generator.delta_tool build \
+#         --old <上一版 slot 镜像> --new ${CMAKE_BINARY_DIR}/${PROJECT_NAME}_crc.bin \
+#         -o ${CMAKE_BINARY_DIR}/${PROJECT_NAME}.h2cd --version <版本号>
+#
+# P5（端到端）再把这一步接进 CMake —— 那时会把调用方式一并定下来，
+# 而不是现在留一个从不执行、也无法执行的目标。
 {% endif %}
 {% endif %}
 

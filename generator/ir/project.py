@@ -68,6 +68,10 @@ class ProjectIR(IRObject):
     has_substate: bool = False
     has_bootloader: bool = False
     has_fota: bool = False
+    # 接收侧协议驱动（drv_fota）当前被整体停用，见 bootloader_context.inject_bootloader_drivers
+    # 的注释：它引用了 drv_uart 的 static 函数，从未被编译过。P3 重写。这里显式留一个
+    # 标志位，让"老 FOTA 单测是否执行"取决于一个真实存在的字段，而不是一个永远取不到的键。
+    has_fota_receive: bool = False
     has_iwdg: bool = False
     has_event_mgr: bool = True
     has_tickless: bool = False
@@ -116,6 +120,15 @@ class ProjectIR(IRObject):
 
     # ---------- Bootloader ----------
     boot: BootIR = field(default_factory=BootIR)
+
+    # ---------- FOTA 差分格式（头部/信封布局的唯一真源 → 模板常量） ----------
+    # 由 generator/context/bootloader_context.fota_format_for_templates() 从
+    # docs/fota_format.json 展平；模板里**不允许**出现字面偏移量。防 A3 双源漂移。
+    fota_fmt: dict = field(default_factory=dict)
+    # 差分应用的 RAM 预算，默认值有实测依据（见 fota_delta_budget）
+    fota_delta_page_size: int = 2048
+    fota_delta_cache_size: int = 2048
+    fota_delta_dict_size: int = 4096
 
     # ---------- EXTI ----------
     exti: ExtiIR = field(default_factory=ExtiIR)

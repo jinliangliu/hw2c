@@ -47,6 +47,41 @@ def img(spec):
     return spec["image_header"]
 
 
+def _render_slot_linker(slot: str) -> str:
+    """把 app_slot_{a,b}.ld.j2 **渲染出来**再断言。
+
+    为什么必须渲染而不是对模板源码做正则：模板里的偏移现在写成
+    `{{ fota_fmt.img_hdr_off }}`，源码上看不出它到底是多少。只有渲染后
+    才能确认落进链接脚本的是真源里的那个数（= A3 的正面防线）。
+    """
+    import jinja2
+
+    from generator.context.bootloader_context import fota_format_for_templates
+
+    flash_base = 0x08000000
+    boot_config = {
+        "size_kb": 8,
+        "app_a_offset": 0x2000,
+        "app_b_offset": 0x40000,
+        "_app_a_start": flash_base + 0x2000,
+        "_app_a_end": flash_base + 0x40000,
+        "_app_b_start": flash_base + 0x40000,
+        "_app_b_end": flash_base + 0x80000,
+        "_app_a_size": 0x40000 - 0x2000,
+        "_app_b_size": 0x80000 - 0x40000,
+    }
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(_TEMPLATES_DIR)),
+        trim_blocks=True, lstrip_blocks=True,
+    )
+    return env.get_template("linker/app_slot_%s.ld.j2" % slot).render(
+        boot_config=boot_config,
+        fota_fmt=fota_format_for_templates(),
+        heap_size="0x200",
+        stack_size="0x400",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. 真源自身的自洽性
 # ---------------------------------------------------------------------------
@@ -99,14 +134,15 @@ def test_crc_region_covers_magic_and_version(img):
 
 @pytest.mark.parametrize("slot", ["a", "b"])
 def test_slot_linker_declares_header_of_exact_size(slot, img):
-    """`.app_header` 段必须恰好声明 img['size'] 个 LONG。
+    """**渲染后**的 `.app_header` 段必须恰好声明 img['size'] 个 LONG，
+    且 magic 落在真源规定的那个字上。
 
     多一个少一个都会让 .text 的起始地址与真源不符 —— 而真源正是
-    boot_crc / patch_crc 两边共用的偏移依据。
+    boot_crc / patch_crc 两侧共用的偏移依据。
     """
-    tmpl = (_TEMPLATES_DIR / "linker" / ("app_slot_%s.ld.j2" % slot)).read_text(encoding="utf-8")
-    block = re.search(r"\.app_header\s*:\s*\{(.*?)\}\s*>FLASH", tmpl, re.S)
-    assert block, "app_slot_%s.ld.j2 中找不到 .app_header 段" % slot
+    text = _render_slot_linker(slot)
+    block = re.search(r"\.app_header\s*:\s*\{(.*?)\}\s*>FLASH", text, re.S)
+    assert block, "app_slot_%s.ld 中找不到 .app_header 段" % slot
 
     longs = re.findall(r"\bLONG\s*\(", block.group(1))
     expected = img["size"] // 4
@@ -115,14 +151,16 @@ def test_slot_linker_declares_header_of_exact_size(slot, img):
         % (len(longs), expected, img["size"])
     )
 
-    # magic 必须出现在它该在的那个 LONG 上
-    magic_longs = [i for i, m in enumerate(re.finditer(r"\bLONG\s*\(\s*([^)]*)\)", block.group(1)))
-                   if m.group(1).strip().upper().startswith("0X4841436B")]
-    assert magic_longs, "链接脚本里没有 magic 常量"
+    # magic 必须出现在它该在的那个 LONG 上，且值等于真源
     magic_index = img["fields"]["magic"]["offset"] // 4
-    assert magic_longs == [magic_index], (
-        "magic 位于第 %s 个 LONG，真源要求第 %d 个" % (magic_longs, magic_index)
+    values = [int(m.group(1).strip(), 0)
+              for m in re.finditer(r"\bLONG\s*\(\s*([^)]*)\)", block.group(1))]
+    assert values[magic_index] == img["fields"]["magic"]["value"], (
+        "第 %d 个 LONG 是 0x%08X，真源的 magic 是 0x%08X"
+        % (magic_index, values[magic_index], img["fields"]["magic"]["value"])
     )
+    assert values.count(img["fields"]["magic"]["value"]) == 1, (
+        "magic 常量在 .app_header 里出现了不止一次")
 
 
 def test_boot_crc_constants_match_spec(img):
@@ -294,3 +332,58 @@ def test_patch_crc_rejects_missing_magic(tmp_path, img):
     src.write_bytes(bytes(blob))
     with pytest.raises(ValueError, match="magic"):
         patch_firmware(str(src), str(tmp_path / "out.bin"), version=1)
+
+
+def test_patch_crc_rejects_header_at_the_wrong_slot_offset(tmp_path, img):
+    """头部偏移与真源不符必须**拒绝**，而不是"搜到哪儿就按哪儿写"。
+
+    背景（2026-09-16 实测）：`.isr_vector` 在 STM32G0B1 上只有 47 项 =
+    188 B = 0xBC，链接脚本里 `.app_header` 紧随其后 → 落在 0xBC。
+    旧实现用 magic 的实际位置反推 header_offset，于是它**顺着**接受了 0xBC，
+    而引导器 / fota_delta 都按 0xC0 读 ⇒ 在板上拒掉每一个镜像，
+    但生成与编译一路绿灯。本测试把这条静默路径钉死。
+    """
+    # 把整个头部（含 magic）前移 4 字节，模拟向量表比预期短
+    blob = bytearray(_make_image(img))
+    hdr_at = img["offset_in_slot"]
+    shifted = bytes(blob[hdr_at:hdr_at + img["size"]])
+    del blob[hdr_at:hdr_at + img["size"]]
+    blob[hdr_at - 4:hdr_at - 4] = shifted
+    src = tmp_path / "shifted.bin"
+    src.write_bytes(bytes(blob))
+
+    with pytest.raises(ValueError, match="槽内偏移"):
+        patch_firmware(str(src), str(tmp_path / "out.bin"), version=1)
+
+
+# ---------------------------------------------------------------------------
+# 4. 链接脚本把头部**钉在**真源偏移上（不是"紧随向量表"）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("slot", ["a", "b"])
+def test_slot_linker_pins_header_at_the_spec_offset(slot, img):
+    """仅声明 `.app_header` 是不够的，必须把它的**位置**钉在真源偏移上。
+
+    只检查"段里有 4 个 LONG"会漏掉真正的故障模式：段本身是对的，
+    但它被放在了错误的偏移上（紧随长度未知的向量表）。所以这里断言
+    (1) `.isr_vector` 里显式把位置计数器推到 `ORIGIN(FLASH) + offset_in_slot`，
+    (2) 存在校验位置与大小的链接期 ASSERT。
+    """
+    tmpl = (_TEMPLATES_DIR / "linker" / ("app_slot_%s.ld.j2" % slot)).read_text(encoding="utf-8")
+
+    # (1) 位置钉死。允许写成字面量或经 fota_fmt 展开的占位符；这里只要求
+    #     "把 . 推到 ORIGIN(FLASH) 加一个常量"这个结构存在。
+    m = re.search(r"\.\s*=\s*ORIGIN\(FLASH\)\s*\+\s*([^;]+);", tmpl)
+    assert m, (
+        "app_slot_%s.ld.j2 没有把 .isr_vector 的结束位置推到 ORIGIN(FLASH) + 头部偏移；"
+        "头部会落在向量表的自然长度上（STM32G0B1 实测 0xBC，而非真源的 0x%X）"
+        % (slot, img["offset_in_slot"]))
+    expr = m.group(1).strip()
+    assert "fota_fmt.img_hdr_off" in expr or str(img["offset_in_slot"]) in expr, (
+        "头部偏移表达式 %r 既不是真源占位符也不等于真源值" % expr)
+
+    # (2) 链接期断言必须存在 —— 否则位置/大小再次漂移时无人报警。
+    assert re.search(r"ASSERT\s*\(\s*ADDR\(\.app_header\)", tmpl), (
+        "app_slot_%s.ld.j2 缺少对头部**位置**的链接期 ASSERT" % slot)
+    assert re.search(r"ASSERT\s*\(\s*SIZEOF\(\.app_header\)", tmpl), (
+        "app_slot_%s.ld.j2 缺少对头部**大小**的链接期 ASSERT" % slot)

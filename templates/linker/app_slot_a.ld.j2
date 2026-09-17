@@ -23,7 +23,7 @@ _Min_Heap_Size = {{ heap_size | default('0x200') }};
 _Min_Stack_Size = {{ stack_size | default('0x400') }};
 
 /* VTOR 偏移量（C 代码中设置 SCB->VTOR 时使用） */
-__vtor_offset__ = {{ boot_config.app_a_offset }};
+__vtor_offset__ = 0x{{ "%08X" % boot_config.app_a_offset }};
 
 MEMORY
 {
@@ -37,26 +37,46 @@ SECTIONS
   {
     . = ALIGN(4);
     KEEP(*(.isr_vector))
-    . = ALIGN(4);
+
+    /* ⚠️ 把位置计数器**推进到槽内偏移 {{ fota_fmt.img_hdr_off }}（{{ fota_fmt.img_hdr_off | string }} B）**，
+       让镜像头恰好落在那里。绝不能依赖"向量表自然就是那么长"。
+
+       实测（2026-09-16，STM32G0B1RET6 + 本仓库的 CMSIS 启动文件）：
+       `.isr_vector` 只有 47 项 = 188 B = 0xBC，于是 `.app_header` 落在
+       0xBC 而不是真源声明的 0xC0。引导器按 `slot_base + {{ fota_fmt.img_hdr_off }}` 读 magic，
+       于是**每一个镜像都被判为无效** —— 而生成与编译全都不报错。
+       这类缺陷只能靠链接期把它钉死。
+
+       顺带的好处：若将来向量表**超过**该偏移，链接器会报
+       "cannot move location counter backwards"，是 fail-closed 的。 */
+    . = ORIGIN(FLASH) + {{ fota_fmt.img_hdr_off }};
   } >FLASH
 
-  /* 固件镜像头部（紧随向量表，偏移 0xC0，共 16 字节）
-     Bootloader 从 slot_start + 0xC0 读取此头部。
-     格式（真源 generator/data/fota_format.json）:
-       +0x00 image_size (u32)  payload 字节数
-       +0x04 crc32      (u32)  CRC-32/MPEG-2，覆盖 magic + fw_version + payload
-       +0x08 magic      (u32)  0x4841436B
-       +0x0C fw_version (u32)  24-bit 有效
+  /* 固件镜像头部（槽内偏移 {{ fota_fmt.img_hdr_off }}，共 {{ fota_fmt.img_hdr_size }} 字节）
+     Bootloader 与 fota_delta 都从 `slot_base + {{ fota_fmt.img_hdr_off }}` 读取此头部。
+     字段偏移的真源是 generator/data/fota_format.json（这里按它展开，不写死字面量）：
+       +{{ fota_fmt.img_off_image_size }}  image_size (u32)  payload 字节数
+       +{{ fota_fmt.img_off_crc32 }}  crc32      (u32)  CRC-32/ISO-HDLC（≡ zlib.crc32，**不是** MPEG-2）
+       +{{ fota_fmt.img_off_magic }}  magic      (u32)  {{ "0x%08X" % fota_fmt.img_magic }}（内存中呈现为 'kCAH'，勿"顺手"改成 ASCII）
+       +{{ fota_fmt.img_off_fw_version }}  fw_version (u32)  24-bit 有效
      编译后由 patch_crc.py **原位回填**（不插入字节；插入会使镜像位移而
-     向量表/字面量池中的绝对地址失配）。 */
+     向量表/字面量池中的绝对地址失配 —— B1）。 */
   .app_header :
   {
     . = ALIGN(4);
-    LONG(0xFFFFFFFF);         /* image_size 占位，编译后回填 */
-    LONG(0xFFFFFFFF);         /* crc32 占位，编译后回填 */
-    LONG(0x4841436B);         /* magic，标识有效头部 */
-    LONG(0xFFFFFFFF);         /* fw_version 占位，编译后回填 */
+    LONG(0xFFFFFFFF);                      /* +{{ fota_fmt.img_off_image_size }}  image_size  占位，编译后回填 */
+    LONG(0xFFFFFFFF);                      /* +{{ fota_fmt.img_off_crc32 }}  crc32       占位，编译后回填 */
+    LONG({{ "0x%08X" % fota_fmt.img_magic }});                      /* +{{ fota_fmt.img_off_magic }}  magic       标识有效头部（数值真源：fota_format.json） */
+    LONG(0xFFFFFFFF);                      /* +{{ fota_fmt.img_off_fw_version }}  fw_version  占位，编译后回填 */
   } >FLASH
+
+  /* 链接期断言：头部的**位置**与**大小**是两个必须成立的不变量。
+     任一被破坏，机器上的症状都是"引导器拒掉所有镜像"，且不会在任何
+     编译产物里留下痕迹 —— 所以放在这里，让它变成链接错误。 */
+  ASSERT(ADDR(.app_header) - ORIGIN(FLASH) == {{ fota_fmt.img_hdr_off }},
+         "镜像头不在槽内偏移 {{ fota_fmt.img_hdr_off }} 上：向量表填充被破坏")
+  ASSERT(SIZEOF(.app_header) == {{ fota_fmt.img_hdr_size }},
+         "镜像头段大小与 fota_format.json 不一致")
 
   .text :
   {

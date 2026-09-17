@@ -1,0 +1,258 @@
+#ifndef __DRV_FOTA_DELTA_H
+#define __DRV_FOTA_DELTA_H
+
+/*
+ * 差分 OTA 的**设备侧应用层**（规划 P2'）。
+ *
+ * 分层（规划 §5.1）
+ * ----------------
+ * 本文件与 fota_delta.c **不含任何 HAL 调用**，也不含 `#ifdef TEST`。
+ * 所有 I/O 通过 `fota_delta_backend_t` 注入：
+ *
+ *   · 目标侧（设备）：drv_fota_delta.c 里的 Flash 后端（HAL_FLASHEx_Erase /
+ *     HAL_FLASH_Program，按页擦、按双字编程）；
+ *   · 主机侧（测试）：tools/fota_delta_testbench/ 里的内存后端（可注入掉电）。
+ *
+ * 这是 A9（"mock 让测试失效"）的结构性对策：主机跑的不是替身，而是与设备
+ * **同一份**源码。真正的差异只有 Flash 那一层，而那一层在主机上被换成
+ * "行为正确、可注入失败"的实现，而不是 no-op。
+ *
+ * 为什么应用方是 vendored 解码器而不是自研算法
+ * ------------------------------------------
+ * 规划 §16.7 裁决 1：只借解码器（HPatchLite，MIT）、自研 Python 写侧。
+ * 于是"格式正确性"的判据变成「我们写的编码器产出的流能否被**上游解码器**
+ * 还原」，由 oracle 逐字节比对覆盖（见 generator/tests/test_delta_tool.py）。
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ---- 全部布局常量来自 generator/data/fota_format.json（唯一真源）------- */
+
+/* 镜像头：位于每个槽的固定偏移，紧随向量表 */
+#define FOTA_IMG_HDR_OFF          {{ fota_fmt.img_hdr_off }}U
+#define FOTA_IMG_HDR_SIZE         {{ fota_fmt.img_hdr_size }}U
+#define FOTA_IMG_PAYLOAD_OFF      {{ fota_fmt.img_payload_off }}U
+#define FOTA_IMG_MAGIC            {{ "0x%08XUL" | format(fota_fmt.img_magic) }}
+#define FOTA_IMG_VERSION_MASK     {{ "0x%08XUL" | format(fota_fmt.img_version_mask) }}
+#define FOTA_IMG_OFF_IMAGE_SIZE   {{ fota_fmt.img_off_image_size }}U
+#define FOTA_IMG_OFF_CRC32        {{ fota_fmt.img_off_crc32 }}U
+#define FOTA_IMG_OFF_MAGIC        {{ fota_fmt.img_off_magic }}U
+#define FOTA_IMG_OFF_FW_VERSION   {{ fota_fmt.img_off_fw_version }}U
+
+/* CRC 覆盖区：起点是 magic（刻意排除 image_size 与 crc32 自身），
+ * 长度 = 代码区长度 + length_addend。与 boot_crc_verify() 覆盖**同一段**。 */
+#define FOTA_CRC_REGION_START     {{ fota_fmt.crc_region_start }}U
+#define FOTA_CRC_REGION_ADDEND    {{ fota_fmt.crc_region_addend }}U
+
+/* 事后回填的 8 字节窗口（image_size + crc32）：
+ * 差分流把它们写成 0xFFFFFFFF 占位，设备编程时必须跳过、留到 FLUSH 单独写入。 */
+#define FOTA_HDR_HOLE_OFF         {{ fota_fmt.hdr_hole_off }}U
+#define FOTA_HDR_HOLE_LEN         {{ fota_fmt.hdr_hole_len }}U
+
+/* 信封（外层）*/
+#define FOTA_ENV_SIZE             {{ fota_fmt.env_size }}U
+#define FOTA_ENV_MAGIC            {{ "0x%08XUL" | format(fota_fmt.env_magic) }}
+#define FOTA_ENV_FORMAT_VER       {{ fota_fmt.env_format_ver }}U
+#define FOTA_ENV_FLAG_COMPRESSED  {{ fota_fmt.env_flags_compressed }}U
+#define FOTA_ENV_OFF_MAGIC        {{ fota_fmt.env_off_magic }}U
+#define FOTA_ENV_OFF_FORMAT_VER   {{ fota_fmt.env_off_format_ver }}U
+#define FOTA_ENV_OFF_FLAGS        {{ fota_fmt.env_off_flags }}U
+#define FOTA_ENV_OFF_OLD_SIZE     {{ fota_fmt.env_off_old_size }}U
+#define FOTA_ENV_OFF_OLD_CRC32    {{ fota_fmt.env_off_old_crc32 }}U
+#define FOTA_ENV_OFF_NEW_SIZE     {{ fota_fmt.env_off_new_size }}U
+#define FOTA_ENV_OFF_NEW_CRC32    {{ fota_fmt.env_off_new_crc32 }}U
+#define FOTA_ENV_OFF_PATCH_SIZE   {{ fota_fmt.env_off_patch_size }}U
+#define FOTA_ENV_OFF_FW_VERSION   {{ fota_fmt.env_off_fw_version }}U
+#define FOTA_ENV_OFF_HDR_CRC16    {{ fota_fmt.env_off_hdr_crc16 }}U
+#define FOTA_ENV_OFF_AUTH_LEN     {{ fota_fmt.env_off_auth_len }}U
+
+#define FOTA_SLOT_A_BASE          {{ "0x%08XUL" | format(boot_config._app_a_start) }}
+#define FOTA_SLOT_A_SIZE          {{ boot_config._app_a_size }}U
+#define FOTA_SLOT_B_BASE          {{ "0x%08XUL" | format(boot_config._app_b_start) }}
+#define FOTA_SLOT_B_SIZE          {{ boot_config._app_b_size }}U
+
+/* ---- 资源预算 -------------------------------------------------------------
+ *
+ * RAM 组成（压缩路径最坏情况）:
+ *   page_size        {{ fota_delta_page_size }}  顺序输出的页缓冲
+ *   cache_size       {{ fota_delta_cache_size }}  HPatchLite 的 temp_cache
+ *                          （一半作 old→new 拷贝的暂存，一半作补丁输入缓存）
+ *   dict_size        {{ fota_delta_dict_size }}  tinyuz 的回溯窗口（只能取流里声明的值）
+ *   ------------------------------------------
+ *   合计             {{ fota_delta_page_size + fota_delta_cache_size + fota_delta_dict_size }}   （不含少量状态变量）
+ *
+ * `dict_size` 取 4 KB 的依据（真实固件对实测）：1K/4K/16K 的补丁大小几乎相同，
+ * 4 KB 已拿到 16 KB 的全部收益 —— 见 generator/delta_tool.py::build()。
+ * 上限只用于静态分配，实际值以补丁流开头声明的 dict_size 为准（必须 ≤ 上限）。
+ */
+#define FOTA_DELTA_PAGE_SIZE      {{ fota_delta_page_size }}U
+#define FOTA_DELTA_CACHE_SIZE     {{ fota_delta_cache_size }}U
+#define FOTA_DELTA_DICT_SIZE_MAX  {{ fota_delta_dict_size }}U
+
+/* 是否编入 tinyuz 解压路径。默认开（裁决 2）。关掉可以省下
+ * `FOTA_DELTA_DICT_SIZE_MAX + CACHE/4` 的静态缓冲，但此时 `compress_type=1`
+ * 的补丁会被明确拒绝（而不是静默产出坏镜像）。 */
+#ifndef FOTA_DELTA_HAS_TUZ
+#  define FOTA_DELTA_HAS_TUZ 1
+#endif
+
+/* CRC 多项式（反射形式）—— CRC-32/ISO-HDLC，等价于 zlib.crc32。
+ * ⚠️ 早期注释把它写成 CRC-32/MPEG-2 是**错的**，两者结果不同。 */
+#define FOTA_CRC32_POLY_REFLECTED 0xEDB88320UL
+#define FOTA_CRC32_INIT           0xFFFFFFFFUL
+#define FOTA_CRC32_FINAL_XOR      0xFFFFFFFFUL
+
+/* ---- 返回码：稳定编号，便于写进 .noinit 供复位后诊断 --------------------- */
+typedef enum {
+    FOTA_DELTA_OK             = 0,
+    FOTA_DELTA_E_ARG          = -1,   /* 入参为空 / 布局非法 */
+    FOTA_DELTA_E_TOO_SHORT    = -2,   /* 补丁连信封都装不下 */
+    FOTA_DELTA_E_ENV_MAGIC    = -3,
+    FOTA_DELTA_E_ENV_VERSION  = -4,
+    FOTA_DELTA_E_ENV_FLAGS    = -5,   /* 含未知位 */
+    FOTA_DELTA_E_ENV_CRC16    = -6,
+    FOTA_DELTA_E_AUTH         = -7,   /* 声明了签名但本版不支持 */
+    FOTA_DELTA_E_OLD_SIZE     = -8,   /* 活动槽实况与信封不符 */
+    FOTA_DELTA_E_OLD_CRC      = -9,   /* 活动槽内容不是补丁针对的那一版 */
+    FOTA_DELTA_E_TOO_BIG      = -10,  /* 新镜像放不下目标槽 */
+    FOTA_DELTA_E_IMAGE_HEAD   = -11,  /* 活动槽读不出合法镜像头 */
+    FOTA_DELTA_E_LITE_HEAD    = -12,  /* lite 头不合法 */
+    FOTA_DELTA_E_LITE_NEWSIZE = -13,  /* lite 头的 newSize 与信封不符 */
+    FOTA_DELTA_E_PATCH_SIZE   = -14,  /* 实到字节数与 patch_size 不符 */
+    FOTA_DELTA_E_UNSUPPORTED  = -15,  /* compress_type 不受支持 */
+    FOTA_DELTA_E_DECOMP       = -16,  /* tinyuz 解压失败 */
+    FOTA_DELTA_E_APPLY        = -17,  /* hpatch_lite_patch() 失败 */
+    FOTA_DELTA_E_IO           = -18,  /* 后端 I/O 失败 */
+    FOTA_DELTA_E_CRC          = -19,  /* 新镜像 CRC 与 new_crc32 不符 */
+    FOTA_DELTA_E_VECTOR       = -20,  /* 向量表不合法（见下） */
+} fota_delta_err_t;
+
+/* ---- 后端（唯一的 I/O 边界）--------------------------------------------- */
+/*
+ * 地址一律是**绝对 Flash 地址**（如 0x08040000），与 HAL 的 API 一致。
+ * 核心层自己把"槽内偏移"换算成绝对地址，后端不需要知道有 src/dst 两个槽 ——
+ * 少一个隐含状态，就少一类"读错了槽"的缺陷。
+ */
+
+typedef struct {
+    /* 顺序读补丁字节。返回**实际读到的字节数**；0 表示流已结束。
+     * 语义与 HPatchLite 的 `hpi_TInputStream_read` 一致（EOF 不等于错误）。 */
+    uint32_t (*patch_read)(void *ctx, uint8_t *dst, uint32_t len);
+
+    /* 擦除覆盖 [addr, addr+len) 的所有 Flash 页。 */
+    int (*erase)(void *ctx, uint32_t addr, uint32_t len);
+
+    /* 把 `src` 处的 `len` 字节编程到 `addr`。前置条件：`addr` 8 字节对齐、
+     * `len` 为 8 的整数倍、目标区域已擦除（STM32G0 为双字编程）。 */
+    int (*program)(void *ctx, uint32_t addr, const uint8_t *src, uint32_t len);
+
+    /* 从 Flash 读回（VERIFY / 向量表检查用）。 */
+    void (*read)(void *ctx, uint32_t addr, uint8_t *dst, uint32_t len);
+
+    /* 喂狗。按页调用 —— 擦一页 + 写一页在 5 s IWDG 下必须留出余量。 */
+    void (*watchdog)(void *ctx);
+
+    /* 可选的进度回调（每页一次），供 CLI/遥测显示。 */
+    void (*progress)(void *ctx, uint32_t done, uint32_t total);
+
+    void *ctx;                        /* 后端私有状态 */
+} fota_delta_backend_t;
+
+/* ---- 解析后的信封 --------------------------------------------------------- */
+typedef struct {
+    uint16_t flags;
+    uint32_t old_size;
+    uint32_t old_crc32;
+    uint32_t new_size;
+    uint32_t new_crc32;
+    uint32_t patch_size;
+    uint32_t fw_version;
+    uint16_t auth_len;
+} fota_delta_env_t;
+
+/* ---- API ----------------------------------------------------------------- */
+
+/**
+ * 解析并**完整校验**信封。本函数不得产生任何 Flash 写。
+ *
+ * @param patch_read 顺序读回调；只需能从头顺序读
+ * @param ctx        回调上下文
+ * @param out        解析结果
+ * @return FOTA_DELTA_OK 或负的错误码
+ *
+ * 校验项（规划 §12 的 L4）：长度下限、魔法、format_ver、flags 未知位、
+ * 头 CRC16、auth_len、new_size 是否放得下目标槽。
+ * `old_*` 的实况校验放在 fota_delta_apply() 里 —— 那需要读活动槽。
+ */
+int fota_delta_parse_env(uint32_t (*patch_read)(void *, uint8_t *, uint32_t),
+                         void *ctx, fota_delta_env_t *out);
+
+/**
+ * 应用补丁：读活动槽 → 写目标槽 → 回填镜像头 → 复算 CRC 复核。
+ *
+ * 调用前提：补丁流已定位到**信封之后**（lite 流起点）。
+ * 也就是说 `patch_read` 的第一次读取应当返回 lite 流的第一个字节。
+ *
+ * @param env     fota_delta_parse_env() 的结果
+ * @param io      后端
+ * @param src_slot 活动槽基址（补丁的 old 侧来源）
+ * @param dst_slot 目标槽基址
+ * @param dst_size 目标槽容量（字节）
+ * @param out_err  失败时的错误码（可为 NULL）
+ * @return FOTA_DELTA_OK 或负的错误码
+ *
+ * ⚠️ 掉电语义（规划 §7.1）：目标槽先全擦再写。中途掉电只会得到一个不完整的
+ * 目标槽，**活动槽不会被触碰**；而目标槽的镜像头 magic 尚未写入（它属于
+ * FLUSH 阶段），所以引导器不会把它当成有效镜像 —— 这正是"幂等重放"的前提。
+ *
+ * ⚠️ 执行器安全（规划 §11.3）：本函数会长时间占用 CPU 并擦写 Flash。
+ * 调用方**必须**先把执行器（PWM / 继电器 / 电磁阀）置为安全态，
+ * 否则"升级期间执行器带电"是安全事故，不只是功能缺陷。
+ */
+int fota_delta_apply(const fota_delta_env_t *env,
+                     const fota_delta_backend_t *io,
+                     uint32_t src_slot, uint32_t dst_slot, uint32_t dst_size,
+                     int *out_err);
+
+/**
+ * 检查一段槽内数据是不是一个"可以被 boot_jump_to_app() 跳进去"的镜像。
+ *
+ * 为什么单独需要它：`boot_crc_verify()` 的覆盖区从 `magic`(0xC8) 起，
+ * **不含开头 192 B 的向量表**；而 `boot_jump_to_app()` 恰恰只依赖那一段
+ * （`slot+0` 取初始 SP、`slot+4` 取 Reset_Handler）。二者之间的缺口意味着
+ * "CRC 通过"并不等于"跳得进去"。
+ *
+ * 检查内容：
+ *   1. 镜像头 magic 正确；
+ *   2. 初始 SP 落在 RAM 范围内；
+ *   3. Reset_Handler 落在**本槽**范围内 —— 而不是仅仅"落在 Flash 里"：
+ *      后者对两个槽同时成立，于是向量表指向另一个槽的代码也会被放行；
+ *   4. 其余非零向量同样落在本槽内。
+ *
+ * @param io        后端（只用 read）
+ * @param slot_base 槽基址
+ * @param slot_size 槽容量
+ * @return FOTA_DELTA_OK 或 FOTA_DELTA_E_VECTOR
+ */
+int fota_delta_check_vectors(const fota_delta_backend_t *io,
+                             uint32_t slot_base, uint32_t slot_size);
+
+/**
+ * 对目标槽做一次完整复核：读回代码区、按覆盖区算 CRC32、与期望值比对。
+ *
+ * 这是**唯一**能拦住"解码器返回成功但内容已错"的手段 —— 实测确认
+ * HPatchLite 的结束校验（`_cache_success_finish()` = 输入缓存非空）
+ * 发现不了中段损坏，见规划 §17.2 与 generator/tests/test_delta_tool.py。
+ *
+ * @param expected_crc 信封里的 new_crc32
+ * @return FOTA_DELTA_OK 或 FOTA_DELTA_E_CRC
+ */
+int fota_delta_verify(const fota_delta_backend_t *io,
+                      uint32_t dst_slot, uint32_t code_size,
+                      uint32_t expected_crc);
+
+/** 软件 CRC32（CRC-32/ISO-HDLC，等价 zlib.crc32）。可在任意分片上累积。 */
+uint32_t fota_delta_crc32_update(uint32_t crc, const uint8_t *data, uint32_t len);
+
+#endif /* __DRV_FOTA_DELTA_H */

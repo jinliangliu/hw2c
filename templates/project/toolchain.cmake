@@ -25,9 +25,31 @@ set(CMAKE_C_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb -std=c99 -fdata-sections -ff
 set(CMAKE_ASM_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb")
 
 # Global linker flags
+#
 # -u _printf_float / -u _scanf_float: newlib-nano omits float support in
 # printf/scanf by default.  Without them "%.1f" prints nothing useful and
 # sscanf("%f") fails on target, while host tests (glibc) pass regardless.
 # Costs roughly 6-10 KB of flash; drop them only if the firmware is known
 # to use integer formatting exclusively.
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb -specs=nano.specs -specs=nosys.specs -Wl,--gc-sections -u _printf_float -u _scanf_float -Wl,-Map=${CMAKE_PROJECT_NAME}.map")
+#
+# ⚠️ 这两个 `-u` 是**可选**的，不能无条件塞进链接命令行 —— 引导器（8 KB 预算）
+#    一行浮点格式化都不做，但只要继承了它们，链接器就必须去解析
+#    `_printf_float`/`_scanf_float`，从而把 newlib 的 printf/scanf 机器连同
+#    _write_r/_sbrk 一整套 I/O 链路拉进来，**直接撑爆 8 KB**
+#    （实测溢出 23 KB）。而且报错是链接期的
+#    "section `.text' will not fit in region `FLASH'"，完全指不到真实原因。
+#
+#    所以做成开关：应用侧默认 ON，引导器子工程显式置 OFF。
+if(NOT DEFINED HW2C_FLOAT_PRINTF)
+    set(HW2C_FLOAT_PRINTF ON CACHE BOOL
+        "Link newlib float printf/scanf support (-u _printf_float / _scanf_float)")
+endif()
+
+if(HW2C_FLOAT_PRINTF)
+    set(HW2C_FLOAT_PRINTF_LINK_FLAGS "-u _printf_float -u _scanf_float")
+else()
+    set(HW2C_FLOAT_PRINTF_LINK_FLAGS "")
+    message(STATUS "hw2c: float printf/scanf support DISABLED (HW2C_FLOAT_PRINTF=OFF)")
+endif()
+
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-mcpu=cortex-m0plus -mthumb -specs=nano.specs -specs=nosys.specs -Wl,--gc-sections ${HW2C_FLOAT_PRINTF_LINK_FLAGS} -Wl,-Map=${CMAKE_PROJECT_NAME}.map")

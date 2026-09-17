@@ -122,14 +122,14 @@ UART_HandleTypeDef huart_{{ p.name }};
 
 /* ------- Task handles ------- */
 {% for task in app_tasks %}
-{% if not (has_fota and task.name == 'fota_task') %}
+{% if not (has_fota_receive and task.name == 'fota_task') %}
 TaskHandle_t {{ task.name }}_handle = NULL;
 {% endif %}
 {% endfor %}
 
 /* ------- Task prototypes ------- */
 {% for task in app_tasks %}
-{% if not (has_fota and task.name == 'fota_task') %}
+{% if not (has_fota_receive and task.name == 'fota_task') %}
 void {{ task.name }}(void *pvParameters);
 {% endif %}
 {% endfor %}
@@ -138,7 +138,7 @@ void {{ task.name }}(void *pvParameters);
 void cli_task(void *arg);
 {% endif %}
 
-{% if has_fota %}
+{% if has_fota_receive %}
 void fota_task(void *arg);
 {% endif %}
 
@@ -348,12 +348,11 @@ int main(void)
     log_flush();  /* Ensure banner is fully transmitted before proceeding */
     /* hw2c boot banner: ASCII logo (raw, no timestamp) + project info */
     log_raw(
-        "H   H  W   W  2222  CCCC\r\n"
-        "H   H  W   W     2  C\r\n"
-        "HHHHH  W W W   22   C\r\n"
-        "H   H  WW WW  2     C\r\n"
-        "H   H  W   W  2222  CCCC\r\n"
-        "====================================================\r\n"
+            "\t    _/    _/  _/          _/    _/_/      _/_/_/\n"  
+            "\t   _/    _/  _/          _/  _/    _/  _/\n"          
+            "\t  _/_/_/_/  _/    _/    _/      _/    _/\n"           
+            "\t _/    _/    _/  _/  _/      _/      _/\n"            
+            "\t_/    _/      _/  _/      _/_/_/_/    _/_/_/\r\n"
     );
     log_info("{{ project_name }} v1.0 — Hardware2Code | {{ mcu.part }} @ {{ (mcu.clock_freq_hz / 1000000) | int }} MHz");
 
@@ -479,7 +478,7 @@ int main(void)
     log_info("RTC_Init() OK");
 {% endif %}
 
-{% if has_fota %}
+{% if has_fota_receive %}
     /* Initialize FOTA subsystem (protocol state machine + bspatch engine) */
     fota_init();
 {% if has_log %}
@@ -623,7 +622,7 @@ int main(void)
 
     /* Create application tasks (user-defined) */
 {% for task in app_tasks %}
-{% if not (has_fota and task.name == 'fota_task') %}
+{% if not (has_fota_receive and task.name == 'fota_task') %}
     create_task_checked( {{ task.name }}, "{{ task.name }}", {{ task.stack_size | default(128) }}, NULL, {{ task.priority }}, &{{ task.name }}_handle );
 {% endif %}
 {% endfor %}
@@ -635,7 +634,7 @@ int main(void)
     /* Create the central event manager task (highest priority) */
     create_task_checked(EventMgr_Task, "event_mgr", 512, NULL, configMAX_PRIORITIES - 1, NULL);
 
-{% if has_fota %}
+{% if has_fota_receive %}
     create_task_checked(fota_task, "fota", 512, NULL, 1, NULL);
 {% endif %}
 
@@ -657,7 +656,7 @@ int main(void)
 
 /* ------- Task implementations ------- */
 {% for task in app_tasks %}
-{% if not (has_fota and task.name == 'fota_task') %}
+{% if not (has_fota_receive and task.name == 'fota_task') %}
 void {{ task.name }}(void *pvParameters)
 {
     {% if task.name == 'mpu6050_alert_task' %}
@@ -715,7 +714,7 @@ void component_step_task(void *arg)
 }
 {% endif %}
 
-{% if has_fota and not test_mode %}
+{% if has_fota_receive and not test_mode %}
 /*
  * FOTA task: polls the protocol state machine.
  * When a FOTA START command is received via UART interrupt,

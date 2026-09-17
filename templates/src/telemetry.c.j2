@@ -100,7 +100,7 @@ static const struct {
     uint16_t    stack_words;
 } g_task_stack_table[] = {
 {% for task in app_tasks %}
-{% if not (has_fota and task.name == 'fota_task') %}
+{% if not (has_fota_receive and task.name == 'fota_task') %}
     { "{{ task.name }}", {{ task.stack_size | default(128) }} },
 {% endif %}
 {% endfor %}
@@ -108,7 +108,7 @@ static const struct {
     { "cli", {{ cli_stack_size | default(512) }} },
 {% endif %}
     { "event_mgr", 512 },
-{% if has_fota %}
+{% if has_fota_receive %}
     { "fota", 512 },
 {% endif %}
 {% if has_components %}
