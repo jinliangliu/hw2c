@@ -2,58 +2,428 @@
 #include "mock_hal.h"
 #include <string.h>
 
-{# SPI Flash driver file is named after the peripheral instance (e.g. drv_flash.c) #}
+{#
+    test_spi_flash.c.j2 - SPI NOR 驱动的设备侧单测
+
+    这个文件以前只有 4 个用例，全部是**恒真**的：
+      · init 返回 0 —— 而当时 init 只是把句柄存下来就返回成功
+      · get_id 返回 0 —— 从不检查读回来的是不是真的 ID
+      · 两个 NULL 参数检查
+    真正危险的行为（跨页写、擦除对齐、WIP 等待、越界）一条都没测，而
+    mock 又把首字节当寄存器下标 —— 于是"写进去读回来"这类断言即使写了
+    也恒真。这是 A9 那一族缺陷（mock 让测试失效）。
+
+    现在 mock 换成真 NOR 语义（见 mock_hal.h 的 SPI NOR mock 段落），
+    这里补齐**能真正失败**的断言。每个用例只改一处、只断言一件事，
+    失败信息里写清"什么样的实现会让它红"。
+#}
+
 {% set spi_flash = peripherals | selectattr('is_spi_flash') | first %}
+{% set cs_pin_val = spi_flash.get('extra', {}).get('chip_select_pin', spi_flash.get('cs_pin', '')) %}
 #include "../src/drivers/drv_{{ spi_flash.name }}.c"
 
 static SPI_HandleTypeDef hspi_inst;
 
+/* 测试里当作"某个已擦除区域"用的地址：远离 0 与器件尾部，避免和
+ * 页/扇区边界的巧合互相掩盖。 */
+#define T_ADDR          0x00012300UL
+#define T_SECTOR        0x00012000UL
+#define T_CHUNK_PAIR    (SPI_FLASH_CHUNK_SIZE * 2U)
+
 void setUp(void)
 {
-    /* dummy SPI instance for tests */
+    mock_nor_reset();
+    mock_nor_set_geometry(SPI_FLASH_PAGE_SIZE, SPI_FLASH_SECTOR_SIZE,
+                          SPI_FLASH_TOTAL_SIZE);
+    mock_tick_reset();
+{% if cs_pin_val %}
+    /* 片选是普通 GPIO，mock 只能从 HAL_GPIO_WritePin 观察；把它绑上，
+     * 否则 NOR 模型无法界定事务边界（第二个事务的首字节会被当成地址）。
+     * 正常路径上这由 spi_flash_init() 自己完成，这里提前绑是为了让
+     * "init 之前就发命令"的用例也能成立。 */
+    mock_nor_bind_cs(GPIO_PIN_{{ cs_pin_val | pin_number }});
+{% endif %}
 }
 
-void tearDown(void)
+void tearDown(void) {}
+
+/* 让器件回报与驱动头文件一致的型号，然后初始化。
+ * ID 取自驱动自己的宏 —— 模型改了这里自动跟着改，不会各说各话。 */
+static int init_with_matching_device(void)
 {
+    uint8_t id[3];
+    id[0] = (uint8_t)SPI_FLASH_JEDEC_ID_0;
+    id[1] = (uint8_t)SPI_FLASH_JEDEC_ID_1;
+    id[2] = (uint8_t)SPI_FLASH_JEDEC_ID_2;
+    mock_nor_set_jedec_id(id);
+    return spi_flash_init(&hspi_inst);
 }
 
-void test_spi_flash_init_returns_ok(void)
+/* ---- 契约自洽：驱动与 mock 对同一件器件的理解必须一致 ---- */
+
+void test_mock_poll_interval_matches_the_driver(void)
 {
-    int ret = spi_flash_init(&hspi_inst);
-    TEST_ASSERT_EQUAL_INT(0, ret);
+    /* 驱动按 1 ms 轮询，mock 也按同样的步长推进时基。两者不一致时
+     * "轮询 WIP"的时序断言就失去意义（超时会在错误的时刻触发）。 */
+    TEST_ASSERT_EQUAL_UINT32(SPI_FLASH_POLL_INTERVAL_MS, MOCK_NOR_POLL_INTERVAL_MS);
 }
 
-void test_spi_flash_init_null_handle(void)
+void test_flash_fits_in_the_mock_array(void)
 {
-    int ret = spi_flash_init(NULL);
-    TEST_ASSERT_EQUAL_INT(-1, ret);
+    TEST_ASSERT_TRUE(SPI_FLASH_TOTAL_SIZE <= MOCK_NOR_MAX_SIZE);
 }
 
-void test_spi_flash_get_id(void)
+void test_geometry_is_self_consistent(void)
 {
-    uint8_t id[3] = {0};
-
-    /* Init first */
-    spi_flash_init(&hspi_inst);
-
-    /* get_id should return 0 when init was successful */
-    int ret = spi_flash_get_id(id);
-    TEST_ASSERT_EQUAL_INT(0, ret);
+    /* 页必须整除扇区、扇区必须整除容量 —— 驱动的跨页切分与越界判据
+     * 都建立在这三条之上。模型层面的同类校验在生成期（device_models.py），
+     * 这里是"生成出来的宏确实带着这些关系"的最后一道。 */
+    TEST_ASSERT_EQUAL_UINT32(0, SPI_FLASH_SECTOR_SIZE % SPI_FLASH_PAGE_SIZE);
+    TEST_ASSERT_EQUAL_UINT32(0, SPI_FLASH_TOTAL_SIZE % SPI_FLASH_SECTOR_SIZE);
+    TEST_ASSERT_TRUE(SPI_FLASH_BLOCK_SIZE_64K > SPI_FLASH_SECTOR_SIZE);
 }
 
-void test_spi_flash_get_id_null_buffer(void)
+void test_status_bit_masks_match_the_mock(void)
 {
-    spi_flash_init(&hspi_inst);
-    int ret = spi_flash_get_id(NULL);
-    TEST_ASSERT_EQUAL_INT(-1, ret);
+    TEST_ASSERT_EQUAL_UINT8(MOCK_NOR_SR_WIP, SPI_FLASH_SR_WIP);
+    TEST_ASSERT_EQUAL_UINT8(MOCK_NOR_SR_WEL, SPI_FLASH_SR_WEL);
+}
+
+/* ---- 初始化与型号核对 ---- */
+
+void test_init_accepts_a_matching_device(void)
+{
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    TEST_ASSERT_EQUAL_INT(1, spi_flash_is_ready());
+}
+
+void test_init_rejects_a_mismatched_device(void)
+{
+    /* 器件不是模型声明的型号。旧实现无论如何都返回成功，于是驱动会对着
+     * 错误的几何按错误的粒度擦写 —— 静默丢数据。现在必须拒绝。 */
+    uint8_t wrong[3] = {0xEFU, 0x40U, 0x15U};   /* 容量字节差一位 */
+    mock_nor_set_jedec_id(wrong);
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_ID, spi_flash_init(&hspi_inst));
+    TEST_ASSERT_EQUAL_INT(0, spi_flash_is_ready());
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_ID, spi_flash_last_error());
+}
+
+void test_operations_are_refused_after_a_failed_init(void)
+{
+    uint8_t buf[4];
+    uint8_t wrong[3] = {0x00U, 0x00U, 0x00U};
+
+    mock_nor_set_jedec_id(wrong);
+    (void)spi_flash_init(&hspi_inst);
+
+    /* 关键：失败之后不能"看起来还能用"。若这里返回 OK，上层会以为外部
+     * NVM 可用，读到的是垃圾，而后按垃圾长度去解析。 */
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_NO_INIT,
+                          spi_flash_read(T_ADDR, buf, sizeof(buf)));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_NO_INIT,
+                          spi_flash_erase_sector(T_SECTOR));
+}
+
+void test_init_null_handle(void)
+{
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_ARG, spi_flash_init(NULL));
+}
+
+/* ---- 读 ---- */
+
+void test_read_returns_the_actual_device_content(void)
+{
+    uint8_t got[8];
+    uint8_t i;
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    for (i = 0U; i < 8U; i++) {
+        mock_nor_poke(T_ADDR + i, (uint8_t)(0xA0U + i));
+    }
+    memset(got, 0, sizeof(got));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, spi_flash_read(T_ADDR, got, 8U));
+    for (i = 0U; i < 8U; i++) {
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)(0xA0U + i), got[i]);
+    }
+}
+
+void test_long_read_is_chunked_without_corruption(void)
+{
+    /* 超过 SPI_FLASH_CHUNK_SIZE 的读必须被切成多次事务，且拼起来是对的。
+     * 旧实现把 len 直接塞进 HAL 的 uint16_t 形参 —— 这里顺带钉住
+     * "分块"这件事真的发生了（拼接错了会在中途对不上）。 */
+    static uint8_t got[T_CHUNK_PAIR];
+    uint32_t i;
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    for (i = 0U; i < T_CHUNK_PAIR; i++) {
+        mock_nor_poke(T_ADDR + i, (uint8_t)(i & 0xFFU));
+    }
+    memset(got, 0, sizeof(got));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK,
+                          spi_flash_read(T_ADDR, got, T_CHUNK_PAIR));
+    for (i = 0U; i < T_CHUNK_PAIR; i++) {
+        TEST_ASSERT_EQUAL_UINT8((uint8_t)(i & 0xFFU), got[i]);
+    }
+}
+
+/* ---- 写：页边界是重点 ---- */
+
+void test_write_within_one_page_round_trips(void)
+{
+    uint8_t data[16];
+    uint8_t got[16];
+    uint32_t i;
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    for (i = 0U; i < 16U; i++) {
+        data[i] = (uint8_t)(0x11U * (i + 1U));
+    }
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, spi_flash_write(T_ADDR, data, 16U));
+    TEST_ASSERT_EQUAL_UINT32(1U, mock_nor_program_count());
+
+    memset(got, 0, sizeof(got));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, spi_flash_read(T_ADDR, got, 16U));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(data, got, 16U);
+}
+
+void test_write_across_a_page_boundary_is_split(void)
+{
+    /* 这是本次改造最要紧的一条。
+     * 真器件在 PAGE_PROGRAM 越过页尾时回到**页首**（不是写到下一页、
+     * 也不报错），所以一次跨页写会静默覆盖页首的旧数据 —— 典型的
+     * "偶发丢数据"。旧驱动的 spi_flash_write() 正是这么写的。
+     * 现在必须在页边界切开：本用例的 32 B 从页内偏移 240 开始，正好
+     * 跨页，所以必须发出**两次** program，且两侧内容都对。 */
+    uint8_t data[32];
+    uint8_t got[32];
+    uint32_t page_base = T_ADDR - (T_ADDR % SPI_FLASH_PAGE_SIZE);
+    uint32_t start = page_base + SPI_FLASH_PAGE_SIZE - 16U;  /* 页内偏移 240 */
+    uint32_t i;
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    for (i = 0U; i < 32U; i++) {
+        data[i] = (uint8_t)(0x5AU ^ (uint8_t)i);
+    }
+
+    /* 先给"会被回绕覆盖"的位置放一个显眼的值：如果驱动没有按页切分，
+     * 器件会把第 17..32 字节写到页首，把它冲掉。 */
+    mock_nor_poke(page_base, 0xC3U);
+    mock_nor_poke(page_base + 1U, 0xC3U);
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, spi_flash_write(start, data, 32U));
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(2U, mock_nor_program_count(),
+        "跨页写没有被切成两次页编程 —— 器件会在页内回绕，静默覆盖页首数据");
+
+    memset(got, 0, sizeof(got));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, spi_flash_read(start, got, 32U));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(data, got, 32U);
+
+    /* 页首那两个字节必须原样未动 */
+    TEST_ASSERT_EQUAL_UINT8(0xC3U, mock_nor_peek(page_base));
+    TEST_ASSERT_EQUAL_UINT8(0xC3U, mock_nor_peek(page_base + 1U));
+}
+
+void test_write_does_not_go_out_of_range_internally(void)
+{
+    /* 驱动的分块 / 跨页推进都不该把地址推出容量外。真器件会静默回绕，
+     * 所以只有 mock 的越界计数能看出来。 */
+    uint8_t data[64];
+    uint32_t last_sector = SPI_FLASH_TOTAL_SIZE - SPI_FLASH_SECTOR_SIZE;
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    memset(data, 0x3CU, sizeof(data));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK,
+                          spi_flash_write(last_sector, data, sizeof(data)));
+    TEST_ASSERT_EQUAL_UINT32(0U, mock_nor_out_of_range_count());
+}
+
+void test_program_on_top_of_old_data_is_detected_not_ignored(void)
+{
+    /* NOR 的 program 只能把 1 写成 0 —— 目标区没擦过就直接写，结果必然
+     * 与期望不符。这类"写进去了但值不对"是裸 NOR 最经典的误用，驱动
+     * 必须在写后读回时发现它，而不是报成功。 */
+    uint8_t data[8];
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    memset(data, 0xFFU, sizeof(data));
+    mock_nor_fill(T_ADDR, sizeof(data), 0x00U);   /* 未擦除：全是 0 */
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_VERIFY,
+                          spi_flash_write(T_ADDR, data, sizeof(data)));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_VERIFY, spi_flash_last_error());
+}
+
+/* ---- 擦除 ---- */
+
+void test_erase_sector_clears_exactly_one_sector(void)
+{
+    uint8_t got[4];
+    uint32_t i;
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    mock_nor_fill(T_SECTOR, SPI_FLASH_SECTOR_SIZE * 2U, 0x00U);
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, spi_flash_erase_sector(T_SECTOR));
+
+    for (i = 0U; i < SPI_FLASH_SECTOR_SIZE; i += 997U) {
+        TEST_ASSERT_EQUAL_UINT8(0xFFU, mock_nor_peek(T_SECTOR + i));
+    }
+    /* 紧邻的下一个扇区必须没被动过 —— 擦多了就是把别的数据抹了 */
+    for (i = 0U; i < 4U; i++) {
+        TEST_ASSERT_EQUAL_UINT8(0x00U,
+            mock_nor_peek(T_SECTOR + SPI_FLASH_SECTOR_SIZE + i));
+    }
+    memset(got, 0, sizeof(got));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, spi_flash_read(T_SECTOR, got, 4U));
+    TEST_ASSERT_EQUAL_UINT8(0xFFU, got[0]);
+}
+
+void test_erase_rejects_a_misaligned_address(void)
+{
+    /* 真器件对未对齐的擦除地址是**未定义**的（多数会忽略低地址位），
+     * 所以驱动必须自己拒绝，而不是把它交给器件"看着办"。 */
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_ALIGN,
+                          spi_flash_erase_sector(T_SECTOR + 1U));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_ALIGN, spi_flash_last_error());
+    TEST_ASSERT_EQUAL_UINT32(0U, mock_nor_erase_count());
+}
+
+void test_erase_range_covers_both_ends(void)
+{
+    /* 区间两端都要向外扩到扇区边界：只擦"完全包含在内的扇区"会留下
+     * 半擦的扇区，而半擦的扇区在 NOR 上既不是旧数据也不是空 ——
+     * 对日志式存储是致命的。
+     *
+     * 用例刻意让请求区间**横跨**扇区边界（从第 1 个扇区的最后 8 字节
+     * 起，跨 16 字节）：这样两端各有一部分落在两个扇区里，两个都必须
+     * 被擦到；而第三个扇区必须原样不动。 */
+    uint32_t first  = T_SECTOR;
+    uint32_t second = T_SECTOR + SPI_FLASH_SECTOR_SIZE;
+    uint32_t third  = T_SECTOR + (SPI_FLASH_SECTOR_SIZE * 2U);
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    mock_nor_fill(first, SPI_FLASH_SECTOR_SIZE * 4U, 0x00U);
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK,
+                          spi_flash_erase_range(second - 8U, 16U));
+
+    TEST_ASSERT_EQUAL_UINT8(0xFFU, mock_nor_peek(first));
+    TEST_ASSERT_EQUAL_UINT8(0xFFU, mock_nor_peek(second));
+    /* 第三个扇区不在请求区间覆盖范围内，不能被擦 */
+    TEST_ASSERT_EQUAL_UINT8(0x00U, mock_nor_peek(third));
+    TEST_ASSERT_EQUAL_UINT32(2U, mock_nor_erase_count());
+}
+
+void test_erase_range_inside_one_sector_erases_only_that_sector(void)
+{
+    /* 反面对照：区间完全落在单个扇区内时**只能**擦那一个。
+     * 没有这条，"把所有扇区都擦掉"的实现也能让上一条通过。 */
+    uint32_t first  = T_SECTOR;
+    uint32_t second = T_SECTOR + SPI_FLASH_SECTOR_SIZE;
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    mock_nor_fill(first, SPI_FLASH_SECTOR_SIZE * 2U, 0x00U);
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK,
+                          spi_flash_erase_range(first + 16U, 16U));
+
+    TEST_ASSERT_EQUAL_UINT8(0xFFU, mock_nor_peek(first));
+    TEST_ASSERT_EQUAL_UINT8(0x00U, mock_nor_peek(second));
+    TEST_ASSERT_EQUAL_UINT32(1U, mock_nor_erase_count());
+}
+
+/* ---- 越界与超时：必须失败，且必须退出 ---- */
+
+void test_out_of_range_access_is_refused(void)
+{
+    uint8_t buf[4];
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_RANGE,
+                          spi_flash_read(SPI_FLASH_TOTAL_SIZE, buf, 4U));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_RANGE,
+                          spi_flash_read(SPI_FLASH_TOTAL_SIZE - 2U, buf, 4U));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_RANGE,
+                          spi_flash_write(SPI_FLASH_TOTAL_SIZE - 2U, buf, 4U));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_RANGE,
+                          spi_flash_erase_sector(SPI_FLASH_TOTAL_SIZE));
+}
+
+void test_zero_length_is_refused(void)
+{
+    uint8_t buf[4];
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_ARG, spi_flash_read(T_ADDR, buf, 0U));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_ARG, spi_flash_write(T_ADDR, buf, 0U));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_ARG, spi_flash_read(T_ADDR, NULL, 4U));
+}
+
+void test_a_permanently_busy_device_times_out_instead_of_hanging(void)
+{
+    /* 注入"WIP 永远不落"的器件。驱动必须报超时并返回 —— 而不是死循环。
+     * 这条同时钉住了超时的**两道**上界：毫秒判据和轮询次数。 */
+    uint8_t data[4] = {1U, 2U, 3U, 4U};
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    mock_nor_set_busy_polls(MOCK_NOR_STUCK_BUSY);
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_TIMEOUT,
+                          spi_flash_write(T_ADDR, data, sizeof(data)));
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_E_TIMEOUT, spi_flash_last_error());
+}
+
+void test_wait_ready_returns_immediately_on_an_idle_device(void)
+{
+    uint32_t before;
+
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK, init_with_matching_device());
+    before = HAL_GetTick();
+    TEST_ASSERT_EQUAL_INT(SPI_FLASH_OK,
+                          spi_flash_wait_ready(SPI_FLASH_SECTOR_TIMEOUT_MS));
+    /* 空闲器件不该让时基前进几十毫秒 —— 那说明在"等一个不会来的忙" */
+    TEST_ASSERT_TRUE((HAL_GetTick() - before) <= 2U);
 }
 
 int main(void)
 {
     UNITY_BEGIN();
-    RUN_TEST(test_spi_flash_init_returns_ok);
-    RUN_TEST(test_spi_flash_init_null_handle);
-    RUN_TEST(test_spi_flash_get_id);
-    RUN_TEST(test_spi_flash_get_id_null_buffer);
+
+    /* 契约自洽 */
+    RUN_TEST(test_mock_poll_interval_matches_the_driver);
+    RUN_TEST(test_flash_fits_in_the_mock_array);
+    RUN_TEST(test_geometry_is_self_consistent);
+    RUN_TEST(test_status_bit_masks_match_the_mock);
+
+    /* 初始化与型号核对 */
+    RUN_TEST(test_init_accepts_a_matching_device);
+    RUN_TEST(test_init_rejects_a_mismatched_device);
+    RUN_TEST(test_operations_are_refused_after_a_failed_init);
+    RUN_TEST(test_init_null_handle);
+
+    /* 读 */
+    RUN_TEST(test_read_returns_the_actual_device_content);
+    RUN_TEST(test_long_read_is_chunked_without_corruption);
+
+    /* 写 */
+    RUN_TEST(test_write_within_one_page_round_trips);
+    RUN_TEST(test_write_across_a_page_boundary_is_split);
+    RUN_TEST(test_write_does_not_go_out_of_range_internally);
+    RUN_TEST(test_program_on_top_of_old_data_is_detected_not_ignored);
+
+    /* 擦除 */
+    RUN_TEST(test_erase_sector_clears_exactly_one_sector);
+    RUN_TEST(test_erase_rejects_a_misaligned_address);
+    RUN_TEST(test_erase_range_covers_both_ends);
+    RUN_TEST(test_erase_range_inside_one_sector_erases_only_that_sector);
+
+    /* 越界与超时 */
+    RUN_TEST(test_out_of_range_access_is_refused);
+    RUN_TEST(test_zero_length_is_refused);
+    RUN_TEST(test_a_permanently_busy_device_times_out_instead_of_hanging);
+    RUN_TEST(test_wait_ready_returns_immediately_on_an_idle_device);
+
     return UNITY_END();
 }

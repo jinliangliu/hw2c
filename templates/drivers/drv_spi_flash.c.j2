@@ -1,170 +1,662 @@
 {#
-    drv_spi_flash.c.j2 - Generic SPI Flash driver
-    Supports SPI_Flash_W25Q32 and SPI_Flash_Generic model types.
-    Uses HAL_SPI_* APIs with mock-compatible #ifdef TEST guard.
+    drv_spi_flash.c.j2 - SPI NOR Flash 驱动（可作 NVM KV 后端）
+
+    设计要点
+    --------
+    1. **几何 / 命令码 / 超时全部来自 models/<type>.yaml**。上一版把
+       PAGE_PROGRAM 写死 0x02、用 HAL_Delay(10)/(100) 顶替器件就绪，
+       换型号只能改模板，而改模板不会被任何测试拦住。
+
+    2. **按页切分写入**。真器件在 PAGE_PROGRAM 越过页尾时回到页首
+       （不是报错、也不是写到下一页），所以一次跨页写会静默覆盖页首数据。
+       这里在页边界切开，每页各自 WREN + program + 轮询 + 读回校验。
+
+    3. **轮询 WIP，不用固定延时**。HAL_Delay 依赖 SysTick 与中断，
+       在调度器启动前或临界区里会死等 —— 这个坑在 FOTA 里已经踩过
+       （见 main.c 里 0xAAAAAAAA 毒值那段）。超时上界取模型的 timing 段，
+       并且**同时**用"轮询次数"兜底：时基冻结时毫秒判据永远不成立。
+
+    4. **失败要可区分**。返回值区分越界 / 对齐 / 超时 / 型号不符 /
+       读回不一致，上层（NVM KV）据此决定"重试"还是"退回编译期默认值"。
 #}
+
+{% set addr_bytes = model.get('address_bytes', 3) %}
+{% set cs_pin_val = peripheral.get('extra', {}).get('chip_select_pin', peripheral.get('cs_pin', '')) %}
+
 #ifdef TEST
 #include "mock_hal.h"
 #else
 #include "stm32g0xx_hal.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #endif
 
 #include "drv_{{ peripheral.name }}.h"
 
-{% set cs_pin_val = peripheral.get('extra', {}).get('chip_select_pin', peripheral.get('cs_pin', '')) %}
 {% if cs_pin_val %}
-/* CS pin: {{ cs_pin_val }} */
+/* CS 是普通 GPIO，由本驱动手动控制（SPI 外设工作在 NSS_SOFT）。 */
 #define SPI_FLASH_CS_PORT                GPIO{{ cs_pin_val | pin_port }}
 #define SPI_FLASH_CS_PIN                 GPIO_PIN_{{ cs_pin_val | pin_number }}
 {% endif %}
 
-/* Private variables */
-static SPI_HandleTypeDef *flash_spi;
-static uint8_t tx_buf[8];
+/* 命令帧缓冲：1 字节命令 + 地址 */
+#define SPI_FLASH_CMD_BUF_LEN            (1U + SPI_FLASH_ADDR_BYTES)
 
-/* Internal helper: select CS (active low) */
-static void spi_flash_cs_low(void) {
+static SPI_HandleTypeDef *flash_spi = NULL;
+static uint8_t            g_ready    = 0U;   /* 1 = 可用（型号核对通过或无需核对） */
+static int                g_last_err = SPI_FLASH_OK;
+static uint8_t            g_in_use   = 0U;   /* 并发进入检测 */
+static uint8_t            tx_buf[SPI_FLASH_CMD_BUF_LEN];
+
+/* ==========================================================================
+ * 临界区
+ * ==========================================================================
+ * ARMv6-M 没有 LDREX/STREX，也就没有 lock-free 原语（`__atomic_*` 会退化成
+ * 库调用，未链 -latomic 时直接链接失败）。所以共享状态的保护只有
+ * volatile + PRIMASK 临界区这一条路。临界区只覆盖"检查并置位"那一瞬间，
+ * 不覆盖整次 SPI 事务 —— 后者要几十毫秒，屏蔽中断的代价不可接受。
+ */
+static uint32_t flash_irq_save(void)
+{
+#ifdef TEST
+    return 0U;                       /* 主机单测是单线程，且 mock 不提供 PRIMASK */
+#else
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    return primask;
+#endif
+}
+
+static void flash_irq_restore(uint32_t primask)
+{
+#ifdef TEST
+    (void)primask;
+#else
+    __set_PRIMASK(primask);
+#endif
+}
+
+/* 进入/退出"独占使用总线"。同一时刻只允许一个持有者：驱动用的是静态
+ * tx_buf 与单例句柄，两个任务并发调用会互相踩缓冲区 —— 而且症状是
+ * "偶尔写进去一个奇怪的字节"，极难定位。这里把它变成确定的 E_BUSY。 */
+static int flash_enter(void)
+{
+    uint32_t primask = flash_irq_save();
+    int rc = SPI_FLASH_OK;
+
+    if (g_in_use != 0U) {
+        rc = SPI_FLASH_E_BUSY;
+    } else {
+        g_in_use = 1U;
+    }
+    flash_irq_restore(primask);
+
+    if (rc != SPI_FLASH_OK) {
+        g_last_err = rc;
+    }
+    return rc;
+}
+
+static void flash_leave(void)
+{
+    uint32_t primask = flash_irq_save();
+    g_in_use = 0U;
+    flash_irq_restore(primask);
+}
+
+/* ==========================================================================
+ * 片选与底层传输
+ * ========================================================================== */
+
+static void spi_flash_cs_low(void)
+{
 {% if cs_pin_val %}
     HAL_GPIO_WritePin(SPI_FLASH_CS_PORT, SPI_FLASH_CS_PIN, GPIO_PIN_RESET);
 {% else %}
-    /* CS pin not configured */
+    /* 未配置 CS —— 驱动无法界定事务边界，硬件上必须自行处理 */
 {% endif %}
 }
 
-/* Internal helper: deselect CS (active high) */
-static void spi_flash_cs_high(void) {
+static void spi_flash_cs_high(void)
+{
 {% if cs_pin_val %}
     HAL_GPIO_WritePin(SPI_FLASH_CS_PORT, SPI_FLASH_CS_PIN, GPIO_PIN_SET);
-{% else %}
-    /* CS pin not configured */
 {% endif %}
 }
 
-/**
- * @brief   Initialize the SPI Flash driver
- * @param   hspi: pointer to the SPI handle (already configured by HAL)
- * @return  0 on success, -1 on error
- */
+/* HAL_SPI_* 的 Size 是 uint16_t，超过 65535 会被静默截断 —— 所以主动
+ * 按 SPI_FLASH_CHUNK_SIZE 分块，而不是把长度直接塞进去。 */
+static int flash_tx(const uint8_t *buf, uint32_t len)
+{
+    while (len > 0U) {
+        uint16_t n = (len > SPI_FLASH_CHUNK_SIZE)
+                     ? (uint16_t)SPI_FLASH_CHUNK_SIZE : (uint16_t)len;
+        if (HAL_SPI_Transmit(flash_spi, (uint8_t *)(uintptr_t)buf, n,
+                             SPI_FLASH_CMD_TIMEOUT_MS) != HAL_OK) {
+            return SPI_FLASH_E_IO;
+        }
+        buf += n;
+        len -= n;
+    }
+    return SPI_FLASH_OK;
+}
+
+static int flash_rx(uint8_t *buf, uint32_t len)
+{
+    while (len > 0U) {
+        uint16_t n = (len > SPI_FLASH_CHUNK_SIZE)
+                     ? (uint16_t)SPI_FLASH_CHUNK_SIZE : (uint16_t)len;
+        if (HAL_SPI_Receive(flash_spi, buf, n, SPI_FLASH_CMD_TIMEOUT_MS) != HAL_OK) {
+            return SPI_FLASH_E_IO;
+        }
+        buf += n;
+        len -= n;
+    }
+    return SPI_FLASH_OK;
+}
+
+/* 在已选中片选的前提下发命令 + 地址 */
+static int flash_send_cmd_addr(uint8_t cmd, uint32_t addr)
+{
+    tx_buf[0] = cmd;
+{% for i in range(addr_bytes) %}
+    tx_buf[{{ 1 + i }}] = (uint8_t)((addr >> {{ 8 * (addr_bytes - 1 - i) }}) & 0xFFU);
+{% endfor %}
+    return flash_tx(tx_buf, SPI_FLASH_CMD_BUF_LEN);
+}
+
+/* ==========================================================================
+ * 状态与就绪
+ * ========================================================================== */
+
+static int flash_read_status(uint8_t *out)
+{
+    int rc;
+
+    spi_flash_cs_low();
+    tx_buf[0] = SPI_FLASH_CMD_READ_STATUS;
+    rc = flash_tx(tx_buf, 1U);
+    if (rc == SPI_FLASH_OK) {
+        rc = flash_rx(out, 1U);
+    }
+    spi_flash_cs_high();
+    return rc;
+}
+
+/* 轮询间隔之间的让出。调度器在跑时必须让出 —— 一次扇区擦除有几十毫秒，
+ * 忙等会把低优先级任务饿死；调度器未启动时**绝不能**调 vTaskDelay
+ * （会直接进 HardFault），所以要判状态。 */
+static void flash_poll_yield(void)
+{
+#ifndef TEST
+    if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
+        vTaskDelay(pdMS_TO_TICKS(SPI_FLASH_POLL_INTERVAL_MS));
+    }
+#endif
+}
+
+static int flash_wait_ready(uint32_t timeout_ms)
+{
+    uint32_t start;
+    uint32_t polls = 0U;
+    uint8_t  sr = 0U;
+
+    start = HAL_GetTick();
+    for (;;) {
+        if (flash_read_status(&sr) != SPI_FLASH_OK) {
+            return SPI_FLASH_E_IO;
+        }
+        if ((sr & SPI_FLASH_SR_WIP) == 0U) {
+            return SPI_FLASH_OK;
+        }
+        /* 两道上界，缺一不可：
+         *  · 毫秒判据 —— 正常情况下的语义化超时；
+         *  · 轮询次数 —— 时基冻结时（PRIMASK 被卡住，HAL_GetTick 不再前进）
+         *    毫秒判据永远成立，只靠它会死循环。 */
+        if ((uint32_t)(HAL_GetTick() - start) > timeout_ms) {
+            return SPI_FLASH_E_TIMEOUT;
+        }
+        if (++polls > timeout_ms) {
+            return SPI_FLASH_E_TIMEOUT;
+        }
+        flash_poll_yield();
+    }
+}
+
+/* 写使能，并**回读确认 WEL 真的置上了**。
+ * 只发 WREN 不看结果的话，一次没生效的 WREN 会让随后的 program 被器件
+ * 静默忽略 —— 数据没写进去，而驱动这边"成功了"。 */
+static int flash_wren(void)
+{
+    uint8_t sr = 0U;
+    int rc;
+
+    spi_flash_cs_low();
+    tx_buf[0] = SPI_FLASH_CMD_WRITE_ENABLE;
+    rc = flash_tx(tx_buf, 1U);
+    spi_flash_cs_high();
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+{% if 'WEL' in model.status_bits %}
+    rc = flash_read_status(&sr);
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    if ((sr & SPI_FLASH_SR_WEL) == 0U) {
+        return SPI_FLASH_E_IO;
+    }
+{% endif %}
+    return SPI_FLASH_OK;
+}
+
+/* ==========================================================================
+ * 内部实现（不持独占锁、不检查 g_ready —— 供持锁的公开 API 调用）
+ * ========================================================================== */
+
+static int flash_get_id(uint8_t *id)
+{
+    int rc;
+
+    if (id == NULL || flash_spi == NULL) {
+        return SPI_FLASH_E_ARG;
+    }
+    spi_flash_cs_low();
+    tx_buf[0] = SPI_FLASH_CMD_READ_ID;
+    rc = flash_tx(tx_buf, 1U);
+    if (rc == SPI_FLASH_OK) {
+        rc = flash_rx(id, 3U);
+    }
+    spi_flash_cs_high();
+    return rc;
+}
+
+#if SPI_FLASH_VERIFY_WRITES
+/* 写后读回。NOR 的 program 只能把 1 写成 0，一旦器件因为任何原因没接受
+ * 这次写入，**唯一**能发现的途径就是读回来比。 */
+static int flash_verify(uint32_t addr, const uint8_t *expect, uint32_t len)
+{
+    uint8_t buf[SPI_FLASH_CHUNK_SIZE];
+    uint32_t off = 0U;
+
+    while (off < len) {
+        uint32_t n = len - off;
+        uint32_t i;
+        int rc;
+
+        if (n > SPI_FLASH_CHUNK_SIZE) {
+            n = SPI_FLASH_CHUNK_SIZE;
+        }
+        spi_flash_cs_low();
+        rc = flash_send_cmd_addr(SPI_FLASH_CMD_READ_DATA, addr + off);
+        if (rc == SPI_FLASH_OK) {
+            rc = flash_rx(buf, n);
+        }
+        spi_flash_cs_high();
+        if (rc != SPI_FLASH_OK) {
+            return rc;
+        }
+        for (i = 0U; i < n; i++) {
+            if (buf[i] != expect[off + i]) {
+                return SPI_FLASH_E_VERIFY;
+            }
+        }
+        off += n;
+    }
+    return SPI_FLASH_OK;
+}
+#endif
+
+/* 一次页内编程（len 必须 <= 页内剩余空间，调用者保证） */
+static int flash_program_page(uint32_t addr, const uint8_t *buf, uint32_t len)
+{
+    int rc = flash_wren();
+
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    spi_flash_cs_low();
+    rc = flash_send_cmd_addr(SPI_FLASH_CMD_PAGE_PROGRAM, addr);
+    if (rc == SPI_FLASH_OK) {
+        rc = flash_tx(buf, len);
+    }
+    spi_flash_cs_high();
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    return flash_wait_ready(SPI_FLASH_PROGRAM_TIMEOUT_MS);
+}
+
+/* 擦除一个对齐单元。unit 决定命令与超时上限。 */
+static int flash_erase_unit(uint32_t addr, uint32_t unit, uint32_t timeout_ms)
+{
+    uint8_t cmd;
+    int rc;
+
+    if ((addr % unit) != 0U) {
+        return SPI_FLASH_E_ALIGN;
+    }
+    if (addr >= SPI_FLASH_TOTAL_SIZE) {
+        return SPI_FLASH_E_RANGE;
+    }
+    if (unit >= SPI_FLASH_BLOCK_SIZE_64K) {
+        cmd = SPI_FLASH_CMD_BLOCK_ERASE_64K;
+    } else if (unit >= SPI_FLASH_BLOCK_SIZE_32K) {
+        cmd = SPI_FLASH_CMD_BLOCK_ERASE_32K;
+    } else {
+        cmd = SPI_FLASH_CMD_SECTOR_ERASE;
+    }
+
+    rc = flash_wren();
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    spi_flash_cs_low();
+    rc = flash_send_cmd_addr(cmd, addr);
+    spi_flash_cs_high();
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    return flash_wait_ready(timeout_ms);
+}
+
+static uint32_t flash_erase_timeout(uint32_t unit)
+{
+    if (unit >= SPI_FLASH_BLOCK_SIZE_64K) {
+        return SPI_FLASH_BLOCK64_TIMEOUT_MS;
+    }
+    if (unit >= SPI_FLASH_BLOCK_SIZE_32K) {
+        return SPI_FLASH_BLOCK32_TIMEOUT_MS;
+    }
+    return SPI_FLASH_SECTOR_TIMEOUT_MS;
+}
+
+/* ==========================================================================
+ * 公开 API
+ * ========================================================================== */
+
 int spi_flash_init(SPI_HandleTypeDef *hspi)
 {
     if (hspi == NULL) {
-        return -1;
+        g_last_err = SPI_FLASH_E_ARG;
+        return SPI_FLASH_E_ARG;
     }
     flash_spi = hspi;
+    g_ready   = 0U;
     spi_flash_cs_high();
-    return 0;
+
+#ifdef TEST
+{% if cs_pin_val %}
+    /* mock 看不到片选（它只是一次普通 GPIO 写），需要被告知哪根脚是 CS
+     * 才能界定事务边界。真实硬件上片选就是这根线的电平，不需要额外声明。 */
+    mock_nor_bind_cs(SPI_FLASH_CS_PIN);
+{% endif %}
+#endif
+
+{% if model.get('jedec_id') %}
+    {
+        uint8_t id[3];
+        int rc = flash_get_id(id);
+
+        if (rc != SPI_FLASH_OK) {
+            g_last_err = rc;
+            return rc;
+        }
+        if (id[0] != SPI_FLASH_JEDEC_ID_0
+            || id[1] != SPI_FLASH_JEDEC_ID_1
+            || id[2] != SPI_FLASH_JEDEC_ID_2) {
+            /* 型号不符就**拒绝服务**：对着别的型号按错误的粒度擦写，
+             * 结果是静默丢数据，比"起不来"难查得多。 */
+            g_last_err = SPI_FLASH_E_ID;
+            return SPI_FLASH_E_ID;
+        }
+    }
+{% else %}
+    /* 模型未声明 JEDEC ID（Generic）—— 跳过型号核对。代价见头文件。 */
+{% endif %}
+
+    g_ready    = 1U;
+    g_last_err = SPI_FLASH_OK;
+    return SPI_FLASH_OK;
 }
 
-/**
- * @brief   Read the JEDEC manufacturer/device ID (3 bytes)
- * @param   id: output buffer (must be at least 3 bytes)
- * @return  0 on success, -1 on error
- */
+int spi_flash_is_ready(void)      { return (g_ready != 0U) ? 1 : 0; }
+int spi_flash_last_error(void)    { return g_last_err; }
+uint32_t spi_flash_total_size(void) { return SPI_FLASH_TOTAL_SIZE; }
+
 int spi_flash_get_id(uint8_t *id)
 {
-    if (id == NULL || flash_spi == NULL) {
-        return -1;
-    }
-
-    spi_flash_cs_low();
-    tx_buf[0] = SPI_FLASH_CMD_READ_ID;
-    HAL_SPI_Transmit(flash_spi, tx_buf, 1, 100);
-    HAL_SPI_Receive(flash_spi, id, 3, 100);
-    spi_flash_cs_high();
-    return 0;
+    return flash_get_id(id);
 }
 
-/**
- * @brief   Read data from flash memory
- * @param   addr: start address (24-bit)
- * @param   buf: output buffer
- * @param   len: number of bytes to read
- * @return  0 on success, -1 on error
- */
+int spi_flash_wait_ready(uint32_t timeout_ms)
+{
+    int rc;
+
+    if (flash_spi == NULL) {
+        return SPI_FLASH_E_NO_INIT;
+    }
+    rc = flash_enter();
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    rc = flash_wait_ready(timeout_ms);
+    if (rc != SPI_FLASH_OK) {
+        g_last_err = rc;
+    }
+    flash_leave();
+    return rc;
+}
+
 int spi_flash_read(uint32_t addr, uint8_t *buf, uint32_t len)
 {
-    if (buf == NULL || flash_spi == NULL) {
-        return -1;
+    uint32_t off = 0U;
+    int rc;
+
+    if (buf == NULL || len == 0U) {
+        return SPI_FLASH_E_ARG;
+    }
+    /* 越界判据要防溢出：addr + len 可能回绕。 */
+    if (addr >= SPI_FLASH_TOTAL_SIZE || len > (SPI_FLASH_TOTAL_SIZE - addr)) {
+        g_last_err = SPI_FLASH_E_RANGE;
+        return SPI_FLASH_E_RANGE;
+    }
+    rc = flash_enter();
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    if (g_ready == 0U) {
+        g_last_err = SPI_FLASH_E_NO_INIT;
+        flash_leave();
+        return SPI_FLASH_E_NO_INIT;
     }
 
-    spi_flash_cs_low();
-    tx_buf[0] = SPI_FLASH_CMD_READ_DATA;
-    tx_buf[1] = (uint8_t)((addr >> 16) & 0xFF);
-    tx_buf[2] = (uint8_t)((addr >> 8) & 0xFF);
-    tx_buf[3] = (uint8_t)(addr & 0xFF);
-    HAL_SPI_Transmit(flash_spi, tx_buf, 4, 100);
-    HAL_SPI_Receive(flash_spi, buf, (uint16_t)len, 1000);
-    spi_flash_cs_high();
-    return 0;
+    while (off < len) {
+        uint32_t n = len - off;
+
+        if (n > SPI_FLASH_CHUNK_SIZE) {
+            n = SPI_FLASH_CHUNK_SIZE;
+        }
+        spi_flash_cs_low();
+        rc = flash_send_cmd_addr(SPI_FLASH_CMD_READ_DATA, addr + off);
+        if (rc == SPI_FLASH_OK) {
+            rc = flash_rx(&buf[off], n);
+        }
+        spi_flash_cs_high();
+        if (rc != SPI_FLASH_OK) {
+            break;
+        }
+        off += n;
+    }
+
+    if (rc != SPI_FLASH_OK) {
+        g_last_err = rc;
+    }
+    flash_leave();
+    return rc;
 }
 
-/**
- * @brief   Write data to flash memory (page program)
- * @param   addr: start address (24-bit)
- * @param   buf: data buffer
- * @param   len: number of bytes to write (must fit within one page)
- * @return  0 on success, -1 on error
- */
 int spi_flash_write(uint32_t addr, const uint8_t *buf, uint32_t len)
 {
-    if (buf == NULL || flash_spi == NULL) {
-        return -1;
+    int rc;
+
+    if (buf == NULL || len == 0U) {
+        return SPI_FLASH_E_ARG;
+    }
+    if (addr >= SPI_FLASH_TOTAL_SIZE || len > (SPI_FLASH_TOTAL_SIZE - addr)) {
+        g_last_err = SPI_FLASH_E_RANGE;
+        return SPI_FLASH_E_RANGE;
+    }
+    rc = flash_enter();
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    if (g_ready == 0U) {
+        g_last_err = SPI_FLASH_E_NO_INIT;
+        flash_leave();
+        return SPI_FLASH_E_NO_INIT;
     }
 
-    /* Write Enable */
-    spi_flash_cs_low();
-    tx_buf[0] = SPI_FLASH_CMD_WRITE_ENABLE;
-    HAL_SPI_Transmit(flash_spi, tx_buf, 1, 100);
-    spi_flash_cs_high();
+    /* 按页边界切分。真器件在页内回绕，一次跨页写会静默改写页首数据 ——
+     * 这是"偶发丢数据"最经典的一个来源。 */
+    while (len > 0U) {
+        uint32_t page_off = addr % SPI_FLASH_PAGE_SIZE;
+        uint32_t n = SPI_FLASH_PAGE_SIZE - page_off;
 
-    /* Page Program */
-    spi_flash_cs_low();
-    tx_buf[0] = SPI_FLASH_CMD_PAGE_PROGRAM;
-    tx_buf[1] = (uint8_t)((addr >> 16) & 0xFF);
-    tx_buf[2] = (uint8_t)((addr >> 8) & 0xFF);
-    tx_buf[3] = (uint8_t)(addr & 0xFF);
-    HAL_SPI_Transmit(flash_spi, tx_buf, 4, 100);
-    HAL_SPI_Transmit(flash_spi, (uint8_t *)buf, (uint16_t)len, 2000);
-    spi_flash_cs_high();
-
-#ifdef TEST
-    /* No delay in test mode */
-#else
-    HAL_Delay(10);
+        if (n > len) {
+            n = len;
+        }
+        rc = flash_program_page(addr, buf, n);
+        if (rc != SPI_FLASH_OK) {
+            break;
+        }
+#if SPI_FLASH_VERIFY_WRITES
+        rc = flash_verify(addr, buf, n);
+        if (rc != SPI_FLASH_OK) {
+            break;
+        }
 #endif
-    return 0;
+        addr += n;
+        buf  += n;
+        len  -= n;
+    }
+
+    if (rc != SPI_FLASH_OK) {
+        g_last_err = rc;
+    }
+    flash_leave();
+    return rc;
 }
 
-/**
- * @brief   Erase a 4KB sector
- * @param   addr: any address within the sector to erase
- * @return  0 on success, -1 on error
- */
 int spi_flash_erase_sector(uint32_t addr)
 {
-    if (flash_spi == NULL) {
-        return -1;
+    int rc = flash_enter();
+
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    if (g_ready == 0U) {
+        g_last_err = SPI_FLASH_E_NO_INIT;
+        flash_leave();
+        return SPI_FLASH_E_NO_INIT;
+    }
+    rc = flash_erase_unit(addr, SPI_FLASH_SECTOR_SIZE, SPI_FLASH_SECTOR_TIMEOUT_MS);
+    if (rc != SPI_FLASH_OK) {
+        g_last_err = rc;
+    }
+    flash_leave();
+    return rc;
+}
+
+int spi_flash_erase_block_32k(uint32_t addr)
+{
+    int rc = flash_enter();
+
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    if (g_ready == 0U) {
+        g_last_err = SPI_FLASH_E_NO_INIT;
+        flash_leave();
+        return SPI_FLASH_E_NO_INIT;
+    }
+    rc = flash_erase_unit(addr, SPI_FLASH_BLOCK_SIZE_32K,
+                          flash_erase_timeout(SPI_FLASH_BLOCK_SIZE_32K));
+    if (rc != SPI_FLASH_OK) {
+        g_last_err = rc;
+    }
+    flash_leave();
+    return rc;
+}
+
+int spi_flash_erase_block_64k(uint32_t addr)
+{
+    int rc = flash_enter();
+
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    if (g_ready == 0U) {
+        g_last_err = SPI_FLASH_E_NO_INIT;
+        flash_leave();
+        return SPI_FLASH_E_NO_INIT;
+    }
+    rc = flash_erase_unit(addr, SPI_FLASH_BLOCK_SIZE_64K,
+                          flash_erase_timeout(SPI_FLASH_BLOCK_SIZE_64K));
+    if (rc != SPI_FLASH_OK) {
+        g_last_err = rc;
+    }
+    flash_leave();
+    return rc;
+}
+
+int spi_flash_erase_range(uint32_t addr, uint32_t len)
+{
+    uint32_t start;
+    uint32_t end;
+    uint32_t off;
+    int rc;
+
+    if (len == 0U) {
+        return SPI_FLASH_E_ARG;
+    }
+    if (addr >= SPI_FLASH_TOTAL_SIZE || len > (SPI_FLASH_TOTAL_SIZE - addr)) {
+        g_last_err = SPI_FLASH_E_RANGE;
+        return SPI_FLASH_E_RANGE;
+    }
+    rc = flash_enter();
+    if (rc != SPI_FLASH_OK) {
+        return rc;
+    }
+    if (g_ready == 0U) {
+        g_last_err = SPI_FLASH_E_NO_INIT;
+        flash_leave();
+        return SPI_FLASH_E_NO_INIT;
     }
 
-    /* Write Enable */
-    spi_flash_cs_low();
-    tx_buf[0] = SPI_FLASH_CMD_WRITE_ENABLE;
-    HAL_SPI_Transmit(flash_spi, tx_buf, 1, 100);
-    spi_flash_cs_high();
+    /* 两端都向外扩到扇区边界 —— 调用者只关心"这段区间是干净的"。 */
+    start = addr - (addr % SPI_FLASH_SECTOR_SIZE);
+    end   = addr + len;
+    if ((end % SPI_FLASH_SECTOR_SIZE) != 0U) {
+        end += SPI_FLASH_SECTOR_SIZE - (end % SPI_FLASH_SECTOR_SIZE);
+    }
+    if (end > SPI_FLASH_TOTAL_SIZE) {
+        end = SPI_FLASH_TOTAL_SIZE;
+    }
 
-    /* Sector Erase */
-    spi_flash_cs_low();
-    tx_buf[0] = SPI_FLASH_CMD_SECTOR_ERASE;
-    tx_buf[1] = (uint8_t)((addr >> 16) & 0xFF);
-    tx_buf[2] = (uint8_t)((addr >> 8) & 0xFF);
-    tx_buf[3] = (uint8_t)(addr & 0xFF);
-    HAL_SPI_Transmit(flash_spi, tx_buf, 4, 200);
-    spi_flash_cs_high();
+    /* 逐扇区擦，不用块擦：块擦在部分场景快得多，但会让"最坏耗时"随
+     * 对齐情况跳变，而 NVM 回收路径需要一个可预测的上界。 */
+    for (off = start; off < end; off += SPI_FLASH_SECTOR_SIZE) {
+        rc = flash_erase_unit(off, SPI_FLASH_SECTOR_SIZE,
+                              SPI_FLASH_SECTOR_TIMEOUT_MS);
+        if (rc != SPI_FLASH_OK) {
+            break;
+        }
+    }
 
-#ifdef TEST
-    /* No delay in test mode */
-#else
-    HAL_Delay(100);
-#endif
-    return 0;
+    if (rc != SPI_FLASH_OK) {
+        g_last_err = rc;
+    }
+    flash_leave();
+    return rc;
 }

@@ -108,11 +108,20 @@ uint32_t mock_HAL_GPIO_WritePin_get_count(void) {
     return gpio_write_call_count;
 }
 
+/* SPI NOR 模型定义在后面；片选边沿是**普通 GPIO 写**，而 GPIO 桩在最前面，
+ * 所以这里前向声明一下，让 GPIO 写能把边沿转给 NOR 模型。 */
+static void nor_cs_edge(uint16_t pin, bool selected);
+
 void HAL_GPIO_WritePin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin, uint16_t PinState) {
     (void)GPIOx;
     gpio_write_last_pin = GPIO_Pin;
     gpio_write_last_state = PinState;
     gpio_write_call_count++;
+
+    /* SPI NOR 的片选是普通 GPIO，器件无法从 SPI 帧里看出事务边界 ——
+     * 只有片选边沿能界定。所以把每次 GPIO 写转给 NOR 模型，由它自己
+     * 判断是不是它绑定的那根脚（mock_nor_bind_cs）。 */
+    nor_cs_edge(GPIO_Pin, PinState == GPIO_PIN_RESET);
 }
 
 void HAL_GPIO_TogglePin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin) {
@@ -230,6 +239,12 @@ void HAL_I2C_Init(I2C_HandleTypeDef *hi2c) {
  * Test code uses mock_spi_set/get_reg() and mock_spi_load_image(). */
 #define MOCK_SPI_MEM_SIZE 128
 
+/* 总线上挂的是哪一种器件：寄存器模型（MPU6500 等）还是 SPI NOR。
+ * 两套模型共用同一组 HAL_SPI_* 桩，靠这个选择器分流。 */
+#define MOCK_SPI_KIND_REGISTER  0
+#define MOCK_SPI_KIND_NOR       1
+static int g_spi_kind = MOCK_SPI_KIND_REGISTER;
+
 static uint8_t  g_spi_mem[MOCK_SPI_MEM_SIZE];
 static uint32_t g_spi_read_calls  = 0;
 static uint32_t g_spi_write_calls = 0;
@@ -241,10 +256,13 @@ void mock_spi_reset(void)
     g_spi_read_calls  = 0;
     g_spi_write_calls = 0;
     g_spi_present     = false;
+    g_spi_kind        = MOCK_SPI_KIND_REGISTER;
 }
 
 void mock_spi_set_reg(uint8_t reg, uint8_t val)
 {
+    /* 用寄存器接口即表示"总线上挂的是寄存器型器件"（MPU6500 等） */
+    g_spi_kind    = MOCK_SPI_KIND_REGISTER;
     g_spi_present = true;
     if (reg < MOCK_SPI_MEM_SIZE) {
         g_spi_mem[reg] = val;
@@ -270,6 +288,377 @@ void mock_spi_load_image(const uint8_t *init, uint32_t len)
 uint32_t mock_spi_read_count(void)  { return g_spi_read_calls; }
 uint32_t mock_spi_write_count(void) { return g_spi_write_calls; }
 
+/* ==========================================================================
+ * SPI NOR mock —— 真器件语义
+ * ==========================================================================
+ * 上面那套是"寄存器模型"（首字节当寄存器下标）。它无法验证任何 NOR 协议
+ * 行为：没有地址译码、没有 WREN 锁存、没有 WIP、program 不是"只能 1→0"、
+ * 没有扇区擦除。用它测 SPI NOR 驱动，凡"写进去再读回来"的断言都**恒真**。
+ *
+ * 这里改为对器件真实行为建模，包括最容易写错驱动的几处：
+ *   · 24 位地址译码；越界**静默回绕**（真器件如此），但计数以便测试断言
+ *     驱动自己从不越界
+ *   · PAGE_PROGRAM 只能 1→0（写过的位置再写只会更小）
+ *   · PAGE_PROGRAM 在**页内**回绕 —— 这就是驱动必须按页切分的原因
+ *   · 未 WREN 的 program/erase **被忽略**（真器件行为，不是报错）
+ *   · ERASE 把对应区域置 0xFF；WEL 在 program/erase 执行后自动清除
+ *   · READ_STATUS 返回 WIP|WEL；忙时递减忙计数
+ *   · RDID 返回绑定的 JEDEC ID
+ *   · 片选边沿界定一次事务 —— CS 是普通 GPIO，mock 只能从 HAL_GPIO_WritePin
+ *     的调用观察，所以用 mock_nor_bind_cs() 告诉它哪根脚是 CS
+ *
+ * 时间推进：每读一次状态寄存器推进 mock 时基一个轮询间隔。这样驱动的
+ * "轮询 WIP + 用 HAL_GetTick 判超时"这条路径在主机上会被真正走到 ——
+ * 否则时基不动，轮询必然超时，超时分支反而永远测不到"正常落下去"。
+ * ------------------------------------------------------------------------ */
+
+/* 哪个器件挂在总线上 —— 选择器定义在本节开头（寄存器模型之前），
+ * 因为 mock_spi_set_reg()/mock_spi_reset() 也要写它。 */
+
+static uint8_t  g_nor[MOCK_NOR_MAX_SIZE];
+static uint32_t g_nor_page_size   = 256U;
+static uint32_t g_nor_sector_size = 4096U;
+static uint32_t g_nor_total_size  = MOCK_NOR_MAX_SIZE;
+static uint8_t  g_nor_jedec[3]    = {0xFFU, 0xFFU, 0xFFU};
+static bool     g_nor_present     = false;
+
+static uint16_t g_nor_cs_pin      = 0U;     /* 0 = 未绑定 */
+static bool     g_nor_cs_active   = false;
+
+static uint32_t g_nor_busy_polls  = MOCK_NOR_DEFAULT_BUSY;
+static uint32_t g_nor_busy_left   = 0U;
+static bool     g_nor_wel         = false;
+
+static bool     g_nor_have_cmd    = false;
+static uint8_t  g_nor_cmd         = 0U;
+static uint32_t g_nor_addr        = 0U;
+static uint8_t  g_nor_addr_got    = 0U;
+static uint8_t  g_nor_dummy_left  = 0U;
+static uint8_t  g_nor_id_left     = 0U;
+static uint32_t g_nor_cursor      = 0U;
+static bool     g_nor_prog_active = false;
+
+static uint32_t g_nor_program_count = 0U;
+static uint32_t g_nor_erase_count   = 0U;
+static uint32_t g_nor_oor_count     = 0U;
+
+void mock_nor_reset(void)
+{
+    g_spi_kind        = MOCK_SPI_KIND_NOR;
+    memset(g_nor, 0xFF, sizeof(g_nor));
+    g_nor_page_size   = 256U;
+    g_nor_sector_size = 4096U;
+    g_nor_total_size  = MOCK_NOR_MAX_SIZE;
+    memset(g_nor_jedec, 0xFF, sizeof(g_nor_jedec));
+    g_nor_present     = true;
+    g_nor_cs_pin      = 0U;
+    g_nor_cs_active   = false;
+    g_nor_busy_polls  = MOCK_NOR_DEFAULT_BUSY;
+    g_nor_busy_left   = 0U;
+    g_nor_wel         = false;
+    g_nor_have_cmd    = false;
+    g_nor_prog_active = false;
+    g_nor_program_count = 0U;
+    g_nor_erase_count   = 0U;
+    g_nor_oor_count     = 0U;
+}
+
+void mock_nor_set_geometry(uint32_t page_size, uint32_t sector_size,
+                           uint32_t total_size)
+{
+    g_spi_kind = MOCK_SPI_KIND_NOR;
+    if (page_size > 0U)   { g_nor_page_size   = page_size; }
+    if (sector_size > 0U) { g_nor_sector_size = sector_size; }
+    if (total_size > 0U && total_size <= MOCK_NOR_MAX_SIZE) {
+        g_nor_total_size = total_size;
+    }
+    /* 越界回绕依赖 total_size 是扇区大小的整数倍 */
+    g_nor_present = true;
+}
+
+void mock_nor_set_jedec_id(const uint8_t id[3])
+{
+    g_spi_kind = MOCK_SPI_KIND_NOR;
+    if (id != NULL) {
+        memcpy(g_nor_jedec, id, 3U);
+    }
+    g_nor_present = true;
+}
+
+void mock_nor_bind_cs(uint16_t cs_pin)
+{
+    g_nor_cs_pin = cs_pin;
+}
+
+void mock_nor_set_busy_polls(uint32_t polls)
+{
+    g_nor_busy_polls = polls;
+}
+
+uint32_t mock_nor_busy_polls(void) { return g_nor_busy_polls; }
+uint32_t mock_nor_program_count(void) { return g_nor_program_count; }
+uint32_t mock_nor_erase_count(void)   { return g_nor_erase_count; }
+uint32_t mock_nor_out_of_range_count(void) { return g_nor_oor_count; }
+
+uint8_t mock_nor_peek(uint32_t addr)
+{
+    return g_nor[addr % g_nor_total_size];
+}
+
+void mock_nor_poke(uint32_t addr, uint8_t val)
+{
+    g_nor[addr % g_nor_total_size] = val;
+}
+
+void mock_nor_fill(uint32_t addr, uint32_t len, uint8_t val)
+{
+    uint32_t i;
+    for (i = 0U; i < len; i++) {
+        g_nor[(addr + i) % g_nor_total_size] = val;
+    }
+}
+
+/* 越界访问在真器件上是静默回绕（不是报错），所以这里也回绕，但计数 ——
+ * 驱动**自己**不该越界，测试用 mock_nor_out_of_range_count() 断言这一点。 */
+static uint32_t nor_wrap_counting(uint32_t addr)
+{
+    if (addr >= g_nor_total_size) {
+        g_nor_oor_count++;
+        return addr % g_nor_total_size;
+    }
+    return addr;
+}
+
+/* 内部游标推进用这个：读到最后 1 字节之后游标会走到 total_size，那属于
+ * 正常推进而不是"驱动越界"，不能计入越界次数（否则断言永不为零）。 */
+static uint32_t nor_wrap_quiet(uint32_t addr)
+{
+    return (addr >= g_nor_total_size) ? (addr % g_nor_total_size) : addr;
+}
+
+#define nor_index(addr)  nor_wrap_counting(addr)
+
+static uint8_t nor_status(void)
+{
+    uint8_t s = 0U;
+    if (g_nor_busy_left > 0U) { s |= MOCK_NOR_SR_WIP; }
+    if (g_nor_wel)            { s |= MOCK_NOR_SR_WEL; }
+    return s;
+}
+
+/* 时基与器件一起前进：每轮询一次状态寄存器，过掉一个轮询间隔。 */
+static void nor_advance_time(void)
+{
+    if (g_nor_busy_left > 0U) {
+        g_nor_busy_left--;
+    }
+    mock_tick_advance(MOCK_NOR_POLL_INTERVAL_MS);
+}
+
+static bool nor_needs_addr(uint8_t cmd)
+{
+    return (cmd == MOCK_NOR_CMD_READ_DATA)
+        || (cmd == MOCK_NOR_CMD_FAST_READ)
+        || (cmd == MOCK_NOR_CMD_PAGE_PROGRAM)
+        || (cmd == MOCK_NOR_CMD_SECTOR_ERASE)
+        || (cmd == MOCK_NOR_CMD_BLOCK_ERASE_32K)
+        || (cmd == MOCK_NOR_CMD_BLOCK_ERASE_64K);
+}
+
+static void nor_erase(uint32_t addr, uint32_t size)
+{
+    uint32_t base;
+    uint32_t end;
+
+    /* 真器件：没有 WREN 的擦除被忽略，且不报错。这是驱动最容易漏的一步。 */
+    if (!g_nor_wel) {
+        return;
+    }
+    g_nor_wel = false;
+    if (size == 0U) { return; }
+
+    base = addr - (addr % size);
+    end  = base + size;
+    if (base >= g_nor_total_size) { return; }
+    if (end > g_nor_total_size)   { end = g_nor_total_size; }
+    memset(&g_nor[base], 0xFF, end - base);
+    g_nor_busy_left = g_nor_busy_polls;
+    g_nor_erase_count++;
+}
+
+static void nor_addr_complete(void)
+{
+    switch (g_nor_cmd) {
+    case MOCK_NOR_CMD_READ_DATA:
+    case MOCK_NOR_CMD_FAST_READ:
+        g_nor_cursor     = nor_index(g_nor_addr);
+        g_nor_dummy_left = (g_nor_cmd == MOCK_NOR_CMD_FAST_READ) ? 1U : 0U;
+        break;
+
+    case MOCK_NOR_CMD_PAGE_PROGRAM:
+        if (!g_nor_wel) {
+            /* 未 WREN ⇒ 整个 program 被忽略（真器件行为） */
+            g_nor_prog_active = false;
+            return;
+        }
+        g_nor_wel         = false;
+        g_nor_cursor      = nor_index(g_nor_addr);
+        g_nor_prog_active = true;
+        g_nor_program_count++;
+        break;
+
+    case MOCK_NOR_CMD_SECTOR_ERASE:
+        nor_erase(g_nor_addr, g_nor_sector_size);
+        break;
+
+    case MOCK_NOR_CMD_BLOCK_ERASE_32K:
+        nor_erase(g_nor_addr, MOCK_NOR_BLOCK_32K);
+        break;
+
+    case MOCK_NOR_CMD_BLOCK_ERASE_64K:
+        nor_erase(g_nor_addr, MOCK_NOR_BLOCK_64K);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* 一个数据字节进入器件（PAGE_PROGRAM 阶段） */
+static void nor_program_byte(uint8_t b)
+{
+    uint32_t page_off;
+    uint32_t page_base;
+    uint32_t idx;
+
+    if (!g_nor_prog_active) {
+        return;
+    }
+    idx = nor_index(g_nor_cursor);
+    /* NOR 只能把 1 写成 0 —— 这就是"写之前必须先擦"的根源。 */
+    g_nor[idx] &= b;
+
+    /* 页内回绕：越过页尾回到页首（真器件行为，也是驱动必须按页切分的原因） */
+    page_off  = g_nor_cursor % g_nor_page_size;
+    page_base = g_nor_cursor - page_off;
+    g_nor_cursor = page_base + ((page_off + 1U) % g_nor_page_size);
+}
+
+static void nor_tx_byte(uint8_t b)
+{
+    if (!g_nor_have_cmd) {
+        g_nor_have_cmd    = true;
+        g_nor_cmd         = b;
+        g_nor_addr        = 0U;
+        g_nor_addr_got    = 0U;
+        g_nor_dummy_left  = 0U;
+        g_nor_id_left     = 0U;
+        g_nor_prog_active = false;
+        switch (b) {
+        case MOCK_NOR_CMD_WRITE_ENABLE:
+            g_nor_wel = true;
+            break;
+        case MOCK_NOR_CMD_WRITE_DISABLE:
+            g_nor_wel = false;
+            break;
+        case MOCK_NOR_CMD_CHIP_ERASE:
+            if (g_nor_wel) {
+                g_nor_wel = false;
+                memset(g_nor, 0xFF, g_nor_total_size);
+                g_nor_busy_left = g_nor_busy_polls;
+                g_nor_erase_count++;
+            }
+            break;
+        case MOCK_NOR_CMD_READ_ID:
+            g_nor_id_left = 3U;
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+    if (nor_needs_addr(g_nor_cmd) && g_nor_addr_got < 3U) {
+        g_nor_addr = (g_nor_addr << 8) | (uint32_t)b;
+        g_nor_addr_got++;
+        if (g_nor_addr_got == 3U) {
+            nor_addr_complete();
+        }
+        return;
+    }
+
+    if (g_nor_cmd == MOCK_NOR_CMD_PAGE_PROGRAM) {
+        nor_program_byte(b);
+    }
+}
+
+static uint8_t nor_rx_byte(void)
+{
+    uint8_t out = 0xFFU;
+
+    if (!g_nor_have_cmd) {
+        return out;
+    }
+    switch (g_nor_cmd) {
+    case MOCK_NOR_CMD_READ_ID:
+        if (g_nor_id_left > 0U) {
+            out = g_nor_jedec[3U - g_nor_id_left];
+            g_nor_id_left--;
+        }
+        break;
+
+    case MOCK_NOR_CMD_READ_STATUS:
+        out = nor_status();
+        nor_advance_time();
+        break;
+
+    case MOCK_NOR_CMD_READ_DATA:
+    case MOCK_NOR_CMD_FAST_READ:
+        if (g_nor_dummy_left > 0U) {
+            g_nor_dummy_left--;
+            break;
+        }
+        out = g_nor[nor_index(g_nor_cursor)];
+        g_nor_cursor = nor_wrap_quiet(g_nor_cursor + 1U);
+        break;
+
+    default:
+        break;
+    }
+    return out;
+}
+
+/* 片选边沿界定事务。CS 是普通 GPIO，mock 只能从 HAL_GPIO_WritePin 观察；
+ * 未绑定 CS 脚时（g_nor_cs_pin == 0）不做任何事 —— 那时 NOR 模型无法区分
+ * 事务，测试必须先调 mock_nor_bind_cs()，否则读命令会被当成地址字节。 */
+static void nor_cs_edge(uint16_t pin, bool selected)
+{
+    if (g_nor_cs_pin == 0U || pin != g_nor_cs_pin) {
+        return;
+    }
+    if (g_nor_cs_active == selected) {
+        return;
+    }
+    g_nor_cs_active = selected;
+    if (selected) {
+        /* 选中：开始新事务 */
+        g_nor_have_cmd    = false;
+        g_nor_addr_got    = 0U;
+        g_nor_dummy_left  = 0U;
+        g_nor_id_left     = 0U;
+        g_nor_prog_active = false;
+    } else {
+        /* 取消选中：一次 program 到此结束，器件开始忙 */
+        if (g_nor_prog_active) {
+            g_nor_busy_left   = g_nor_busy_polls;
+            g_nor_prog_active = false;
+        }
+        g_nor_have_cmd = false;
+    }
+}
+
+static bool spi_is_nor(void) { return g_spi_kind == MOCK_SPI_KIND_NOR; }
+
 void HAL_SPI_Init(SPI_HandleTypeDef *hspi) {
     (void)hspi;
 }
@@ -278,6 +667,15 @@ HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef *hspi, uint8_t *pTxData, ui
     uint16_t i;
     uint8_t  reg;
     (void)hspi; (void)Timeout;
+    if (spi_is_nor()) {
+        if (!g_nor_present) {
+            return HAL_ERROR;
+        }
+        for (i = 0U; i < Size; i++) {
+            nor_tx_byte((pTxData == NULL) ? 0xFFU : pTxData[i]);
+        }
+        return HAL_OK;
+    }
     if (!g_spi_present) {
         return HAL_ERROR;
     }
@@ -293,7 +691,20 @@ HAL_StatusTypeDef HAL_SPI_Transmit(SPI_HandleTypeDef *hspi, uint8_t *pTxData, ui
 }
 
 HAL_StatusTypeDef HAL_SPI_Receive(SPI_HandleTypeDef *hspi, uint8_t *pRxData, uint16_t Size, uint32_t Timeout) {
+    uint16_t i;
     (void)hspi; (void)Timeout;
+    if (spi_is_nor()) {
+        if (!g_nor_present) {
+            return HAL_ERROR;
+        }
+        for (i = 0U; i < Size; i++) {
+            uint8_t b = nor_rx_byte();
+            if (pRxData != NULL) {
+                pRxData[i] = b;
+            }
+        }
+        return HAL_OK;
+    }
     if (!g_spi_present) {
         return HAL_ERROR;
     }
@@ -308,6 +719,19 @@ HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef *hspi, uint8_t *pTxD
     uint16_t i;
     uint8_t  reg;
     (void)hspi; (void)Timeout;
+    if (spi_is_nor()) {
+        if (!g_nor_present) {
+            return HAL_ERROR;
+        }
+        for (i = 0U; i < Size; i++) {
+            uint8_t tx = (pTxData == NULL) ? 0xFFU : pTxData[i];
+            nor_tx_byte(tx);
+            if (pRxData != NULL) {
+                pRxData[i] = nor_rx_byte();
+            }
+        }
+        return HAL_OK;
+    }
     if (!g_spi_present) {
         return HAL_ERROR;
     }

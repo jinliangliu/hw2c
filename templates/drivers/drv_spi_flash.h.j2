@@ -1,6 +1,20 @@
 #ifndef __DRV_{{ peripheral.name | upper }}_H
 #define __DRV_{{ peripheral.name | upper }}_H
 
+{#
+    drv_spi_flash.h.j2 - SPI NOR Flash 驱动接口
+
+    **本文件里的每一个数字都来自 models/<type>.yaml**（几何 / 命令码 /
+    状态位 / 时序上限）。此前这个头文件把 PAGE_PROGRAM 硬编码成 0x02、
+    分频与延时写死在 .c 里 —— 换一颗 Flash 需要改模板，而"改模板"不会
+    被任何测试拦住。现在换型号只改模型文件。
+
+    模型缺字段时会渲染出语法错误（而不是静默填个魔数）—— 这也是有意的：
+    device_models.validate_device_model() 已在生成期把这些字段列为必填，
+    能走到这里说明校验被绕过了，那就该响亮地失败。
+#}
+{% set timing = model.timing %}
+
 #ifdef TEST
 #include "mock_hal.h"
 #else
@@ -9,24 +23,134 @@
 
 #include <stdint.h>
 
-/* Command constants */
-#define SPI_FLASH_CMD_READ_ID        ((uint8_t){{ model.commands.READ_ID }})
-#define SPI_FLASH_CMD_READ_DATA      ((uint8_t){{ model.commands.READ_DATA }})
-#define SPI_FLASH_CMD_WRITE_ENABLE   ((uint8_t){{ model.commands.WRITE_ENABLE }})
-#define SPI_FLASH_CMD_SECTOR_ERASE   ((uint8_t){{ model.commands.SECTOR_ERASE }})
-#define SPI_FLASH_CMD_CHIP_ERASE     ((uint8_t){{ model.commands.CHIP_ERASE }})
-#define SPI_FLASH_CMD_PAGE_PROGRAM   ((uint8_t)0x02)
+/* ==========================================================================
+ * 器件识别
+ * ========================================================================== */
+{% if model.get('jedec_id') %}
+/* 上电时会核对 RDID；不符即拒绝服务，避免"对着别的型号按错误的粒度擦写"。
+ * 型号 {{ model.get('part_number', model.get('model', '?')) }}
+ * （{{ model.get('vendor', '?') }}） */
+#define SPI_FLASH_HAS_JEDEC_ID       1
+#define SPI_FLASH_JEDEC_ID_0         0x{{ '%02X' | format(model.jedec_id[0]) }}U
+#define SPI_FLASH_JEDEC_ID_1         0x{{ '%02X' | format(model.jedec_id[1]) }}U
+#define SPI_FLASH_JEDEC_ID_2         0x{{ '%02X' | format(model.jedec_id[2]) }}U
+{% else %}
+/* 该型号**未声明** JEDEC ID（models/{{ peripheral.type }}.yaml），驱动跳过
+ * 型号核对。代价必须清楚：不核对 ID 就等于不核对容量 —— 实际器件比
+ * SPI_FLASH_TOTAL_SIZE 小的话，写到尾部之后会静默回绕。 */
+#define SPI_FLASH_HAS_JEDEC_ID       0
+{% endif %}
 
-/* Flash geometry */
+/* ==========================================================================
+ * 命令码（全部取自模型）
+ * ========================================================================== */
+{% for name in ['READ_ID', 'READ_DATA', 'FAST_READ', 'WRITE_ENABLE', 'WRITE_DISABLE',
+                'READ_STATUS', 'PAGE_PROGRAM', 'SECTOR_ERASE', 'BLOCK_ERASE_32K',
+                'BLOCK_ERASE_64K', 'CHIP_ERASE', 'DEEP_POWER_DOWN',
+                'RELEASE_POWER_DOWN'] %}
+{% if name in model.commands %}
+#define SPI_FLASH_CMD_{{ name }}{{ ' ' * (24 - name | length) }}0x{{ '%02X' | format(model.commands[name]) }}U
+{% endif %}
+{% endfor %}
+
+/* 状态寄存器位（手册给的位掩码，不是位号） */
+#define SPI_FLASH_SR_WIP             0x{{ '%02X' | format(model.status_bits.WIP) }}U
+{% if 'WEL' in model.status_bits %}
+#define SPI_FLASH_SR_WEL             0x{{ '%02X' | format(model.status_bits.WEL) }}U
+{% endif %}
+
+/* ==========================================================================
+ * 几何
+ * ========================================================================== */
+#define SPI_FLASH_PAGE_SIZE          {{ model.page_size }}U
 #define SPI_FLASH_SECTOR_SIZE        {{ model.sector_size }}U
-#define SPI_FLASH_PAGE_SIZE          {{ model.get('page_size', 256) }}U
+#define SPI_FLASH_BLOCK_SIZE_32K     {{ model.block_size_32k }}U
+#define SPI_FLASH_BLOCK_SIZE_64K     {{ model.block_size_64k }}U
 #define SPI_FLASH_TOTAL_SIZE         {{ model.total_size }}U
+#define SPI_FLASH_ADDR_BYTES         {{ model.get('address_bytes', 3) }}U
 
-/* SPI Flash API */
+/* 单次 HAL 传输上限。HAL_SPI_* 的 Size 形参是 uint16_t，一次给 64 KB 以上
+ * 会静默截断；这里主动切块，且留出余量避免"刚好等于 65535"的边界。 */
+#define SPI_FLASH_CHUNK_SIZE         256U
+
+/* ==========================================================================
+ * 超时（由模型 timing 段推导，不是魔数）
+ * ==========================================================================
+ * 每条都是"手册上限 × 余量 + 固定余裕"。轮询间隔 1 ms，所以毫秒数同时
+ * 就是最大轮询次数 —— 这样即使时基冻结（HAL_GetTick 不再前进，见
+ * main.c 里 FS 端口毒值那段说明）轮询也**一定会退出**，只是报超时。
+ */
+{% set margin = 2 %}
+{% set floor = 50 %}
+#define SPI_FLASH_POLL_INTERVAL_MS   1U
+#define SPI_FLASH_PROGRAM_TIMEOUT_MS  {{ timing.page_program_ms * margin + floor }}U
+#define SPI_FLASH_SECTOR_TIMEOUT_MS   {{ timing.sector_erase_ms * margin + floor }}U
+#define SPI_FLASH_BLOCK32_TIMEOUT_MS  {{ timing.block_erase_32k_ms * margin + floor }}U
+#define SPI_FLASH_BLOCK64_TIMEOUT_MS  {{ timing.block_erase_64k_ms * margin + floor }}U
+#define SPI_FLASH_CHIP_TIMEOUT_MS     {{ timing.chip_erase_ms * margin + floor }}U
+
+/* 单次命令的超时（纯控制帧，与器件忙闲无关） */
+#define SPI_FLASH_CMD_TIMEOUT_MS      100U
+
+/* 写后是否读回校验。默认开：NOR 的 program 只把 1 写成 0，器件没接受这次
+ * 写入时**唯一**能发现的途径就是读回来比对。代价是写带宽减半，对参数类
+ * 的小块写入可以忽略；追求吞吐的场景可在编译期定义为 0 关掉。 */
+#ifndef SPI_FLASH_VERIFY_WRITES
+#define SPI_FLASH_VERIFY_WRITES       1
+#endif
+
+/* ==========================================================================
+ * 返回值
+ * ==========================================================================
+ * 0 = 成功；负数是可区分的失败原因。区分它们不是洁癖：上层（NVM KV）
+ * 要据此决定"重试"还是"放弃并使用编译期默认值"。
+ */
+#define SPI_FLASH_OK                  0
+#define SPI_FLASH_E_ARG             (-1)   /* 空指针 / 长度为零 */
+#define SPI_FLASH_E_NO_INIT         (-2)   /* 未初始化 */
+#define SPI_FLASH_E_RANGE           (-3)   /* 越过器件容量 */
+#define SPI_FLASH_E_ALIGN           (-4)   /* 擦除地址不在擦除单元边界上 */
+#define SPI_FLASH_E_TIMEOUT         (-5)   /* WIP 一直不落 */
+#define SPI_FLASH_E_IO              (-6)   /* HAL 传输返回非 OK */
+#define SPI_FLASH_E_ID              (-7)   /* JEDEC ID 与模型不符 */
+#define SPI_FLASH_E_VERIFY          (-8)   /* 写后读回不一致 */
+#define SPI_FLASH_E_BUSY            (-9)   /* 并发进入（两个持有者共用总线） */
+
+/* ==========================================================================
+ * API
+ * ========================================================================== */
+
+/* 初始化并（在模型声明了 ID 时）核对型号。
+ * 失败后驱动进入"未就绪"状态，所有读写擦立即返回 SPI_FLASH_E_NO_INIT ——
+ * 让上层明确看到"外部 NVM 不可用"，而不是拿到一堆看似成功的垃圾数据。 */
 int spi_flash_init(SPI_HandleTypeDef *hspi);
+
+/* 就绪查询与最近一次错误（错误是粘滞的，便于 CLI/遥测排查） */
+int      spi_flash_is_ready(void);
+int      spi_flash_last_error(void);
+uint32_t spi_flash_total_size(void);
+
+/* 读：任意长度、任意地址，内部按 SPI_FLASH_CHUNK_SIZE 分块 */
 int spi_flash_read(uint32_t addr, uint8_t *buf, uint32_t len);
+
+/* 写：任意长度、任意地址；内部按页边界切分，每页各自 WREN + 轮询 WIP，
+ * 并在页内做读回校验。返回首个失败的页的起始原因。
+ * 注意 NOR 语义：写入只能把 1 变 0，目标区间必须先擦除。 */
 int spi_flash_write(uint32_t addr, const uint8_t *buf, uint32_t len);
+
+/* 擦除：地址必须落在对应单元的边界上，否则返回 SPI_FLASH_E_ALIGN */
 int spi_flash_erase_sector(uint32_t addr);
+int spi_flash_erase_block_32k(uint32_t addr);
+int spi_flash_erase_block_64k(uint32_t addr);
+
+/* 擦除 [addr, addr+len) 覆盖到的所有扇区（两端都向外扩到扇区边界）。
+ * NVM 层要用它做环形日志的回收。 */
+int spi_flash_erase_range(uint32_t addr, uint32_t len);
+
+/* 读 RDID（3 字节） */
 int spi_flash_get_id(uint8_t *id);
+
+/* 等器件空闲；供上层在自行发出命令后使用 */
+int spi_flash_wait_ready(uint32_t timeout_ms);
 
 #endif /* __DRV_{{ peripheral.name | upper }}_H */

@@ -927,4 +927,90 @@ void   mock_spi_load_image(const uint8_t *init, uint32_t len);
 uint32_t mock_spi_read_count(void);
 uint32_t mock_spi_write_count(void);
 
+/* ==========================================================================
+ * SPI NOR mock —— 真器件语义
+ * ==========================================================================
+ * 为什么必须有这一套（而不是复用上面的寄存器模型）
+ * --------------------------------------------------
+ * 寄存器模型把首字节当寄存器下标，没有地址译码、没有 WREN 锁存、没有 WIP、
+ * program 不是"只能把 1 写成 0"、也没有扇区擦除。用它测 SPI NOR 驱动，
+ * 任何"写进去再读回来"的断言都是**恒真**的 —— 这正是 A9 那一族缺陷
+ * （mock 让测试失效，见 test_bootloader_host_tests.py 的寄存器名护栏）。
+ *
+ * 这里建模的是器件的**真实行为**，包括那些最容易写错驱动的部分：
+ *   · 24 位地址译码；越界地址按真器件回绕（不报错，静默）
+ *   · PAGE_PROGRAM 只能 1→0；写过的位置再写只会更小
+ *   · PAGE_PROGRAM 在**页内**回绕（页大小由 mock_nor_set_geometry 设定）
+ *   · SECTOR/BLOCK/CHIP ERASE 把对应区域置 0xFF
+ *   · WREN 置 WEL 锁存；未 WREN 的 program/erase 被**忽略**（真器件如此）
+ *   · READ_STATUS 返回 WIP|WEL；忙时递减忙计数
+ *   · RDID 返回绑定的 JEDEC ID
+ *   · 片选边沿界定一次事务（CS 是普通 GPIO，mock 只能靠 HAL_GPIO_WritePin
+ *     的调用来观察，所以要 mock_nor_bind_cs 告诉它哪根脚是 CS）
+ *
+ * 时间推进：每读一次状态寄存器推进 mock 时基一个轮询间隔。于是驱动的
+ * "轮询 WIP + 用 HAL_GetTick 判超时"这条路径在主机上会被真正走到 ——
+ * 而不是因为时基不动而必然超时。
+ * ------------------------------------------------------------------------ */
+
+/* mock 里 NOR 的容量上限（覆盖 W25Q32 4 MB 与 P25Q64H 8 MB）。
+ * 生成工程侧测试模板会断言 SPI_FLASH_TOTAL_SIZE <= MOCK_NOR_MAX_SIZE。 */
+#define MOCK_NOR_MAX_SIZE        (8UL * 1024UL * 1024UL)
+#define MOCK_NOR_DEFAULT_BUSY    3U      /* 每次 program/erase 默认忙几个轮询 */
+#define MOCK_NOR_STUCK_BUSY      0xFFFFFFFFUL  /* 注入"永远不落"的器件 */
+
+/* --------------------------------------------------------------------------
+ * NOR 命令码与状态位
+ * --------------------------------------------------------------------------
+ * ⚠️ 这几个数字必须与 models/SPI_Flash_*.yaml 的 commands / status_bits 段
+ * 逐字一致。mock 读不到模型文件，只能重复一遍 —— 所以护栏是**解析比对**：
+ * generator/tests/test_bootloader_host_tests.py 的同族检查会把这些宏与
+ * 每个 flash 模型比一遍。凭印象改这里能让全部 NOR 测试变成假绿。
+ * ------------------------------------------------------------------------ */
+#define MOCK_NOR_CMD_READ_ID            0x9FU
+#define MOCK_NOR_CMD_READ_DATA          0x03U
+#define MOCK_NOR_CMD_FAST_READ          0x0BU
+#define MOCK_NOR_CMD_WRITE_ENABLE       0x06U
+#define MOCK_NOR_CMD_WRITE_DISABLE      0x04U
+#define MOCK_NOR_CMD_READ_STATUS        0x05U
+#define MOCK_NOR_CMD_PAGE_PROGRAM       0x02U
+#define MOCK_NOR_CMD_SECTOR_ERASE       0x20U
+#define MOCK_NOR_CMD_BLOCK_ERASE_32K    0x52U
+#define MOCK_NOR_CMD_BLOCK_ERASE_64K    0xD8U
+#define MOCK_NOR_CMD_CHIP_ERASE         0xC7U
+
+#define MOCK_NOR_SR_WIP                 0x01U
+#define MOCK_NOR_SR_WEL                 0x02U
+
+#define MOCK_NOR_BLOCK_32K              32768UL
+#define MOCK_NOR_BLOCK_64K              65536UL
+
+/* 每轮询一次状态寄存器，器件与 mock 时基各前进这么多。驱动侧的
+ * SPI_FLASH_POLL_INTERVAL_MS 必须等于它（生成工程侧有断言）。 */
+#define MOCK_NOR_POLL_INTERVAL_MS       1U
+
+void     mock_nor_reset(void);
+/* 设定几何：页大小、扇区大小、容量（与器件模型一致）。 */
+void     mock_nor_set_geometry(uint32_t page_size, uint32_t sector_size,
+                               uint32_t total_size);
+/* 绑定 JEDEC ID（p25q64h = 85 60 17）。未绑定时 RDID 返回 FF FF FF。 */
+void     mock_nor_set_jedec_id(const uint8_t id[3]);
+/* 告诉 mock 哪根 GPIO 脚是片选（active low）—— 它据此看出事务边界。 */
+void     mock_nor_bind_cs(uint16_t cs_pin);
+/* 忙计数：一次 program/erase 之后要几个轮询才落。默认 MOCK_NOR_DEFAULT_BUSY，
+ * 传 MOCK_NOR_STUCK_BUSY 可注入"器件永久忙"以验证超时路径。 */
+void     mock_nor_set_busy_polls(uint32_t polls);
+uint32_t mock_nor_busy_polls(void);
+
+/* 直接读写 NOR 阵列（用于布置初值 / 检查落盘结果） */
+uint8_t  mock_nor_peek(uint32_t addr);
+void     mock_nor_poke(uint32_t addr, uint8_t val);
+/* 用某个字节填满一段（通常用 0xFF 造"已擦除"） */
+void     mock_nor_fill(uint32_t addr, uint32_t len, uint8_t val);
+/* 统计：实际发生的 program / erase 次数（用来断言"跨页写被切成了 N 次"） */
+uint32_t mock_nor_program_count(void);
+uint32_t mock_nor_erase_count(void);
+/* 越界（超出 total_size）的访问次数 —— 真器件会静默回绕，但驱动不该越界 */
+uint32_t mock_nor_out_of_range_count(void);
+
 #endif /* MOCK_HAL_H */

@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import glob
 import os
+import re
 
 import pytest
 
@@ -27,7 +28,7 @@ from generator.device_models import (
     validate_device_model,
     validate_model_file,
 )
-from generator.paths import MODELS_DIR
+from generator.paths import MODELS_DIR, TEMPLATES_DIR
 from generator.peripheral_types import SPI_FLASH_TYPES
 
 
@@ -290,6 +291,114 @@ def test_validator_does_not_mutate_the_model_it_inspects():
     snapshot = copy.deepcopy(model)
     _errors_for(model)
     assert model == snapshot
+
+
+# ---------------------------------------------------------------------------
+# 三方一致：模型 ↔ 驱动模板 ↔ mock
+# ---------------------------------------------------------------------------
+# 「模型是硅片事实的唯一落点」这句话只有在**其余两处都从它派生**时才成立。
+# 实际上有三份副本，各自都可能凭印象漂移：
+#   1. models/SPI_Flash_*.yaml        —— 真源
+#   2. templates/drivers/drv_spi_flash.h.j2  —— 生成到固件里的宏
+#   3. templates/test/mock_hal.h.j2   —— 主机侧假器件的命令码
+# 第 3 份最危险：它读不到 YAML，只能重复一遍。若它和模型不一致，全部 NOR
+# 行为测试就都在验证一个**不存在的器件**，而且全绿。
+# 这与 A9（mock 把 TAMP 开到 BKP31R，凭空造出硅片上不存在的寄存器）同族。
+
+_MOCK_HEADER = os.path.join(TEMPLATES_DIR, "test", "mock_hal.h.j2")
+_DRIVER_HEADER = os.path.join(TEMPLATES_DIR, "drivers", "drv_spi_flash.h.j2")
+
+
+def _parse_mock_nor_defines() -> dict[str, int]:
+    """从 mock 头文件里抽出 MOCK_NOR_* 的取值（十六进制或十进制都接受）。"""
+    with open(_MOCK_HEADER, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    out: dict[str, int] = {}
+    for m in re.finditer(
+        r"^#define\s+(MOCK_NOR_[A-Z0-9_]+)\s+(0[xX][0-9A-Fa-f]+|\d+)[uUlL]*\s*$",
+        text,
+        re.MULTILINE,
+    ):
+        raw = m.group(2)
+        # int(x, 0) 会按前缀自动选进制；纯十进制也走这条路。
+        out[m.group(1)] = int(raw, 16) if raw.lower().startswith("0x") else int(raw, 10)
+    return out
+
+
+@pytest.mark.parametrize(
+    "path", _flash_model_paths(), ids=lambda p: os.path.basename(p)
+)
+def test_mock_command_codes_match_the_model(path):
+    """mock 的 NOR 命令码必须与模型的 `commands` 段逐个相等。"""
+    from generator.device_models import load_device_model
+
+    model = load_device_model(path)
+    defines = _parse_mock_nor_defines()
+    assert defines, f"没能从 {_MOCK_HEADER} 解析出任何 MOCK_NOR_* 定义"
+
+    for name, code in model["commands"].items():
+        key = f"MOCK_NOR_CMD_{name}"
+        if key not in defines:
+            # 模型声明的命令比 mock 支持的多是允许的（如 DEEP_POWER_DOWN
+            # 驱动不发、测试也不需要），但**必备命令**不能缺。
+            assert name not in REQUIRED_FLASH_COMMANDS, (
+                f"{os.path.basename(path)} 声明了必备命令 {name}="
+                f"0x{code:02X}，但 mock 里没有 {key} —— NOR 行为测试无法覆盖它。"
+            )
+            continue
+        assert defines[key] == code, (
+            f"{key} 在 mock 里是 0x{defines[key]:02X}，而 "
+            f"{os.path.basename(path)} 的 commands.{name} 是 0x{code:02X}。"
+            f"mock 建的是**不存在的器件**。"
+        )
+
+    for name, mask in model["status_bits"].items():
+        key = f"MOCK_NOR_SR_{name}"
+        assert key in defines, f"mock 缺少状态位 {key}"
+        assert defines[key] == mask, (
+            f"{key} 在 mock 里是 0x{defines[key]:02X}，模型是 0x{mask:02X}"
+        )
+
+
+@pytest.mark.parametrize(
+    "path", _flash_model_paths(), ids=lambda p: os.path.basename(p)
+)
+def test_driver_header_emits_every_command_the_model_declares(path):
+    """模型声明的命令必须真的被生成成宏。
+
+    头文件模板用的是一个 Jinja 名字列表来展开宏。列表里少了某个名字，
+    模型就会"声明了但驱动不认" —— 而生成期没有任何响声。
+    """
+    from generator.device_models import load_device_model
+
+    model = load_device_model(path)
+    with open(_DRIVER_HEADER, "r", encoding="utf-8") as fh:
+        text = fh.read()
+
+    listed = set(re.findall(r"'([A-Z][A-Z0-9_]+)'", text))
+    for name in model["commands"]:
+        assert name in listed, (
+            f"{os.path.basename(path)} 声明了命令 {name}，但 "
+            f"{os.path.basename(_DRIVER_HEADER)} 的宏展开列表里没有它 —— "
+            f"该命令不会被生成到固件里。"
+        )
+
+
+def test_mock_block_sizes_match_the_models():
+    """mock 的块擦尺寸也必须与模型一致（块擦命令码同样受上面那条约束）。"""
+    from generator.device_models import load_device_model
+
+    defines = _parse_mock_nor_defines()
+    for path in _flash_model_paths():
+        model = load_device_model(path)
+        for key, field in (
+            ("MOCK_NOR_BLOCK_32K", "block_size_32k"),
+            ("MOCK_NOR_BLOCK_64K", "block_size_64k"),
+        ):
+            assert defines[key] == model[field], (
+                f"{key} 在 mock 里是 {defines[key]}，"
+                f"{os.path.basename(path)} 的 {field} 是 {model[field]}"
+            )
 
 
 # ---------------------------------------------------------------------------

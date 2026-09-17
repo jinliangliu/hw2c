@@ -140,13 +140,28 @@ def validate_device_model(model: dict, model_path: str = "<model>") -> list[str]
     for name in ("block_size_32k", "block_size_64k"):
         value = model.get(name)
         if value is None:
+            # 主流 SPI NOR（W25Q / P25Q / GD25 全系）都有两种块擦。
+            # 作为必填而不是可选，是为了让模板不必写条件分支 ——
+            # 条件生成的分支是最容易"某个型号悄悄少生成一段"的地方。
+            errors.append(
+                f"{where} '{name}' is required (the driver exposes block "
+                f"erase for both sizes; model it explicitly)."
+            )
             continue
-        if not isinstance(value, int) or not _is_power_of_two(sector_size):
-            errors.append(f"{where} {name}={value} must be an integer.")
+        if not _is_power_of_two(sector_size):
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            errors.append(f"{where} {name}={value!r} must be a positive integer.")
         elif value % sector_size != 0:
             errors.append(
                 f"{where} {name}={value} must be a multiple of "
                 f"sector_size={sector_size}."
+            )
+        elif value <= sector_size:
+            errors.append(
+                f"{where} {name}={value} must be larger than "
+                f"sector_size={sector_size}: a block erase that is not bigger "
+                f"than a sector erase is a modelling mistake."
             )
 
     # ---------- 命令集 ----------
