@@ -35,6 +35,10 @@
 {% if has_log %}
 #include "drv_log.h"
 {% endif %}
+/* 异常诊断（FR-15.7）：CLI 是"当前在跑什么"最重要的一条线索来源，命令进出
+ * 都要登记 tag；主动软件复位也要留下"是谁要求复位的"。 */
+#include "hw2c_diag.h"
+#include "hw2c_fault.h"
 {% if has_led %}
 #include "led_component.h"
 {% endif %}
@@ -301,7 +305,57 @@ static void cmd_reset(int argc, char *argv[], cli_output_fn out)
     (void)argv;
     out("Resetting...\r\n");
     vTaskDelay(100);
+    /*
+     * 复位前登记一笔：这次复位是**人要求的**，不是故障。
+     * 不做这件事的话，开机横幅里"上次复位"一片空白，现场无法区分
+     * "运行了几周后自己重启"和"有人敲了 reset"。lr 由 hw2c_diag_note()
+     * 自己取（就是本函数里这一行的下一条指令）。
+     */
+    hw2c_diag_note(HW2C_FAULT_SOFT_RESET);
     NVIC_SystemReset();
+}
+
+/*
+ * 故障诊断（FR-15.7）
+ *
+ * `diag last`  —— 打印上次复位前的快照，不必等下次开机。
+ * `diag crash` —— 故意触发 HardFault。这是整条诊断链路**可复现的注入点**：
+ *                 没有它，"HardFault 时会不会打出地址和模块"只能靠运气碰。
+ */
+static void cmd_diag(int argc, char *argv[], cli_output_fn out)
+{
+    char line[HW2C_DIAG_LINE_LEN];
+
+    if (argc < 2) {
+        out("Usage: diag last | diag crash\r\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "last") == 0) {
+        (void)hw2c_diag_format_last(line, sizeof(line));
+        out("%s\r\n", line);
+        return;
+    }
+
+    if (strcmp(argv[1], "crash") == 0) {
+        volatile uint32_t *trap = (volatile uint32_t *)0xDEADBEE0UL;
+
+        out("crashing on purpose (store to an unmapped address)...\r\n");
+{% if has_log %}
+        /* 先把这句话刷出去：HardFault 之后 TXE 中断不会再被服务。 */
+        log_flush();
+{% endif %}
+        /*
+         * 0xDEADBEE0 没有被任何外设解码，M0+ 上必然 BusFault → HardFault。
+         * 打印出来的 PC 应当落在 cmd_diag() 里这一行 —— 这是"故障点地址"
+         * 是不是真的指向故障点的一个自证。
+         */
+        *trap = 0xDEADUL;
+        out("crash did not fault?!\r\n");
+        return;
+    }
+
+    out("Unknown diag subcommand: %s\r\n", argv[1]);
 }
 
 /* ==================================================================
@@ -1081,7 +1135,11 @@ static void cmd_fota(int argc, char *argv[], cli_output_fn out)
     static void _hw2c_##name(int argc, char *argv[], hw2c_cli_t *cli) \
     { \
         (void)cli; \
+        /* 故障瞬间要知道"当时在跑哪个命令"（FR-15.7）。tag 是字符串字面量， \
+         * 静态存储期，diag 只存指针不复制 —— 故障路径上不做任何分配。 */ \
+        hw2c_diag_enter("cli:" #name, 0U); \
         cmd_##name(argc, argv, cli_output); \
+        hw2c_diag_leave(); \
     }
 
 CLI_HW2C_WRAPPER(help)
@@ -1090,6 +1148,7 @@ CLI_HW2C_WRAPPER(uptime)
 CLI_HW2C_WRAPPER(free)
 CLI_HW2C_WRAPPER(tasks)
 CLI_HW2C_WRAPPER(reset)
+CLI_HW2C_WRAPPER(diag)
 {% if has_led or pins|length > 0 %}
 CLI_HW2C_WRAPPER(gpio)
 {% endif %}
@@ -1147,6 +1206,7 @@ static const hw2c_cli_cmd_t _hw2c_commands[] = {
     {"free",     "Show free heap memory",        _hw2c_free},
     {"tasks",    "List FreeRTOS tasks",          _hw2c_tasks},
     {"reset",    "Software reset MCU",           _hw2c_reset},
+    {"diag",     "Fault diagnostics (last/crash)", _hw2c_diag},
 {% if has_led or pins|length > 0 %}
     {"gpio",     "Read/write GPIO pins",         _hw2c_gpio},
 {% endif %}
@@ -1214,6 +1274,7 @@ void cli_register_builtin_commands(void)
     cli_register_command("free",    "Show free heap memory",        cmd_free);
     cli_register_command("tasks",   "List FreeRTOS tasks",          cmd_tasks);
     cli_register_command("reset",   "Software reset MCU",           cmd_reset);
+    cli_register_command("diag",    "Fault diagnostics (last/crash)", cmd_diag);
 {% if has_led or pins|length > 0 %}
     cli_register_command("gpio",    "Read/write GPIO pins",         cmd_gpio);
 {% endif %}
@@ -1352,7 +1413,8 @@ void cli_uart_irq_handler(void)
  * ⚠️ **必须在每个字节之前重新判断接管者，不能整批只看一次。**
  *
  * 一个批次里可能同时装着"装上接管者的那条命令"和"接管者要收的第一批数据"
- * —— `fota ymodem` 紧跟 YMODEM 的块 0（真人操作有几百 ms 的间隔，踩不到；
+ * —— `fota ymodem
+` 紧跟 YMODEM 的块 0（真人操作有几百 ms 的间隔，踩不到；
  * 脚本 / 自动化会）。整批只查一次的后果非常难查：那句命令**正常执行**了、
  * 接管者**也装上了**，但同一批剩下的字节仍然被行编辑器吃掉 —— 现场表现是
  * 设备回一句 `Unknown command: <二进制乱码>`、随后一个应答都不发，而

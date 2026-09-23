@@ -7,6 +7,10 @@
  * on the code it recorded (P2-3 / P1-3). */
 #include "fault_trap_stub.c"
 
+/* event_mgr.c 在每个事件派发前后登记诊断 tag（FR-15.7），所以快照模块也要
+ * 进这个编译单元。 */
+#include "../src/hw2c_diag.c"
+
 #include "../src/event_mgr.c"
 
 void setUp(void) {

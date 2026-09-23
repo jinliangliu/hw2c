@@ -1,0 +1,109 @@
+### +0.0s listening on COM5 @ 115200
+### +0.0s pyocd reset
+### +2.3s pyocd rc=0 Resetting target
+### +22.5s !! 速率 43045 B/s 超过 11520 B/s 物理上限 —— 主机侧冲刷，本段不可信
+### +22.5s --- 开机横幅窗口结束 ---
+### +22.5s send: diag last
+### +25.8s send: diag crash
+### +51.2s --- diag crash 之后的重启窗口结束 ---
+### +51.2s send: diag last
+### +54.5s send: reset
+### +79.8s --- reset 之后的重启窗口结束 ---
+### +79.8s send: diag last
+
+===== RAW =====
+[K[K[K[K[K[K[K[K[K
+diag: fault=0 pc=0x00000000 lr=0x0800AE85 psr=0x00000000 task=cli tag=cli:reset detail=0 count=2
+> [K[K[K[K[K[K[K[K[K[K
+crashing on purpose (store to an unmapped address)...
+[2026-09-17 10:00:19.622] [ERR] diag: fault=4 pc=0x0800B056 lr=0x08011F59 psr=0x01000000
+[2026-09-17 10:00:19.625] [ERR] diag: task=cli tag=cli:diag detail=0 count=3
+	    _/    _/  _/          _/    _/_/      _/_/_/
+	   _/    _/  _/          _/  _/    _/  _/
+	  _/_/_/_/  _/    _/    _/      _/    _/
+	 _/    _/    _/  _/  _/      _/      _/
+	_/    _/      _/  _/      _/_/_/_/    _/_/_/
+
+[2000-00-00 00:00:00.999] [INF] mhde_mainboard v1.0.0 â Hardware2Code | STM32G0B1VET6 @ 16 MHz
+[2000-00-00 00:00:00.999] [INF] Firmware v1.0.0 (0x010000) â image @ 0x08002000
+[2000-00-00 00:00:00.999] [ERR] previous reset: fault=0x00000004 â outputs were forced safe
+[2000-00-00 00:00:00.999] [ERR] previous reset: diag: fault=4 pc=0x0800B056 lr=0x08011F59 psr=0x01000000
+[2000-00-00 00:00:00.999] [ERR] diag: task=cli tag=cli:diag detail=0 count=3
+[2000-00-00 00:00:00.999] [INF] MX_GPIO_Init() OK
+[2000-00-00 00:00:00.999] [INF] EventMgr_Init() OK
+[2000-00-00 00:00:00.999] [INF] statemachine_init() OK
+[2000-00-00 00:00:00.999] [INF] RTC clock source: LSE (32.768kHz)
+[2026-09-17 10:00:00.002] [INF] temp_sensor_init() OK
+[2026-09-17 10:00:00.004] [INF] RTC_Init() OK
+[2026-09-17 10:00:00.006] [INF] FOTA subsystem initialized
+[2026-09-17 10:00:00.009] [INF] component_init_all: 3/3 OK
+[2026-09-17 10:00:00.011] [INF] component_bus initialized (4 topics)
+[2026-09-17 10:00:00.013] [INF] param_registry initialized (10 params)
+[2026-09-17 10:00:00.016] [INF] PowerMgr: init, default=STOP1
+[2026-09-17 10:00:00.018] [INF] power_mgr initialized (default: STOP1)
+[2026-09-17 10:00:00.060] [INF] IWDG armed (timeout 5000 ms)
+[2026-09-17 10:00:00.116] [INF] System ready â 3 components, 18504 B heap free, starting scheduler
+> [K[K[K[K[K[K[K[K[K
+diag: fault=0 pc=0x0800B056 lr=0x08011F59 psr=0x01000000 task=cli tag=cli:diag detail=0 count=3
+> [K[K[K[K[K
+Resetting...
+[2026-09-17 10:00:24.587] [ERR] diag: fault=9 pc=0x00000000 lr=0x0800AFD9 psr=0x00000000
+[2026-09-17 10:00:24.589] [ERR] diag: task=cli tag=cli:reset detail=0 count=4
+	    _/    _/  _/          _/    _/_/      _/_/_/
+	   _/    _/  _/          _/  _/    _/  _/
+	  _/_/_/_/  _/    _/    _/      _/    _/
+	 _/    _/    _/  _/  _/      _/      _/
+	_/    _/      _/  _/      _/_/_/_/    _/_/_/
+
+[2000-00-00 00:00:00.999] [INF] mhde_mainboard v1.0.0 â Hardware2Code | STM32G0B1VET6 @ 16 MHz
+[2000-00-00 00:00:00.999] [INF] Firmware v1.0.0 (0x010000) â image @ 0x08002000
+[2000-00-00 00:00:00.999] [ERR] previous reset: fault=0x00000009 â outputs were forced safe
+[2000-00-00 00:00:00.999] [ERR] previous reset: diag: fault=9 pc=0x00000000 lr=0x0800AFD9 psr=0x00000000
+[2000-00-00 00:00:00.999] [ERR] diag: task=cli tag=cli:reset detail=0 count=4
+[2000-00-00 00:00:00.999] [INF] MX_GPIO_Init() OK
+[2000-00-00 00:00:00.999] [INF] EventMgr_Init() OK
+[2000-00-00 00:00:00.999] [INF] statemachine_init() OK
+[2000-00-00 00:00:00.999] [INF] RTC clock source: LSE (32.768kHz)
+[2026-09-17 10:00:00.002] [INF] temp_sensor_init() OK
+[2026-09-17 10:00:00.004] [INF] RTC_Init() OK
+[2026-09-17 10:00:00.006] [INF] FOTA subsystem initialized
+[2026-09-17 10:00:00.009] [INF] component_init_all: 3/3 OK
+[2026-09-17 10:00:00.011] [INF] component_bus initialized (4 topics)
+[2026-09-17 10:00:00.013] [INF] param_registry initialized (10 params)
+[2026-09-17 10:00:00.016] [INF] PowerMgr: init, default=STOP1
+[2026-09-17 10:00:00.018] [INF] power_mgr initialized (default: STOP1)
+[2026-09-17 10:00:00.060] [INF] IWDG armed (timeout 5000 ms)
+[2026-09-17 10:00:00.116] [INF] System ready â 3 components, 18504 B heap free, starting scheduler
+> [K[K[K[K[K[K[K[K[K
+diag: fault=0 pc=0x00000000 lr=0x0800AFD9 psr=0x00000000 task=cli tag=cli:reset detail=0 count=4
+> 
+===== 取证说明 =====
+
+本轮是对 v1（onboard-capture-2026-09-23-diag.txt）暴露的截断问题的复验：
+v1 里 `count=` / `tag=cli:dia` 的尾部被 drv_log 静默截断（行缓冲 128 B，
+时间戳+级别前缀 32 B、CRLF 2 B，正文只剩 94 B，而完整诊断行最长 149 B）。
+修法：**拆行**——故障点一行（fault/pc/lr/psr），上下文一行（task/tag/
+detail/count），每行都在 94 B 之内；开机上报只给故障点行加 `previous reset: `。
+
+结果：字段全部完整，没有再出现截断。
+
+- HardFault（diag crash）：
+    [ERR] diag: fault=4 pc=0x0800B056 lr=0x08011F59 psr=0x01000000
+    [ERR] diag: task=cli tag=cli:diag detail=0 count=3
+- 重启后的开机横幅：
+    [ERR] previous reset: fault=0x00000004 — outputs were forced safe
+    [ERR] previous reset: diag: fault=4 pc=0x0800B056 lr=0x08011F59 psr=0x01000000
+    [ERR] diag: task=cli tag=cli:diag detail=0 count=3
+- 主动软件复位（reset）：
+    [ERR] diag: fault=9 pc=0x00000000 lr=0x0800AFD9 psr=0x00000000
+    [ERR] diag: task=cli tag=cli:reset detail=0 count=4
+- 重启后横幅：fault=0x00000009 / pc=0x00000000 / lr=0x0800AFD9 / tag=cli:reset / count=4
+
+`diag last`（直接写串口、不经日志）仍是完整单行。
+
+⚠️ 主机侧串口重放：本轮开机窗口读到 1.30 MB / 15.2 s = 85 KB/s，是 115200
+波特物理上限（11.52 KB/s）的 7 倍，且内容是 `state=2 compat=STOP1` /
+`=== End PowerMgr ===` 两行重复 24976 次 —— 物理上不可能，是主机侧适配器
+在重放上一次会话的残留缓冲（正常横幅在最后 17 行才出现）。脚本的速率自检
+因此判该窗口不可信并清空，这是**判据生效**，不是丢数据。读这类抓取结果时
+先做速率自检再信内容。

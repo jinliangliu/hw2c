@@ -189,6 +189,9 @@ def _render_sources(tmp_path: Path, override: dict | None = None) -> dict:
         ("drivers/drv_iwdg.h.j2", "drv_iwdg.h", iwdg_peri),
         ("src/hw2c_fault.h.j2", "hw2c_fault.h", None),
         ("src/hw2c_fault.c.j2", "hw2c_fault.c", None),
+        # 诊断快照（FR-15.7）：hw2c_fault 与 drv_fota 都要用它。
+        ("src/hw2c_diag.h.j2", "hw2c_diag.h", None),
+        ("src/hw2c_diag.c.j2", "hw2c_diag.c", None),
         ("test/mock_hal.h.j2", "mock_hal.h", None),
         ("test/mock_hal.c.j2", "mock_hal.c", None),
     ]
@@ -472,6 +475,7 @@ def _run_bench(tmp_path: Path, override: dict | None = None) -> subprocess.Compl
         str(srcs["drv_fota_delta.c"]),
         str(srcs["drv_fota_meta.c"]),
         str(srcs["hw2c_fault.c"]),
+        str(srcs["hw2c_diag.c"]),
         str(srcs["mock_hal.c"]),
         str(_HPATCH_DIR / "hpatch_lite.c"),
         str(_TUZ_DIR / "tuz_dec.c"),
@@ -661,11 +665,11 @@ def test_l5_bench_detects_trusting_declared_crc(tmp_path):
 # 这一改的危害不是"多等一会儿"：下一次 START 的续传判定只认 RECEIVING 记录，
 # 于是会走完整重传，把一份**已经通过 CRC32** 的补丁从暂存区擦掉重收。
 _M4_ANCHOR = """        if (fota_stage_restore(&rec) == 0) {
-            g_state        = FOTA_STATE_READY;
+            fota_set_state(FOTA_STATE_READY);
             g_staged_bytes = rec.staged;"""
 
 _M4_REPL = """        if (fota_stage_restore(&rec) == 0) {
-            g_state        = FOTA_STATE_IDLE;   /* MUTATION M4: 不恢复 READY */
+            fota_set_state(FOTA_STATE_IDLE);   /* MUTATION M4: 不恢复 READY */
             g_staged_bytes = rec.staged;"""
 
 

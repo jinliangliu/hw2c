@@ -17,6 +17,11 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/..  # test/ (mock_hal.h)
     ${CMAKE_SOURCE_DIR}/../../src     # src/ (for component headers)
     ${CMAKE_SOURCE_DIR}/../../src/drivers  # src/drivers/ (for gpio_api.h etc.)
+    # hw2c_diag.c（FR-15.7）在 has_log 的工程里会包含 drv_log.h，而 drv_log.h
+    # 又包含 lwrb.h（日志环形缓冲）。vendor 的 lwrb 在仓库 static/ 下，不在
+    # 上面任何一条路径里 —— 少了这条就是 "fatal error: lwrb.h: No such file"，
+    # 而且只在**开了日志**的工程上冒出来。
+    ${CMAKE_SOURCE_DIR}/../../../../static/third_party/lwrb
     unity
 )
 
@@ -35,6 +40,9 @@ add_executable(test_component_sil
     # hw2c_fault.c is always generated and event_mgr.c takes its fail-safe path
     # on a failed queue allocation, so it has to be linked here (P2-3).
     ${CMAKE_SOURCE_DIR}/../../src/hw2c_fault.c
+    # 诊断快照：hw2c_fault 把记录委托给它，event_mgr 也在派发前后登记 tag
+    # （FR-15.7）。两者必须一起编。
+    ${CMAKE_SOURCE_DIR}/../../src/hw2c_diag.c
     # hw2c_safe_state() forces every PWM actuator inactive, so every PWM driver
     # in the build is reachable from it - not just the PID one.
 {% for p in peripherals | selectattr('type', 'eq', 'Internal_PWM') | list %}

@@ -20,15 +20,63 @@ extern TaskHandle_t {{ pin.notify_task }}_handle;
  * duty was last programmed, so an actuator stays energised forever with no
  * recovery.  hw2c_fault_trap() de-energises the outputs, records the reason
  * and resets the MCU instead.
+ *
+ * 地址怎么拿到（FR-15.7）
+ * ----------------------
+ * 异常一进来，硬件已经把 R0/R1/R2/R3/R12/LR/PC/xPSR 八个字压进了栈（MSP 或
+ * PSP）。其中 **PC 就是出错的那条指令**，是定位故障最有用的一个数。它只能
+ * 在编译器还没动过任何寄存器时读，所以入口必须是 naked 汇编：函数体里第一
+ * 条 C 语句之前，编译器可能已经压栈/改栈指针，"栈帧在哪"就说不清了。
+ *
+ * 判 MSP 还是 PSP 看 EXC_RETURN 的 bit2：为 1 表示异常前跑在任务里（PSP），
+ * 为 0 表示跑在主栈（MSP）。
+ *
+ * 栈帧偏移（从栈指针起）：R0=0  R1=4  R2=8  R3=12  R12=16  LR=20  PC=24
+ *                         xPSR=28
+ *
+ * ⚠️ 不要照抄 Cortex-M3/M4 的 HardFault 打印代码：M0+ 的 SCB 只定义到
+ *    SHCSR，**没有 CFSR / HFSR / BFAR / MMFAR**（见
+ *    static/stm32g0/CMSIS/Core/core_cm0plus.h 的 SCB_Type），读它们的源码
+ *    在本工程根本编译不过。所以这里的"故障点内存地址"只有 PC / LR（外加
+ *    xPSR），没有总线故障地址 —— M0+ 上它本来就不可得。
  */
-void NMI_Handler(void)
+
+/* 汇编段：r0=PC, r1=LR, r2=xPSR，然后尾跳到下面对应的 C 入口。 */
+#define HW2C_EXC_ENTRY_ASM(_c_entry)              \
+    __asm volatile (                              \
+        "movs r0, #4\n\t"                         \
+        "mov  r1, lr\n\t"                         \
+        "tst  r0, r1\n\t"          /* bit2: 1=PSP */ \
+        "beq  1f\n\t"                             \
+        "mrs  r0, psp\n\t"                        \
+        "b    2f\n\t"                             \
+        "1:\n\t"                                  \
+        "mrs  r0, msp\n\t"                        \
+        "2:\n\t"                                  \
+        "ldr  r1, [r0, #20]\n\t"   /* LR   */     \
+        "ldr  r2, [r0, #28]\n\t"   /* xPSR */     \
+        "ldr  r0, [r0, #24]\n\t"   /* PC   */     \
+        "b    " #_c_entry "\n\t"                  \
+    )
+
+void hw2c_hardfault_entry(uint32_t pc, uint32_t lr, uint32_t psr)
 {
-    hw2c_fault_trap(HW2C_FAULT_NMI);
+    hw2c_fault_trap_ctx(HW2C_FAULT_HARDFAULT, pc, lr, psr);
 }
 
-void HardFault_Handler(void)
+void hw2c_nmi_entry(uint32_t pc, uint32_t lr, uint32_t psr)
 {
-    hw2c_fault_trap(HW2C_FAULT_HARDFAULT);
+    hw2c_fault_trap_ctx(HW2C_FAULT_NMI, pc, lr, psr);
+}
+
+__attribute__((naked)) void NMI_Handler(void)
+{
+    HW2C_EXC_ENTRY_ASM(hw2c_nmi_entry);
+}
+
+__attribute__((naked)) void HardFault_Handler(void)
+{
+    HW2C_EXC_ENTRY_ASM(hw2c_hardfault_entry);
 }
 
 /* EXTI interrupt handlers */

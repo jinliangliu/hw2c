@@ -26,6 +26,8 @@
 
 /* Fail-safe fault handling (always present) */
 #include "hw2c_fault.h"
+/* 故障快照的读取接口（FR-15.7）：开机上报用的是同一份 .noinit 记录。 */
+#include "hw2c_diag.h"
 
 {% if has_behavior %}
 #include "statemachine.h"
@@ -402,13 +404,22 @@ int main(void)
      * Report a fault trapped before the previous reset.  Without this the
      * reset reason never leaves the device, because the log itself is lost
      * on reset (see docs/reviews/code-review-2026-09-15-misra-c99.md P1-3).
+     *
+     * 除了错误码，还要报"当时在跑什么模块/任务"和"故障点地址"（FR-15.7）：
+     * 只报错码的话，"设备反复重启"在现场仍然只剩一个数字，看不出是初始化
+     * 失败还是跑飞、看不出在哪条指令上。
      */
     {
         uint32_t prev_fault = hw2c_fault_last();
         if (prev_fault != HW2C_FAULT_NONE) {
-            log_error("previous reset: fault %lu (occurrence %lu) — outputs were forced safe",
-                      (unsigned long)prev_fault,
-                      (unsigned long)hw2c_fault_reset_count());
+            /*
+             * 故障码自己占一行（短，绝不会被 drv_log 的行缓冲截断），
+             * 地址与上下文交给 hw2c_diag_report_last() —— 它会拆成两行，
+             * 每行都在日志正文上限之内。合成一行会静默丢掉尾部字段。
+             */
+            log_error("previous reset: fault=0x%08lX — outputs were forced safe",
+                      (unsigned long)prev_fault);
+            hw2c_diag_report_last();
             /* The reason has been reported; keep the counter so a reset loop
              * stays visible, but drop the latch so it cannot be re-reported
              * as if it were new. */

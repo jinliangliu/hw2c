@@ -48,6 +48,20 @@
 #define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS() (0)  /* use SW timer if needed */
 #define portGET_RUN_TIME_COUNTER_VALUE()         (xTaskGetTickCount())
 
+/*
+ * 故障诊断（FR-15.7）：在**任务切换**的瞬间把切入的任务名缓存下来。
+ *
+ * 为什么要在切换时缓存、而不是等故障发生时再问内核：故障时刻往往正是内存
+ * 被踩坏的时刻，那时调 FreeRTOS API 读到的东西本身就不一定可信；而缓存是
+ * 一份普通 RAM 里的副本，读它不需要内核参与，也不会重入。
+ *
+ * 展开点在 tasks.c 的 vTaskSwitchContext / vTaskStartScheduler，那里
+ * pxCurrentTCB 已经指向即将运行的任务，所以 pcTaskGetName(NULL)（NULL =
+ * "当前任务"）取到的就是"切入的那个任务"。
+ */
+extern void hw2c_diag_task_switched_in(void);
+#define traceTASK_SWITCHED_IN()  hw2c_diag_task_switched_in()
+
 /* Co-routines */
 #define configUSE_CO_ROUTINES                   0
 #define configMAX_CO_ROUTINE_PRIORITIES         2
@@ -102,6 +116,9 @@ void vPortSuppressTicksAndSleep( uint32_t xExpectedIdleTime );
 #define INCLUDE_xTaskAbortDelay             0
 #define INCLUDE_xTaskGetHandle                 1
 #define INCLUDE_xTaskResumeFromISR          1
+/* 任务名查询（FR-15.7 的任务切换 hook 用）。pcTaskGetName() 本身在 FreeRTOS
+ * 里是无条件编译的，这里显式列出是为了让"本工程依赖它"这件事有据可查。 */
+#define INCLUDE_pcTaskGetName               1
 
 /* Normal assert */
 #define configASSERT( x ) if ((x) == 0) { taskDISABLE_INTERRUPTS(); for( ;; ); }

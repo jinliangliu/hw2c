@@ -16,17 +16,22 @@
 {% for p in pwm_peris %}
 #include "../src/drivers/drv_{{ p.name }}.c"
 {% endfor %}
+/* 快照实体在 hw2c_diag（FR-15.7）：hw2c_fault 只做失效安全动作，记录委托给它。 */
+#include "../src/hw2c_diag.c"
 #include "../src/hw2c_fault.c"
 
 /*
- * g_fault_record is file-static in the included hw2c_fault.c, so this test is
+ * g_diag_record is file-static in the included hw2c_diag.c, so this test is
  * part of the same translation unit and can reset the record for isolation.
  */
 static void fault_record_reset(void)
 {
-    g_fault_record.magic = 0U;
-    g_fault_record.code = HW2C_FAULT_NONE;
-    g_fault_record.reset_count = 0U;
+    hw2c_diag_record_t *rec = (hw2c_diag_record_t *)&g_diag_record;
+    rec->magic = 0U;
+    rec->code = HW2C_FAULT_NONE;
+    rec->reset_count = 0U;
+    rec->tag[0] = '\0';
+    rec->task[0] = '\0';
 }
 
 void setUp(void)

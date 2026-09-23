@@ -17,6 +17,9 @@
 #include "drv_{{ cli_name }}.h"      /* cli_set_rx_sink / cli_write_raw / cli_rx_sink_active */
 #include "drv_iwdg.h"
 #include "hw2c_fault.h"
+/* FOTA 是一条长流程：故障发生时"卡在哪个阶段"和故障点地址一样重要
+ * （FR-15.7）——"接收中跑飞"和"应用时跑飞"的处置完全不同。 */
+#include "hw2c_diag.h"
 {% if has_log %}
 #include "drv_log.h"                 /* log_error：应用失败的唯一线索，见 fota_apply_now() */
 {% endif %}
@@ -40,6 +43,20 @@
  * "为什么必须有这个变量"见头文件里类型定义上方的说明。 */
 static fota_state_t     g_state = FOTA_STATE_IDLE;
 static fota_transport_t g_transport = FOTA_TP_NONE;
+
+/*
+ * g_state 的**唯一**写入口。
+ *
+ * 为什么要收口：状态机有十几个写入点，而"当前阶段"是故障现场的一部分。
+ * 逐点手写 diag 登记迟早漏掉一个，漏掉的那个恰好就是出事的那条路径 ——
+ * 一次"看起来记了、其实没记"比从不记更糟。收口之后，"状态变了"与
+ * "阶段被登记"不可能不同时发生。
+ */
+static void fota_set_state(fota_state_t s)
+{
+    g_state = s;
+    hw2c_diag_enter("fota", (uint32_t)s);
+}
 
 /* 接收缓冲：装得下最长的一帧（DATA）。帧是增量解析的，所以缓冲与"帧"等长，
  * 与补丁大小无关 —— RAM 占用恒定。 */
@@ -498,7 +515,7 @@ static int fota_stage_restore(const fota_meta_t *rec)
 static int fota_set_offline_error(int code)
 {
     g_last_error = code;
-    g_state      = FOTA_STATE_ERROR;
+    fota_set_state(FOTA_STATE_ERROR);
     fota_rx_reset();
 
     /* ⚠️ 必须**同时交还 UART**。ERROR 是终态：不会再有 DATA/FINISH 能救回来，
@@ -698,7 +715,7 @@ int fota_session_open(const uint8_t *env_bytes, uint32_t record_size,
     g_stream_pos  = 0U;
     g_stream_skip = (origin == FOTA_STREAM_FROM_RECORD_START) ? g_staged_bytes : 0U;
 
-    g_state            = FOTA_STATE_RECEIVING;
+    fota_set_state(FOTA_STATE_RECEIVING);
     g_apply_progress   = 0U;
     g_last_error       = FOTA_E_NONE;
     g_last_activity_ms = HAL_GetTick();
@@ -803,7 +820,7 @@ int fota_session_finish(uint32_t expected_crc32)
      * 有一条待应用的补丁、而暂存区其实不完整"的状态。 */
     (void)fota_meta_append(FOTA_META_STATE_READY, g_slot, g_staging_used);
 
-    g_state           = FOTA_STATE_READY;
+    fota_set_state(FOTA_STATE_READY);
     g_apply_requested = 1U;               /* 交给 fota_process：不在接收路径里擦 Flash */
     g_apply_progress  = 0U;
     fota_flash_lock();
@@ -822,7 +839,7 @@ void fota_session_abort(void)
     g_stream_skip = 0U;
     /* 只把状态退回 IDLE：**不清元数据、不擦暂存区**，所以主机可以重发续传。 */
     if (g_state == FOTA_STATE_RECEIVING) {
-        g_state = FOTA_STATE_IDLE;
+        fota_set_state(FOTA_STATE_IDLE);
     }
 }
 
@@ -1058,7 +1075,7 @@ static void fota_apply_now(void)
     int derr = 0;
     int rc;
 
-    g_state          = FOTA_STATE_APPLYING;
+    fota_set_state(FOTA_STATE_APPLYING);
     g_apply_progress = 0U;
     (void)fota_meta_append(FOTA_META_STATE_APPLYING, g_slot,
                            g_staging_used);
@@ -1086,7 +1103,7 @@ static void fota_apply_now(void)
 
     if (rc != FOTA_DELTA_OK) {
         g_last_error = (derr != 0) ? derr : rc;
-        g_state      = FOTA_STATE_ERROR;
+        fota_set_state(FOTA_STATE_ERROR);
 {% if has_log %}
         /* 这条日志是**唯一**的失败线索，别删。
          *
@@ -1122,7 +1139,7 @@ static void fota_apply_now(void)
     }
 
     g_apply_progress = 100U;
-    g_state          = FOTA_STATE_DONE;
+    fota_set_state(FOTA_STATE_DONE);
     /* 成功也要清 last_error：它是"**上一次**出错的原因"，语义是
      * "一直报到下一次成功"（见 fota_receive_begin 的注释）。
      * 真机上这里紧接着就 `NVIC_SystemReset()`，重启后 `fota_init` 本来也会
@@ -1172,7 +1189,7 @@ void fota_init(void)
          * ⚠️ 关键在"不可信时**不解释**它"：一条看起来处于 APPLYING 的记录
          * 若被当真，设备刚上电就会开始擦 Flash。`fota_meta_load` 只认
          * magic + 非零 seq + CRC16 三者的合取，就是为此。 */
-        g_state = FOTA_STATE_IDLE;
+        fota_set_state(FOTA_STATE_IDLE);
         return;
     }
 
@@ -1180,7 +1197,7 @@ void fota_init(void)
     case FOTA_META_STATE_RECEIVING:
         /* 上次没收完。暂存区可能还有内容，等主机重发 START 时按身份决定续传；
          * 这里不主动恢复任何内存状态（g_env 等都要从暂存区重建）。 */
-        g_state = FOTA_STATE_IDLE;
+        fota_set_state(FOTA_STATE_IDLE);
         break;
     case FOTA_META_STATE_READY:
         /* 收齐了但还没应用（掉电在应用之前）。**恢复成 READY**，而不是退回
@@ -1200,10 +1217,10 @@ void fota_init(void)
          * 改写成 ERROR 同时也解开了"拒绝进入接收"：ERROR 不是终局，
          * `fota recv` 仍然可用（见 fota_receive_begin 的注释）。 */
         if (fota_stage_restore(&rec) == 0) {
-            g_state        = FOTA_STATE_READY;
+            fota_set_state(FOTA_STATE_READY);
             g_staged_bytes = rec.staged;
         } else {
-            g_state      = FOTA_STATE_IDLE;
+            fota_set_state(FOTA_STATE_IDLE);
             g_last_error = FOTA_E_STAGING_LOST;
             (void)fota_meta_append(FOTA_META_STATE_ERROR, rec.slot, rec.staged);
         }
@@ -1228,19 +1245,19 @@ void fota_init(void)
          * 操作员再也看不到"上一次升级失败"（`fota status` 只会显示 IDLE）。
          */
         if (rec.slot == fota_active_slot()) {
-            g_state = FOTA_STATE_DONE;
+            fota_set_state(FOTA_STATE_DONE);
             (void)fota_meta_consume();
         } else {
-            g_state      = FOTA_STATE_ERROR;
+            fota_set_state(FOTA_STATE_ERROR);
             g_last_error = FOTA_E_ROLLBACK;
             (void)fota_meta_append(FOTA_META_STATE_ERROR, rec.slot, rec.staged);
         }
         break;
     case FOTA_META_STATE_ERROR:
-        g_state = FOTA_STATE_ERROR;
+        fota_set_state(FOTA_STATE_ERROR);
         break;
     default:
-        g_state = FOTA_STATE_IDLE;
+        fota_set_state(FOTA_STATE_IDLE);
         break;
     }
 }
@@ -1342,7 +1359,7 @@ int fota_receive_begin(char *msg, uint32_t msg_len)
     g_stream_skip      = 0U;
     g_last_activity_ms = HAL_GetTick();
     g_last_error       = FOTA_E_NONE;
-    g_state            = FOTA_STATE_RECEIVING;
+    fota_set_state(FOTA_STATE_RECEIVING);
     /* ⚠️ 这里**不写元数据、不擦暂存区**：START 帧到了才知道这次传的是哪条
      * 补丁，那时才能判断是"续传"还是"新的一次"。提前清掉等于自断续传。 */
     cli_set_rx_sink(fota_rx_bytes);
@@ -1384,7 +1401,7 @@ int fota_erase_target(void)
     /* 记一条"没有待启动槽"。日志式存储没有"删除"这个动作 ——
      * 追加一条新状态就是删除。 */
     (void)fota_meta_consume();
-    g_state          = FOTA_STATE_IDLE;
+    fota_set_state(FOTA_STATE_IDLE);
     g_staged_bytes   = 0U;
     g_staging_used   = 0U;
     g_staging_total  = 0U;

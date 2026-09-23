@@ -98,10 +98,17 @@ power sleep                # 立即进入该模式（RTC/串口/按键均可唤�
 | `tasks` | 列出 FreeRTOS 任务 |
 | `sysinfo` | 系统信息（温度/堆/Flash） |
 | `reset` | 软件复位 MCU |
+| `diag last` | 打印上次异常的诊断记录（故障码 / PC / LR / PSR / 任务 / 模块 tag） |
+| `diag crash` | 故意触发一次 HardFault（验证诊断链路用） |
 | `gpio` | 读写 GPIO 引脚 |
 | `led on/off/toggle` | LED 控制 |
 | `rtc` | RTC 时间操作 |
-| `param get/set` | 运行时参数读写 |
+| `telemetry on/off` | 遥测快照日志开关 |
+| `power sleep/stop` | 低功耗模式验证 |
+| `sysinfo` | 系统信息（温度/堆/Flash） |
+
+> 上表由 `examples/base` 生成的 `src/drivers/drv_shell.c` 命令表为准（13 条）。
+> `param get/set` 目前**没有**实现（FR-15.5 仍是待办，参数只有 C API）。
 
 > 更多外设示例正在重构适配六层 YAML 架构，后续逐步恢复。当前示例工程为 `examples/base`。
 

@@ -1,0 +1,73 @@
+### +0.0s listening on COM5 @ 115200
+### +0.0s pyocd reset
+### +1.8s pyocd rc=0 Resetting target
+### +22.0s !! 速率 25373 B/s 超过 11520 B/s 物理上限 —— 主机侧冲刷，本段不可信
+### +22.0s --- 开机横幅窗口结束 ---
+### +22.0s send: diag last
+### +25.3s send: diag crash
+### +50.6s --- diag crash 之后的重启窗口结束 ---
+### +50.6s send: diag last
+### +53.9s send: reset
+### +79.2s --- reset 之后的重启窗口结束 ---
+### +79.2s send: diag last
+
+===== RAW =====
+[K[K[K[K[K[K[K[K[K
+diag: no fault recorded
+> [K[K[K[K[K[K[K[K[K[K
+crashing on purpose (store to an unmapped address)...
+[2026-09-17 10:00:19.638] [ERR] diag: fault=4 pc=0x0800AF02 lr=0x08011E05 psr=0x01000000 task=cli tag=cli:diag detail=0 count
+	    _/    _/  _/          _/    _/_/      _/_/_/
+	   _/    _/  _/          _/  _/    _/  _/
+	  _/_/_/_/  _/    _/    _/      _/    _/
+	 _/    _/    _/  _/  _/      _/      _/
+	_/    _/      _/  _/      _/_/_/_/    _/_/_/
+
+[2000-00-00 00:00:00.999] [INF] mhde_mainboard v1.0.0 â Hardware2Code | STM32G0B1VET6 @ 16 MHz
+[2000-00-00 00:00:00.999] [INF] Firmware v1.0.0 (0x010000) â image @ 0x08002000
+[2000-00-00 00:00:00.999] [ERR] previous reset: diag: fault=4 pc=0x0800AF02 lr=0x08011E05 psr=0x01000000 task=cli tag=cli:dia
+[2000-00-00 00:00:00.999] [INF] MX_GPIO_Init() OK
+[2000-00-00 00:00:00.999] [INF] EventMgr_Init() OK
+[2000-00-00 00:00:00.999] [INF] statemachine_init() OK
+[2000-00-00 00:00:00.999] [INF] RTC clock source: LSE (32.768kHz)
+[2026-09-17 10:00:00.002] [INF] temp_sensor_init() OK
+[2026-09-17 10:00:00.004] [INF] RTC_Init() OK
+[2026-09-17 10:00:00.006] [INF] FOTA subsystem initialized
+[2026-09-17 10:00:00.009] [INF] component_init_all: 3/3 OK
+[2026-09-17 10:00:00.011] [INF] component_bus initialized (4 topics)
+[2026-09-17 10:00:00.013] [INF] param_registry initialized (10 params)
+[2026-09-17 10:00:00.016] [INF] PowerMgr: init, default=STOP1
+[2026-09-17 10:00:00.018] [INF] power_mgr initialized (default: STOP1)
+[2026-09-17 10:00:00.060] [INF] IWDG armed (timeout 5000 ms)
+[2026-09-17 10:00:00.116] [INF] System ready â 3 components, 18504 B heap free, starting scheduler
+> [K[K[K[K[K[K[K[K[K
+diag: fault=0 pc=0x0800AF02 lr=0x08011E05 psr=0x01000000 task=cli tag=cli:diag detail=0 count=1
+> [K[K[K[K[K
+Resetting...
+[2026-09-17 10:00:24.561] [ERR] diag: fault=9 pc=0x00000000 lr=0x0800AE85 psr=0x00000000 task=cli tag=cli:reset detail=0 coun
+	    _/    _/  _/          _/    _/_/      _/_/_/
+	   _/    _/  _/          _/  _/    _/  _/
+	  _/_/_/_/  _/    _/    _/      _/    _/
+	 _/    _/    _/  _/  _/      _/      _/
+	_/    _/      _/  _/      _/_/_/_/    _/_/_/
+
+[2000-00-00 00:00:00.999] [INF] mhde_mainboard v1.0.0 â Hardware2Code | STM32G0B1VET6 @ 16 MHz
+[2000-00-00 00:00:00.999] [INF] Firmware v1.0.0 (0x010000) â image @ 0x08002000
+[2000-00-00 00:00:00.999] [ERR] previous reset: diag: fault=9 pc=0x00000000 lr=0x0800AE85 psr=0x00000000 task=cli tag=cli:res
+[2000-00-00 00:00:00.999] [INF] MX_GPIO_Init() OK
+[2000-00-00 00:00:00.999] [INF] EventMgr_Init() OK
+[2000-00-00 00:00:00.999] [INF] statemachine_init() OK
+[2000-00-00 00:00:00.999] [INF] RTC clock source: LSE (32.768kHz)
+[2026-09-17 10:00:00.002] [INF] temp_sensor_init() OK
+[2026-09-17 10:00:00.004] [INF] RTC_Init() OK
+[2026-09-17 10:00:00.006] [INF] FOTA subsystem initialized
+[2026-09-17 10:00:00.009] [INF] component_init_all: 3/3 OK
+[2026-09-17 10:00:00.011] [INF] component_bus initialized (4 topics)
+[2026-09-17 10:00:00.013] [INF] param_registry initialized (10 params)
+[2026-09-17 10:00:00.016] [INF] PowerMgr: init, default=STOP1
+[2026-09-17 10:00:00.018] [INF] power_mgr initialized (default: STOP1)
+[2026-09-17 10:00:00.060] [INF] IWDG armed (timeout 5000 ms)
+[2026-09-17 10:00:00.116] [INF] System ready â 3 components, 18504 B heap free, starting scheduler
+> [K[K[K[K[K[K[K[K[K
+diag: fault=0 pc=0x00000000 lr=0x0800AE85 psr=0x00000000 task=cli tag=cli:reset detail=0 count=2
+> 

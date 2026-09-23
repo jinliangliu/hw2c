@@ -186,6 +186,11 @@ def render_templates(env: Environment, context: dict, output_dir: str,
         "src/sleep.c.j2": os.path.join(output_dir, "src", "sleep.c"),
         "src/hw2c_fault.h.j2": os.path.join(output_dir, "src", "hw2c_fault.h"),
         "src/hw2c_fault.c.j2": os.path.join(output_dir, "src", "hw2c_fault.c"),
+        # 异常诊断（FR-15.7）。与 hw2c_fault 成对出现：凡是编译 hw2c_fault.c
+        # 的地方都必须同时编译 hw2c_diag.c，护栏见
+        # generator/tests/test_diag_guardrails.py。
+        "src/hw2c_diag.h.j2": os.path.join(output_dir, "src", "hw2c_diag.h"),
+        "src/hw2c_diag.c.j2": os.path.join(output_dir, "src", "hw2c_diag.c"),
         "src/stm32g0xx_it.c.j2": os.path.join(output_dir, "src", "stm32g0xx_it.c"),
         "config/FreeRTOSConfig.h.j2": os.path.join(output_dir, "config", "FreeRTOSConfig.h"),
         "config/stm32g0xx_hal_conf.h.j2": os.path.join(output_dir, "config", "stm32g0xx_hal_conf.h"),
@@ -538,6 +543,9 @@ def render_templates(env: Environment, context: dict, output_dir: str,
         # hw2c_fault.c is always generated, so its fail-safe contract test is
         # always generated too (see P1-3 of the 2026-09-15 code review).
         "test/test_hw2c_fault.c.j2": os.path.join(test_dir, "test_hw2c_fault.c"),
+        # 异常诊断快照（FR-15.7）。hw2c_fault.c 现在把记录委托给 hw2c_diag.c，
+        # 所以这条测试必须与 fault 的那条同时存在。
+        "test/test_hw2c_diag.c.j2": os.path.join(test_dir, "test_hw2c_diag.c"),
     }
 
     # test_iwdg exercises the driver file named after the declared peripheral,

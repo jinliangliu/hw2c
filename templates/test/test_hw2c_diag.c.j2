@@ -1,0 +1,320 @@
+{#
+    test_hw2c_diag.c.j2 - host tests for the fault-diagnostics snapshot (FR-15.7)
+
+    这些用例盯住的是"故障现场能不能被复原"这件事本身：
+      · 记录是**无条件**的 —— 日志打不出来也必须留下证据（否则下次开机
+        什么都看不到）；
+      · pc / lr 取不到时照原样存 0 并打出来，不许省略字段；
+      · tag / 任务名随故障一起存下来，于是"当时在跑什么"不用猜；
+      · 只清原因、不清次数，复位循环不会被藏起来。
+
+    注意：本文件在主机侧编译，没有 FreeRTOS，所以"任务切换 hook 自动取名"
+    这一条不在这里覆盖 —— 它由渲染级护栏
+    （generator/tests/test_diag_guardrails.py）盯住 FreeRTOSConfig.h 的
+    traceTASK_SWITCHED_IN()，并由真机验证兜底。
+#}
+#include "unity.h"
+#include "mock_hal.h"
+#include <string.h>
+
+#include "../src/hw2c_diag.c"
+#include "hw2c_fault.h"
+
+static void diag_record_reset(void)
+{
+    hw2c_diag_record_t *rec = (hw2c_diag_record_t *)&g_diag_record;
+    rec->magic = 0U;
+    rec->code = 0U;
+    rec->reset_count = 0U;
+    rec->tag[0] = '\0';
+    rec->task[0] = '\0';
+    g_tag = NULL;
+    g_detail = 0U;
+    g_tag_prev = NULL;
+    g_detail_prev = 0U;
+    g_task[0] = '\0';
+}
+
+void setUp(void)
+{
+    diag_record_reset();
+}
+
+void tearDown(void)
+{
+}
+
+/* A fresh device must not report a fault, and the format must say so. */
+void test_diag_initially_empty(void)
+{
+    char line[HW2C_DIAG_LINE_LEN];
+
+    TEST_ASSERT_EQUAL_UINT32(0U, hw2c_diag_last_code());
+    TEST_ASSERT_EQUAL_UINT32(0U, hw2c_diag_reset_count());
+    (void)hw2c_diag_format_last(line, sizeof(line));
+    TEST_ASSERT_NOT_NULL(strstr(line, "no fault recorded"));
+}
+
+/* The whole point: the addresses survive in the record. */
+void test_diag_stores_fault_addresses(void)
+{
+    hw2c_diag_on_fault(HW2C_FAULT_HARDFAULT, 0x08005DE4UL, 0x08001234UL, 0x21000000UL);
+
+    TEST_ASSERT_EQUAL_UINT32(HW2C_FAULT_HARDFAULT, hw2c_diag_last_code());
+    TEST_ASSERT_EQUAL_UINT32(0x08005DE4UL, hw2c_diag_last_pc());
+    TEST_ASSERT_EQUAL_UINT32(0x08001234UL, hw2c_diag_last_lr());
+    TEST_ASSERT_EQUAL_UINT32(0x21000000UL, hw2c_diag_last_psr());
+    TEST_ASSERT_EQUAL_UINT32(1U, hw2c_diag_reset_count());
+}
+
+/*
+ * 不得有静默出口：地址取不到（异常路径之外）时把 0 原样存下来并打出来，
+ * 而不是省略字段或改打"未知" —— 省略之后没人能区分"取不到"和"没记录"。
+ */
+void test_diag_unknown_address_is_recorded_as_zero_not_omitted(void)
+{
+    char line[HW2C_DIAG_LINE_LEN];
+
+    hw2c_diag_on_fault(HW2C_FAULT_PERIPH_INIT, 0U, 0U, 0U);
+    (void)hw2c_diag_format_last(line, sizeof(line));
+
+    TEST_ASSERT_EQUAL_UINT32(0U, hw2c_diag_last_pc());
+    TEST_ASSERT_EQUAL_UINT32(0U, hw2c_diag_last_lr());
+    TEST_ASSERT_NOT_NULL(strstr(line, "pc=0x00000000"));
+    TEST_ASSERT_NOT_NULL(strstr(line, "lr=0x00000000"));
+}
+
+/* The tag says which module/interface was running. */
+void test_diag_records_current_tag(void)
+{
+    hw2c_diag_enter("cli:reset", 0U);
+    hw2c_diag_on_fault(HW2C_FAULT_SOFT_RESET, 0U, 0x08001234UL, 0U);
+
+    TEST_ASSERT_EQUAL_STRING("cli:reset", hw2c_diag_last_tag());
+}
+
+/* detail carries the module's own number (event id / FOTA state / arg index). */
+void test_diag_records_tag_detail(void)
+{
+    hw2c_diag_enter("event", 42U);
+    hw2c_diag_on_fault(HW2C_FAULT_HARDFAULT, 0x08000000UL, 0U, 0U);
+
+    TEST_ASSERT_EQUAL_STRING("event", hw2c_diag_last_tag());
+    TEST_ASSERT_EQUAL_UINT32(42U, hw2c_diag_last_detail());
+}
+
+/*
+ * 退出一层必须回到上一层的作用域（CLI 命令 → 事件派发 这类两层嵌套是最深
+ * 的常态）。不回滚的话，第一个命令的 tag 会一直挂着，故障记录会指向错误的
+ * 模块 —— 一个"看起来有证据但指错了地方"的读数。
+ */
+void test_diag_leave_restores_caller_scope(void)
+{
+    hw2c_diag_enter("event", 7U);
+    hw2c_diag_enter("cli:fota", 0U);
+    hw2c_diag_leave();
+    hw2c_diag_on_fault(HW2C_FAULT_HARDFAULT, 0U, 0U, 0U);
+
+    TEST_ASSERT_EQUAL_STRING("event", hw2c_diag_last_tag());
+    TEST_ASSERT_EQUAL_UINT32(7U, hw2c_diag_last_detail());
+}
+
+/* The task name is cached by the switch hook and copied into the record. */
+void test_diag_records_cached_task_name(void)
+{
+    hw2c_diag_task_note("cli");
+    hw2c_diag_on_fault(HW2C_FAULT_HARDFAULT, 0U, 0U, 0U);
+
+    TEST_ASSERT_EQUAL_STRING("cli", hw2c_diag_last_task());
+}
+
+/* No task has been noted yet: say so, do not print a dangling pointer. */
+void test_diag_missing_task_is_not_a_dangling_string(void)
+{
+    hw2c_diag_on_fault(HW2C_FAULT_HARDFAULT, 0U, 0U, 0U);
+
+    TEST_ASSERT_EQUAL_STRING("<none>", hw2c_diag_last_task());
+}
+
+/*
+ * hw2c_diag_note() 的调用者地址由它自己取，所以调用点不用传任何东西 ——
+ * 这里断言它确实取到了一个**非 0** 的地址（本测试函数里的某条指令）。
+ */
+void test_diag_note_captures_caller_address(void)
+{
+    hw2c_diag_enter("cli:reset", 0U);
+    hw2c_diag_note(HW2C_FAULT_SOFT_RESET);
+
+    TEST_ASSERT_EQUAL_UINT32(HW2C_FAULT_SOFT_RESET, hw2c_diag_last_code());
+    TEST_ASSERT_NOT_EQUAL_UINT32(0U, hw2c_diag_last_lr());
+}
+
+/* Repeated faults keep counting — that is what exposes a reset loop. */
+void test_diag_counts_occurrences(void)
+{
+    hw2c_diag_on_fault(HW2C_FAULT_SCHEDULER, 0U, 0U, 0U);
+    hw2c_diag_on_fault(HW2C_FAULT_SCHEDULER, 0U, 0U, 0U);
+    hw2c_diag_on_fault(HW2C_FAULT_SCHEDULER, 0U, 0U, 0U);
+
+    TEST_ASSERT_EQUAL_UINT32(3U, hw2c_diag_reset_count());
+}
+
+/* Acknowledging the reason must not erase the reset-loop evidence. */
+void test_diag_clear_keeps_counter(void)
+{
+    hw2c_diag_on_fault(HW2C_FAULT_NMI, 0U, 0U, 0U);
+    hw2c_diag_clear();
+
+    TEST_ASSERT_EQUAL_UINT32(0U, hw2c_diag_last_code());
+    TEST_ASSERT_EQUAL_UINT32(1U, hw2c_diag_reset_count());
+}
+
+/* The log line must carry every field, so nothing has to be re-derived. */
+void test_diag_format_line_has_every_field(void)
+{
+    char line[HW2C_DIAG_LINE_LEN];
+
+    hw2c_diag_task_note("cli");
+    hw2c_diag_enter("fota", 3U);
+    hw2c_diag_on_fault(4U, 0x08005DE4UL, 0x08001234UL, 0x21000000UL);
+    (void)hw2c_diag_format_last(line, sizeof(line));
+
+    TEST_ASSERT_NOT_NULL(strstr(line, "fault=4"));
+    TEST_ASSERT_NOT_NULL(strstr(line, "pc=0x08005DE4"));
+    TEST_ASSERT_NOT_NULL(strstr(line, "lr=0x08001234"));
+    TEST_ASSERT_NOT_NULL(strstr(line, "psr=0x21000000"));
+    TEST_ASSERT_NOT_NULL(strstr(line, "task=cli"));
+    TEST_ASSERT_NOT_NULL(strstr(line, "tag=fota"));
+    TEST_ASSERT_NOT_NULL(strstr(line, "count=1"));
+}
+
+/*
+ * 开机上报会在故障行前面加 "previous reset: "，这一条也必须算进预算。
+ * 别嫌它短：正文上限只有 94 B，漏算它就会在真机上被静默截断。
+ */
+#define DIAG_PREV_PREFIX_LEN   16U   /* strlen("previous reset: ") */
+
+/*
+ * 拆行后每行都必须在日志正文预算（HW2C_DIAG_LOG_LINE_LEN）之内。
+ *
+ * 缓冲刻意开成 HW2C_DIAG_LINE_LEN(160) 而不是预算本身：用 94 B 的缓冲去测
+ * "会不会超过 94 B"，超了也会被 snprintf 截成 93 而**断言照样通过** —— 那
+ * 是一条恒真的判据，等于没写。缓冲开大，返回值才是真实长度。
+ */
+void test_diag_log_lines_fit_the_log_body_budget(void)
+{
+    hw2c_diag_record_t *rec = (hw2c_diag_record_t *)&g_diag_record;
+    char tag[HW2C_DIAG_TAG_LEN];
+    char task[HW2C_DIAG_TASK_LEN];
+    char fault_line[HW2C_DIAG_LINE_LEN];
+    char ctx_line[HW2C_DIAG_LINE_LEN];
+    size_t n_fault;
+    size_t n_ctx;
+
+    memset(tag,  'T', sizeof(tag)  - 1U);
+    tag[sizeof(tag) - 1U] = '\0';
+    memset(task, 'k', sizeof(task) - 1U);
+    task[sizeof(task) - 1U] = '\0';
+
+    hw2c_diag_task_note(task);
+    hw2c_diag_enter(tag, 0xFFFFFFFFUL);
+    hw2c_diag_on_fault(0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL, 0xFFFFFFFFUL);
+    /* 次数也推到上界：格式化器不许靠"现实里不会那么长"来保证不截断。 */
+    rec->reset_count = 0xFFFFFFFFUL;
+
+    n_fault = hw2c_diag_format_fault(fault_line, sizeof(fault_line));
+    n_ctx   = hw2c_diag_format_ctx(ctx_line, sizeof(ctx_line));
+
+    TEST_ASSERT_TRUE(n_fault + DIAG_PREV_PREFIX_LEN <= (size_t)HW2C_DIAG_LOG_LINE_LEN);
+    TEST_ASSERT_TRUE(n_ctx <= (size_t)HW2C_DIAG_LOG_LINE_LEN);
+}
+
+/* 拆成两行不许丢字段：两行合起来必须仍然覆盖全部诊断信息。 */
+void test_diag_log_lines_together_carry_every_field(void)
+{
+    char fault_line[HW2C_DIAG_LINE_LEN];
+    char ctx_line[HW2C_DIAG_LINE_LEN];
+
+    hw2c_diag_task_note("cli");
+    hw2c_diag_enter("fota", 3U);
+    hw2c_diag_on_fault(4U, 0x08005DE4UL, 0x08001234UL, 0x21000000UL);
+    (void)hw2c_diag_format_fault(fault_line, sizeof(fault_line));
+    (void)hw2c_diag_format_ctx(ctx_line, sizeof(ctx_line));
+
+    TEST_ASSERT_NOT_NULL(strstr(fault_line, "fault=4"));
+    TEST_ASSERT_NOT_NULL(strstr(fault_line, "pc=0x08005DE4"));
+    TEST_ASSERT_NOT_NULL(strstr(fault_line, "lr=0x08001234"));
+    TEST_ASSERT_NOT_NULL(strstr(fault_line, "psr=0x21000000"));
+    TEST_ASSERT_NOT_NULL(strstr(ctx_line, "task=cli"));
+    TEST_ASSERT_NOT_NULL(strstr(ctx_line, "tag=fota"));
+    TEST_ASSERT_NOT_NULL(strstr(ctx_line, "detail=3"));
+    TEST_ASSERT_NOT_NULL(strstr(ctx_line, "count=1"));
+}
+
+/* 没有记录时两条窄行也要给出同样的"没有记录"，不许吐半截空串。 */
+void test_diag_log_lines_when_empty_say_so(void)
+{
+    char fault_line[HW2C_DIAG_LOG_LINE_LEN];
+    char ctx_line[HW2C_DIAG_LOG_LINE_LEN];
+
+    (void)hw2c_diag_format_fault(fault_line, sizeof(fault_line));
+    (void)hw2c_diag_format_ctx(ctx_line, sizeof(ctx_line));
+
+    TEST_ASSERT_NOT_NULL(strstr(fault_line, "no fault recorded"));
+    TEST_ASSERT_NOT_NULL(strstr(ctx_line, "no fault recorded"));
+    TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)hw2c_diag_format_fault(fault_line, 0U));
+    TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)hw2c_diag_format_ctx(ctx_line, 0U));
+}
+
+/* A short buffer must truncate safely instead of overflowing. */
+void test_diag_format_truncates_instead_of_overflowing(void)
+{
+    char small[8];
+    size_t n;
+
+    hw2c_diag_on_fault(4U, 0x08005DE4UL, 0x08001234UL, 0U);
+    n = hw2c_diag_format_last(small, sizeof(small));
+
+    TEST_ASSERT_TRUE(n < sizeof(small));
+    TEST_ASSERT_EQUAL_UINT8((uint8_t)'\0', (uint8_t)small[n]);
+    TEST_ASSERT_EQUAL_UINT32(0U, (uint32_t)hw2c_diag_format_last(small, 0U));
+}
+
+/*
+ * 日志打不出来时记录仍在（这一条在主机侧就是"emit 被跳过"的构建形态）。
+ * 真机上对应"故障发生在 log_init() 之前"：那时往还没 lwrb_init() 的环形
+ * 缓冲里写字节只会二次 HardFault，所以日志被跳过，但 .noinit 必须留下来。
+ */
+void test_diag_records_even_when_logging_is_unavailable(void)
+{
+    hw2c_diag_task_note("default");
+    hw2c_diag_enter("clock", 0U);
+    hw2c_diag_on_fault(HW2C_FAULT_CLOCK_INIT, 0U, 0x08000100UL, 0U);
+
+    TEST_ASSERT_EQUAL_UINT32(HW2C_FAULT_CLOCK_INIT, hw2c_diag_last_code());
+    TEST_ASSERT_EQUAL_UINT32(0x08000100UL, hw2c_diag_last_lr());
+    TEST_ASSERT_EQUAL_STRING("clock", hw2c_diag_last_tag());
+}
+
+int main(void)
+{
+    UNITY_BEGIN();
+    RUN_TEST(test_diag_initially_empty);
+    RUN_TEST(test_diag_stores_fault_addresses);
+    RUN_TEST(test_diag_unknown_address_is_recorded_as_zero_not_omitted);
+    RUN_TEST(test_diag_records_current_tag);
+    RUN_TEST(test_diag_records_tag_detail);
+    RUN_TEST(test_diag_leave_restores_caller_scope);
+    RUN_TEST(test_diag_records_cached_task_name);
+    RUN_TEST(test_diag_missing_task_is_not_a_dangling_string);
+    RUN_TEST(test_diag_note_captures_caller_address);
+    RUN_TEST(test_diag_counts_occurrences);
+    RUN_TEST(test_diag_clear_keeps_counter);
+    RUN_TEST(test_diag_format_line_has_every_field);
+    RUN_TEST(test_diag_log_lines_fit_the_log_body_budget);
+    RUN_TEST(test_diag_log_lines_together_carry_every_field);
+    RUN_TEST(test_diag_log_lines_when_empty_say_so);
+    RUN_TEST(test_diag_format_truncates_instead_of_overflowing);
+    RUN_TEST(test_diag_records_even_when_logging_is_unavailable);
+    return UNITY_END();
+}

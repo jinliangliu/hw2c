@@ -1,0 +1,374 @@
+{#
+    hw2c_diag.c.j2 - 异常诊断快照（FR-15.7，见 hw2c_diag.h）
+
+    Context used: `has_log`（决定故障时能不能打日志）。
+#}
+#include <string.h>
+#include <stdio.h>
+
+#include "hw2c_diag.h"
+
+{% if has_log %}
+#include "drv_log.h"
+{% endif %}
+
+#ifndef TEST
+#include "FreeRTOS.h"
+#include "task.h"
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Reset-surviving snapshot
+ *
+ * 与 hw2c_fault.c 原来的 .noinit 记录同理：段不被启动代码初始化，所以内容
+ * 能活过 NVIC_SystemReset() 与看门狗复位。上电时 SRAM 内容未定义，因此必须
+ * 先校验 magic 才相信其余字段。
+ * ------------------------------------------------------------------------ */
+#if defined(__GNUC__) && !defined(TEST)
+#define HW2C_DIAG_NOINIT __attribute__((section(".noinit")))
+#else
+#define HW2C_DIAG_NOINIT
+#endif
+
+#define HW2C_DIAG_MAGIC   0x48444731UL   /* "HDG1" */
+
+#define HW2C_DIAG_NONE_TAG   "<none>"
+#define HW2C_DIAG_NONE_TASK  "<none>"
+
+typedef struct {
+    uint32_t magic;         /* HW2C_DIAG_MAGIC when the record is valid      */
+    uint32_t code;          /* last HW2C_FAULT_* code                         */
+    uint32_t pc;            /* 故障点地址（0 = 未知）                          */
+    uint32_t lr;            /* 返回地址（0 = 未知）                            */
+    uint32_t psr;           /* 异常栈帧 xPSR（非异常路径为 0）                 */
+    uint32_t detail;        /* tag 自带的编号                                  */
+    uint32_t reset_count;   /* 连续故障次数                                    */
+    char     task[HW2C_DIAG_TASK_LEN];
+    char     tag[HW2C_DIAG_TAG_LEN];
+} hw2c_diag_record_t;
+
+static volatile hw2c_diag_record_t g_diag_record HW2C_DIAG_NOINIT;
+
+/* ---------------------------------------------------------------------------
+ * Current scope
+ *
+ * 只保存指针，不复制：tag 契约要求调用方传静态存储期的字符串，故障瞬间需要
+ * 的是"快"和"绝不分配/绝不调库"。两个槽 = 当前作用域 + 它的上一层，退出时
+ * 回滚一层就够了（CLI 命令 → 事件派发 这类两层嵌套是最深的常态）。
+ *
+ * 多任务/ISR 并发写是可能的（诊断不是控制路径），这里接受"最后写者生效"，
+ * 不做关中断保护 —— 关中断会改变时序，而时序恰恰是定位故障最需要的东西。
+ * ------------------------------------------------------------------------ */
+static const char *g_tag;
+static uint32_t    g_detail;
+static const char *g_tag_prev;
+static uint32_t    g_detail_prev;
+static char        g_task[HW2C_DIAG_TASK_LEN];
+
+static hw2c_diag_record_t *diag_rec(void)
+{
+    /* The attribute keeps the object out of .bss; the cast only removes the
+     * volatile qualifier so the fields can be written field by field. */
+    return (hw2c_diag_record_t *)&g_diag_record;
+}
+
+/*
+ * 手写的定长复制：不用 strncpy（MISRA 禁用，且它的"不足则补 '\0'"语义在
+ * 这里既不需要也不直观），并保证结尾一定有 '\0'。
+ *
+ * fallback 不是装饰：src 为 NULL **或空串** 时一律写 fallback。"没有记到"
+ * 和"记到了一个空名字"在读日志的人眼里没有区别，都会让人以为故障发生在
+ * 一个叫 "" 的任务里 —— 所以两者都必须打出 '<none>'（FR-15.7 的
+ * "不得有静默出口"落在字符串字段上就是这个要求）。
+ */
+static void diag_copy(char *dst, size_t dst_len, const char *src, const char *fallback)
+{
+    size_t i;
+
+    if (dst_len == 0U) {
+        return;
+    }
+    if ((src == NULL) || (src[0] == '\0')) {
+        src = fallback;
+    }
+    for (i = 0U; (i + 1U) < dst_len; i++) {
+        char c = src[i];
+        dst[i] = c;
+        if (c == '\0') {
+            return;
+        }
+    }
+    dst[dst_len - 1U] = '\0';
+}
+
+/* ---------------------------------------------------------------------------
+ * Scope / task tracking
+ * ------------------------------------------------------------------------ */
+void hw2c_diag_enter(const char *tag, uint32_t detail)
+{
+    g_tag_prev    = g_tag;
+    g_detail_prev = g_detail;
+    g_tag         = tag;
+    g_detail      = detail;
+}
+
+void hw2c_diag_leave(void)
+{
+    g_tag    = g_tag_prev;
+    g_detail = g_detail_prev;
+    g_tag_prev    = NULL;
+    g_detail_prev = 0U;
+}
+
+void hw2c_diag_task_note(const char *name)
+{
+    diag_copy(g_task, sizeof(g_task), name, HW2C_DIAG_NONE_TASK);
+}
+
+#ifndef TEST
+void hw2c_diag_task_switched_in(void)
+{
+    /* pcTaskGetName(NULL) = 取"当前任务"的名字。在 traceTASK_SWITCHED_IN()
+     * 的展开点（tasks.c 的 vTaskSwitchContext）pxCurrentTCB 已经指向即将运行
+     * 的任务，所以这就是"切入的那个任务"。 */
+    hw2c_diag_task_note(pcTaskGetName(NULL));
+}
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Record / report
+ * ------------------------------------------------------------------------ */
+static void diag_store(uint32_t code, uint32_t pc, uint32_t lr, uint32_t psr)
+{
+    hw2c_diag_record_t *rec = diag_rec();
+
+    if (rec->magic != HW2C_DIAG_MAGIC) {
+        rec->magic       = HW2C_DIAG_MAGIC;
+        rec->reset_count = 0U;
+    }
+    rec->code   = code;
+    rec->pc     = pc;
+    rec->lr     = lr;
+    rec->psr    = psr;
+    rec->detail = g_detail;
+    diag_copy(rec->tag,  sizeof(rec->tag),  g_tag,  HW2C_DIAG_NONE_TAG);
+    diag_copy(rec->task, sizeof(rec->task), g_task, HW2C_DIAG_NONE_TASK);
+    rec->reset_count++;
+}
+
+void hw2c_diag_on_fault(uint32_t code, uint32_t pc, uint32_t lr, uint32_t psr)
+{
+{% if has_log %}
+    char fault_line[HW2C_DIAG_LOG_LINE_LEN];
+    char ctx_line[HW2C_DIAG_LOG_LINE_LEN];
+{% endif %}
+
+    /* 1) 先记账——这一步没有任何前置条件，日志打不出来也必须留下证据。 */
+    diag_store(code, pc, lr, psr);
+
+{% if has_log %}
+    /* 2) 再打日志。log_ready() 为假时（故障发生在 log_init() 之前）绝不碰
+     *    日志：环形缓冲还没 lwrb_init()，往里写只会二次 HardFault。
+     *
+     *    拆成两行：一行带上全部字段会顶穿 drv_log 的正文上限（94 B），
+     *    被静默截断成 "count=" 这种半截尾巴 —— 那正是本模块要消灭的东西。 */
+#if !defined(TEST)
+    if (log_ready() != 0) {
+        (void)hw2c_diag_format_fault(fault_line, sizeof(fault_line));
+        (void)hw2c_diag_format_ctx(ctx_line, sizeof(ctx_line));
+        log_output(LOG_LEVEL_ERROR, __FILE__, __LINE__, "%s", fault_line);
+        log_output(LOG_LEVEL_ERROR, __FILE__, __LINE__, "%s", ctx_line);
+        /* 关中断之后 TXE ISR 不会再跑，必须阻塞刷出。 */
+        log_flush();
+    }
+#else
+    (void)fault_line;
+    (void)ctx_line;
+#endif
+{% endif %}
+}
+
+HW2C_DIAG_NOINLINE void hw2c_diag_note(uint32_t code)
+{
+    /* __builtin_return_address(0) = 本函数的返回地址 = 调用 hw2c_diag_note()
+     * 的那条指令之后，也就是"谁要求记这一笔"。 */
+    uint32_t lr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+
+    hw2c_diag_on_fault(code, 0U, lr, 0U);
+}
+
+static const hw2c_diag_record_t *diag_rec_const(void)
+{
+    return (const hw2c_diag_record_t *)&g_diag_record;
+}
+
+#define HW2C_DIAG_RETURN(rec, field, empty) \
+    do { \
+        const hw2c_diag_record_t *r_ = (rec); \
+        return (r_->magic != HW2C_DIAG_MAGIC) ? (empty) : r_->field; \
+    } while (0)
+
+uint32_t hw2c_diag_last_code(void)   { HW2C_DIAG_RETURN(diag_rec_const(), code, 0U); }
+uint32_t hw2c_diag_last_pc(void)     { HW2C_DIAG_RETURN(diag_rec_const(), pc, 0U); }
+uint32_t hw2c_diag_last_lr(void)     { HW2C_DIAG_RETURN(diag_rec_const(), lr, 0U); }
+uint32_t hw2c_diag_last_psr(void)    { HW2C_DIAG_RETURN(diag_rec_const(), psr, 0U); }
+uint32_t hw2c_diag_last_detail(void) { HW2C_DIAG_RETURN(diag_rec_const(), detail, 0U); }
+uint32_t hw2c_diag_reset_count(void) { HW2C_DIAG_RETURN(diag_rec_const(), reset_count, 0U); }
+
+const char *hw2c_diag_last_tag(void)
+{
+    const hw2c_diag_record_t *rec = diag_rec_const();
+
+    if ((rec->magic != HW2C_DIAG_MAGIC) || (rec->tag[0] == '\0')) {
+        return HW2C_DIAG_NONE_TAG;
+    }
+    return rec->tag;
+}
+
+const char *hw2c_diag_last_task(void)
+{
+    const hw2c_diag_record_t *rec = diag_rec_const();
+
+    /* 记录有效但任务名为空 == 任务切换 hook 还没跑过（调度器启动之前就
+     * 故障了）。这时必须说 '<none>'，不许返回空串 —— 空串会被读成"故障
+     * 发生在一个没有名字的任务里"，而真相是"我们不知道"。 */
+    if ((rec->magic != HW2C_DIAG_MAGIC) || (rec->task[0] == '\0')) {
+        return HW2C_DIAG_NONE_TASK;
+    }
+    return rec->task;
+}
+
+void hw2c_diag_clear(void)
+{
+    hw2c_diag_record_t *rec = diag_rec();
+    /* 只清原因：magic 与 reset_count 保留，复位循环继续被计数。 */
+    if (rec->magic == HW2C_DIAG_MAGIC) {
+        rec->code = 0U;
+    }
+}
+
+/*
+ * snprintf 的返回值统一收口：出错写空串，放不下按 snprintf 语义返回 n-1。
+ */
+static size_t diag_len_fix(char *buf, size_t n, int len)
+{
+    if (len < 0) {
+        buf[0] = '\0';
+        return 0U;
+    }
+    if ((size_t)len >= n) {
+        return n - 1U;
+    }
+    return (size_t)len;
+}
+
+size_t hw2c_diag_format_last(char *buf, size_t n)
+{
+    const hw2c_diag_record_t *rec = diag_rec_const();
+    int len;
+
+    if (n == 0U) {
+        return 0U;
+    }
+
+    if (rec->magic != HW2C_DIAG_MAGIC) {
+        len = snprintf(buf, n, "diag: no fault recorded");
+    } else {
+        len = snprintf(buf, n,
+                       "diag: fault=%lu pc=0x%08lX lr=0x%08lX psr=0x%08lX "
+                       "task=%s tag=%s detail=%lu count=%lu",
+                       (unsigned long)rec->code,
+                       (unsigned long)rec->pc,
+                       (unsigned long)rec->lr,
+                       (unsigned long)rec->psr,
+                       hw2c_diag_last_task(), hw2c_diag_last_tag(),
+                       (unsigned long)rec->detail,
+                       (unsigned long)rec->reset_count);
+    }
+
+    return diag_len_fix(buf, n, len);
+}
+
+/*
+ * 两条"窄行"格式化器：故障点一行、上下文一行。
+ *
+ * 为什么不直接把 hw2c_diag_format_last() 的结果交给日志 —— 那一行最长
+ * 149 B，而 drv_log 的行缓冲只给正文留 94 B，多出来的会被 msg_len 钳位
+ * 静默丢掉（不报错、不打点，现场只看到半截 "count="）。拆成两行后每行都
+ * 在 HW2C_DIAG_LOG_LINE_LEN 之内，永远不会触发钳位。
+ *
+ * hw2c_diag_format_last() 保留给**不经日志**的出口（`diag last` 直接写
+ * 串口），那里没有 128 B 行缓冲的限制。
+ */
+size_t hw2c_diag_format_fault(char *buf, size_t n)
+{
+    const hw2c_diag_record_t *rec = diag_rec_const();
+    int len;
+
+    if (n == 0U) {
+        return 0U;
+    }
+
+    if (rec->magic != HW2C_DIAG_MAGIC) {
+        len = snprintf(buf, n, "diag: no fault recorded");
+    } else {
+        len = snprintf(buf, n,
+                       "diag: fault=%lu pc=0x%08lX lr=0x%08lX psr=0x%08lX",
+                       (unsigned long)rec->code,
+                       (unsigned long)rec->pc,
+                       (unsigned long)rec->lr,
+                       (unsigned long)rec->psr);
+    }
+
+    return diag_len_fix(buf, n, len);
+}
+
+size_t hw2c_diag_format_ctx(char *buf, size_t n)
+{
+    const hw2c_diag_record_t *rec = diag_rec_const();
+    int len;
+
+    if (n == 0U) {
+        return 0U;
+    }
+
+    if (rec->magic != HW2C_DIAG_MAGIC) {
+        len = snprintf(buf, n, "diag: no fault recorded");
+    } else {
+        len = snprintf(buf, n,
+                       "diag: task=%s tag=%s detail=%lu count=%lu",
+                       hw2c_diag_last_task(), hw2c_diag_last_tag(),
+                       (unsigned long)rec->detail,
+                       (unsigned long)rec->reset_count);
+    }
+
+    return diag_len_fix(buf, n, len);
+}
+
+void hw2c_diag_report_last(void)
+{
+{% if has_log %}
+    char fault_line[HW2C_DIAG_LOG_LINE_LEN];
+    char ctx_line[HW2C_DIAG_LOG_LINE_LEN];
+
+    if (hw2c_diag_last_code() == 0U) {
+        return;
+    }
+    (void)hw2c_diag_format_fault(fault_line, sizeof(fault_line));
+    (void)hw2c_diag_format_ctx(ctx_line, sizeof(ctx_line));
+#if !defined(TEST)
+    if (log_ready() != 0) {
+        /* 两行分开打：合成一行会顶穿 drv_log 的正文上限被静默截断。 */
+        log_output(LOG_LEVEL_ERROR, __FILE__, __LINE__,
+                   "previous reset: %s", fault_line);
+        log_output(LOG_LEVEL_ERROR, __FILE__, __LINE__, "%s", ctx_line);
+    }
+#else
+    (void)fault_line;
+    (void)ctx_line;
+#endif
+{% else %}
+    /* 本工程没有日志：快照仍然留在 .noinit 里，可被 diag last 读出。 */
+    ;
+{% endif %}
+}

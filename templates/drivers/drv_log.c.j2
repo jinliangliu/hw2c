@@ -51,6 +51,18 @@ static const char *level_strings[] = {
 static lwrb_t   log_ringbuf;
 static uint8_t  log_ringbuf_data[LOG_RING_BUF_SIZE];
 
+/*
+ * 环形缓冲是否可用（FR-15.7）。log_ringbuf 在 log_init() 之前是**未初始化**
+ * 的（里面的 buff 指针是 NULL），此时任何 lwrb_write() 都是往 NULL 写。
+ * 故障处置路径必须先问 log_ready()：不可用就只留 .noinit 记录，不打日志。
+ */
+static int log_ringbuf_ready = 0;
+
+int log_ready(void)
+{
+    return log_ringbuf_ready;
+}
+
 /* ================================================================
  * UART handle — shared between init and ISR
  * ================================================================ */
@@ -335,6 +347,7 @@ void log_flush(void)
 void log_init(void)
 {
     lwrb_init(&log_ringbuf, log_ringbuf_data, LOG_RING_BUF_SIZE);
+    log_ringbuf_ready = 1;
 
     log_uart_init();
 

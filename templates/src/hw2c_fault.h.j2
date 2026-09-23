@@ -41,6 +41,17 @@ extern "C" {
 #define HW2C_FAULT_SCHEDULER   6u   /* vTaskStartScheduler() returned   */
 #define HW2C_FAULT_UNEXPECTED  7u   /* anything else                    */
 #define HW2C_FAULT_FOTA_APPLY  8u   /* 差分补丁应用失败（活动槽未改动，可重试） */
+#define HW2C_FAULT_SOFT_RESET  9u   /* 主动软件复位（如 CLI `reset`），非故障     */
+
+/*
+ * 取"调用者地址"依赖 __builtin_return_address(0)；函数一旦被内联，取到的就是
+ * 调用者的调用者 —— 那是一个**看起来合理但指错了地方**的地址。
+ */
+#if defined(__GNUC__)
+#define HW2C_NOINLINE __attribute__((noinline))
+#else
+#define HW2C_NOINLINE
+#endif
 
 /**
  * @brief  Drive every generated actuator output to its inactive state.
@@ -58,12 +69,30 @@ void hw2c_safe_state(void);
  * @note   Intended never to return.  The MCU reset is requested at the end,
  *         so the recovery path is a normal start-up (and, with a bootloader
  *         present, a retry or rollback) instead of a permanent hang.
+ *
+ *         除了错误码，还会把"当时在跑哪个模块/任务"和**调用本函数的返回地址**
+ *         一并记进 .noinit 并在复位前打进日志（FR-15.7）。返回地址由本函数
+ *         自己取，所以调用点不需要传任何东西 —— 但本函数因此**必须**保持
+ *         不被内联（见 HW2C_NOINLINE）。
  */
-void hw2c_fault_trap(uint32_t code);
+void hw2c_fault_trap(uint32_t code) HW2C_NOINLINE;
+
+/**
+ * @brief  带异常现场版本的 hw2c_fault_trap()，供 HardFault / NMI 使用。
+ * @param  code  HW2C_FAULT_* code。
+ * @param  pc    故障点地址（异常栈帧里的 PC，即出错那条指令）。
+ * @param  lr    异常栈帧里的 LR（出错函数的调用者）。
+ * @param  psr   异常栈帧里的 xPSR。
+ * @note   异常路径下 hw2c_fault_trap() 取到的"调用者"是 HardFault_Handler
+ *         自己，对定位毫无用处，所以异常必须把栈帧里的地址显式传进来。
+ */
+void hw2c_fault_trap_ctx(uint32_t code, uint32_t pc, uint32_t lr, uint32_t psr);
 
 /**
  * @brief  Fault code recorded before the most recent reset.
  * @return HW2C_FAULT_* code, or HW2C_FAULT_NONE if no valid record exists.
+ * @note   记录实体在 hw2c_diag（FR-15.7）：错误码与 tag / 任务名 / 故障点
+ *         地址放在同一份 .noinit 快照里，避免"两个 magic、两份真源"。
  */
 uint32_t hw2c_fault_last(void);
 

@@ -19,6 +19,8 @@ Auto-generated — do not edit manually.
 
 #include "event_mgr.h"
 #include "hw2c_fault.h"
+/* 事件派发是"当前在跑什么"的一条关键线索（FR-15.7）。 */
+#include "hw2c_diag.h"
 
 /* ---- Typed event post functions (from behavior.events contract) ---- */
 {% for evt in events %}
@@ -138,6 +140,9 @@ void EventMgr_Task(void *pvParameters)
     event_t evt;
     while(1) {
         if( xQueueReceive(event_queue, &evt, portMAX_DELAY) == pdTRUE ) {
+            /* 故障瞬间要知道"当时在派发哪个事件"（FR-15.7）：事件 id 放进
+             * detail，于是"哪个事件的处理逻辑跑飞了"不用猜。 */
+            hw2c_diag_enter("event", (uint32_t)evt.id);
 #ifndef TEST
 {% if has_behavior %}
 {% if has_log %}
@@ -196,6 +201,7 @@ void EventMgr_Task(void *pvParameters)
             /* 测试模式：仅标记事件已处理 */
             (void)evt;
 #endif
+            hw2c_diag_leave();
         }
     }
 }

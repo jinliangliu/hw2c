@@ -198,6 +198,9 @@ def _render_sources(tmp_path: Path, override: dict | None = None) -> dict:
         ("drivers/drv_iwdg.h.j2", "drv_iwdg.h", iwdg_peri),
         ("src/hw2c_fault.h.j2", "hw2c_fault.h", None),
         ("src/hw2c_fault.c.j2", "hw2c_fault.c", None),
+        # 诊断快照（FR-15.7）：hw2c_fault 与 drv_fota 都要用它。
+        ("src/hw2c_diag.h.j2", "hw2c_diag.h", None),
+        ("src/hw2c_diag.c.j2", "hw2c_diag.c", None),
         ("test/mock_hal.h.j2", "mock_hal.h", None),
         ("test/mock_hal.c.j2", "mock_hal.c", None),
     ]
@@ -480,6 +483,7 @@ def _run_bench(tmp_path: Path, override: dict | None = None,
         str(srcs["drv_fota_delta.c"]),
         str(srcs["drv_fota_meta.c"]),
         str(srcs["hw2c_fault.c"]),
+        str(srcs["hw2c_diag.c"]),
         str(srcs["mock_hal.c"]),
         str(_HPATCH_DIR / "hpatch_lite.c"),
         str(_TUZ_DIR / "tuz_dec.c"),

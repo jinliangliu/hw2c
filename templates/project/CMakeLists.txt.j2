@@ -133,6 +133,9 @@ set(APP_SOURCES
     src/gpio.c
     src/sleep.c
     src/hw2c_fault.c
+    # 异常诊断快照（FR-15.7）。与 hw2c_fault 成对：只编 fault 不编 diag 会
+    # 在链接期缺符号，而那种缺口只会在"某个示例恰好没开某个功能"时冒出来。
+    src/hw2c_diag.c
     src/stm32g0xx_it.c
     src/event_mgr.c
     src/stm32g0xx_hal_timebase_tim.c

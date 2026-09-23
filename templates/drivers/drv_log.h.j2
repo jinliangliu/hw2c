@@ -83,6 +83,20 @@ void log_system_info(void);
 void log_flush(void);
 
 /**
+ * @brief  Report whether the log ring buffer is usable yet.
+ *
+ *        故障处置路径（hw2c_fault / hw2c_diag）在复位前想留一句话，但故障
+ *        完全可能发生在 log_init() **之前**（时钟配置失败、外设初始化失败
+ *        都在那里）。那时 log_ringbuf 还没 lwrb_init()，往里写字节是往
+ *        NULL 指针写 —— 二次 HardFault，连"记录"这一步都做不成。
+ *
+ *        所以调用方必须先问一句：不可用就只写 .noinit、不打日志（FR-15.7）。
+ *
+ * @return 非 0 = 环形缓冲已就绪，可以 log_output()/log_flush()。
+ */
+int log_ready(void);
+
+/**
  * @brief  Return the UART handle used by the log subsystem.
  *
  *          The CLI shell shares the same UART as the log output.

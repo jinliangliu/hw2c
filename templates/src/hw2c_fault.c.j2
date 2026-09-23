@@ -10,6 +10,12 @@
 #endif
 
 #include "hw2c_fault.h"
+/*
+ * 故障快照（tag / 任务名 / 故障点地址 / 发生次数）住在 hw2c_diag。hw2c_fault
+ * 只负责"失效安全动作"，不再自己持有一份 .noinit 记录 —— 两份 magic 就是
+ * 两份真源，迟早出现"一个说有故障、一个说没有"。
+ */
+#include "hw2c_diag.h"
 
 {% set pwm_peris = peripherals | selectattr('type', 'eq', 'Internal_PWM') | list %}
 {% for p in pwm_peris %}
@@ -17,69 +23,25 @@
 {% endfor %}
 
 /* ---------------------------------------------------------------------------
- * Reset-surviving fault record
+ * Reset-surviving fault record — 委托给 hw2c_diag
  *
- * The section is left untouched by the start-up code (see linker script), so
- * the reason survives NVIC_SystemReset() and a watchdog reset.  A magic word
- * is required before the contents are trusted, because SRAM values at power-up
- * are undefined.
+ * 这里只保留 hw2c_fault 的对外契约（last / reset_count / clear），实体在
+ * hw2c_diag 的 .noinit 快照里（FR-15.7）。
  * ------------------------------------------------------------------------ */
-/*
- * On the target the section is not initialised by the start-up code, so the
- * reason survives NVIC_SystemReset() and a watchdog reset.  On the host
- * (TEST) the default linker script knows nothing about .noinit, so the record
- * falls back to ordinary zero-initialised storage and the tests stay
- * deterministic.
- */
-#if defined(__GNUC__) && !defined(TEST)
-#define HW2C_FAULT_NOINIT __attribute__((section(".noinit")))
-#else
-#define HW2C_FAULT_NOINIT
-#endif
-
-#define HW2C_FAULT_MAGIC   0x48573243UL   /* "HW2C" */
-
-typedef struct {
-    uint32_t magic;         /* HW2C_FAULT_MAGIC when the record is valid      */
-    uint32_t code;          /* last HW2C_FAULT_* code                          */
-    uint32_t reset_count;   /* consecutive trapped faults                      */
-} hw2c_fault_record_t;
-
-static volatile hw2c_fault_record_t g_fault_record HW2C_FAULT_NOINIT;
-
-static hw2c_fault_record_t *fault_rec(void)
-{
-    /* The attribute keeps the object out of .bss; the cast only removes the
-     * volatile qualifier so the fields can be written field by field. */
-    return (hw2c_fault_record_t *)&g_fault_record;
-}
 
 uint32_t hw2c_fault_last(void)
 {
-    const hw2c_fault_record_t *rec = fault_rec();
-    if (rec->magic != HW2C_FAULT_MAGIC) {
-        return HW2C_FAULT_NONE;
-    }
-    return rec->code;
+    return hw2c_diag_last_code();
 }
 
 uint32_t hw2c_fault_reset_count(void)
 {
-    const hw2c_fault_record_t *rec = fault_rec();
-    if (rec->magic != HW2C_FAULT_MAGIC) {
-        return 0U;
-    }
-    return rec->reset_count;
+    return hw2c_diag_reset_count();
 }
 
 void hw2c_fault_clear(void)
 {
-    hw2c_fault_record_t *rec = fault_rec();
-    /* Only the reason is acknowledged; magic and reset_count survive so a
-     * reset loop keeps being counted. */
-    if (rec->magic == HW2C_FAULT_MAGIC) {
-        rec->code = HW2C_FAULT_NONE;
-    }
+    hw2c_diag_clear();
 }
 
 /* ---------------------------------------------------------------------------
@@ -111,10 +73,19 @@ void hw2c_safe_state(void)
 /* ---------------------------------------------------------------------------
  * Trap
  * ------------------------------------------------------------------------ */
-void hw2c_fault_trap(uint32_t code)
+/*
+ * 公共实现。code 之外还要记"在跑什么 + 在哪条指令上"（FR-15.7）：
+ *
+ *   · 非异常路径（本文件里所有 hw2c_fault_trap() 的调用点）取 trap 自己的
+ *     返回地址 —— 那就是"调用 trap 的那条指令之后"，是能拿到的最精确位置；
+ *   · 异常路径（HardFault / NMI）由 hw2c_fault_trap_ctx() 把栈帧里的
+ *     PC / LR / PSR 传进来，因为那时"调用者"是 HardFault_Handler 自己。
+ *
+ * 记账在 hw2c_diag 里无条件发生；日志打不出来（故障发生在 log_init() 之前）
+ * 时只是不打，证据仍留在 .noinit 里等下次开机。
+ */
+static void fault_trap_impl(uint32_t code, uint32_t pc, uint32_t lr, uint32_t psr)
 {
-    hw2c_fault_record_t *rec;
-
     /* 1) Nothing else may act on the system while it is being shut down. */
     __disable_irq();
 
@@ -122,15 +93,24 @@ void hw2c_fault_trap(uint32_t code)
      *    actually protects the plant. */
     hw2c_safe_state();
 
-    /* 3) Record why, so the next boot can report it. */
-    rec = fault_rec();
-    if (rec->magic != HW2C_FAULT_MAGIC) {
-        rec->magic = HW2C_FAULT_MAGIC;
-        rec->reset_count = 0U;
-    }
-    rec->code = code;
-    rec->reset_count++;
+    /* 3) Record why (and where), so the next boot can report it. */
+    hw2c_diag_on_fault(code, pc, lr, psr);
 
     /* 4) Restart under supervision rather than hanging with live outputs. */
     NVIC_SystemReset();
+}
+
+void hw2c_fault_trap_ctx(uint32_t code, uint32_t pc, uint32_t lr, uint32_t psr)
+{
+    fault_trap_impl(code, pc, lr, psr);
+}
+
+HW2C_NOINLINE void hw2c_fault_trap(uint32_t code)
+{
+    /* __builtin_return_address(0) = 本函数的返回地址 = 调用 hw2c_fault_trap()
+     * 的那条指令之后。本函数带 HW2C_NOINLINE：一旦被内联，这个地址就变成
+     * "调用者的调用者"，一个指错地方却看不出错的读数。 */
+    uint32_t lr = (uint32_t)(uintptr_t)__builtin_return_address(0);
+
+    fault_trap_impl(code, 0U, lr, 0U);
 }

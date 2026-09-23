@@ -53,6 +53,8 @@
 #include "mock_hal.h"
 
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -87,6 +89,28 @@ void cli_write_raw(const uint8_t *data, uint16_t len)
 /* ---- 看门狗 / 故障原语 ---- */
 void IWDG_Refresh(void)                 { /* 单测里不喂狗 */ }
 void hw2c_fault_trap(uint32_t code)     { (void)code; g_fault_traps++; }
+
+/* ---- 日志（drv_fota.c 会在拒绝/失败路径上打 log_error + log_flush）-------
+ *
+ * 记下来，不要扔掉：FR-14.9 的容量准入、apply 失败这些分支**唯一的**外部
+ * 表现就是那一行日志。给个空实现的话，"设备到底有没有说'我拒绝了'"这件
+ * 事在测试里就没有任何证据（真机上它表现为"设备一声不吭"）。 */
+static char     g_log_last[160];
+static uint32_t g_log_calls;
+
+void log_output(int level, const char *file, int line, const char *fmt, ...)
+{
+    va_list ap;
+
+    (void)level; (void)file; (void)line;
+    g_log_calls++;
+    va_start(ap, fmt);
+    (void)vsnprintf(g_log_last, sizeof(g_log_last), fmt, ap);
+    va_end(ap);
+}
+
+void log_flush(void)                    { /* 主机侧没有 UART 要刷 */ }
+int  log_ready(void)                    { return 1; }
 
 /* ---- 差分解码器（本模块的下游，另行覆盖）---- */
 int fota_delta_apply(const fota_delta_env_t *env,
@@ -191,6 +215,8 @@ void hw2c_safe_state(void)
  * `test_fota_ymodem.c` 覆盖）。
  * =========================================================================== */
 #include "../src/drivers/drv_fota_meta.c"
+/* drv_fota.c 把 FOTA 阶段登记进诊断快照（FR-15.7）。 */
+#include "../src/hw2c_diag.c"
 #include "../src/drivers/drv_fota.c"
 #include "../src/drivers/drv_fota_ymodem.c"
 

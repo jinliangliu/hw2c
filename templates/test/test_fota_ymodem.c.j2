@@ -45,6 +45,8 @@
 #include "mock_hal.h"
 
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -87,6 +89,26 @@ void cli_write_raw(const uint8_t *data, uint16_t len)
 /* ---- 看门狗 / 故障原语 ---- */
 void IWDG_Refresh(void)                 { /* 单测里不喂狗 */ }
 void hw2c_fault_trap(uint32_t code)     { (void)code; g_fault_traps++; }
+
+/* ---- 日志：drv_fota.c 会在拒绝/失败路径上打 log_error + log_flush -------
+ * 与 test_fota_protocol.c 里的同名替身同理：记下最后一行而不是吞掉，
+ * 否则"设备到底说了没有"在这个单元里没有任何证据。 */
+static char     g_log_last[160];
+static uint32_t g_log_calls;
+
+void log_output(int level, const char *file, int line, const char *fmt, ...)
+{
+    va_list ap;
+
+    (void)level; (void)file; (void)line;
+    g_log_calls++;
+    va_start(ap, fmt);
+    (void)vsnprintf(g_log_last, sizeof(g_log_last), fmt, ap);
+    va_end(ap);
+}
+
+void log_flush(void)                    { /* 主机侧没有 UART 要刷 */ }
+int  log_ready(void)                    { return 1; }
 
 /* ---- 解码器与暂存校验：陷阱桩（见文件头）---- */
 static uint32_t g_env_traps = 0U;
@@ -131,6 +153,8 @@ void hw2c_safe_state(void)
  * 就链接不起来（而"生成一个链接不起来的测试"正是本仓库踩过的坑）。
  * =========================================================================== */
 #include "../src/drivers/drv_fota_meta.c"
+/* drv_fota.c 把 FOTA 阶段登记进诊断快照（FR-15.7）。 */
+#include "../src/hw2c_diag.c"
 #include "../src/drivers/drv_fota.c"
 #include "../src/drivers/drv_fota_ymodem.c"
 
