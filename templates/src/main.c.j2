@@ -358,6 +358,45 @@ int main(void)
             "\t_/    _/      _/  _/      _/_/_/_/    _/_/_/\r\n"
     );
     log_info("{{ project_name }} v{{ project_version }} — Hardware2Code | {{ mcu.part }} @ {{ (mcu.clock_freq_hz / 1000000) | int }} MHz");
+    /*
+     * 固件版本自检（FR-15.6）。
+     *
+     * 上面那行的 v{{ project_version }} 是**生成期**常量（来自 task.yaml），
+     * 而镜像头里的 fw_version 是**构建期**写进去的（CMake 的 FW_VERSION →
+     * patch_crc.py）。两者分叉时设备不会报错，只是"版本看起来不对"：
+     * 镜像头停留在上次 configure 的旧值、或根本烧了一个没走 patch_crc 的
+     * 裸 .bin，症状完全一样。所以这里读镜像头、打印实际值，并与编译进
+     * 来的那个值判等 —— 不一致就当场报出来。
+     */
+{% if has_bootloader %}
+    {
+        uint32_t img_ver = boot_app_image_version();
+        if (img_ver == 0xFFFFFFFFUL) {
+            log_error("firmware version unknown — image header invalid "
+                      "(magic 0x%08lX @ 0x%08lX); patched image?",
+                      (unsigned long)boot_app_image_magic(),
+                      (unsigned long)boot_app_slot_base());
+        } else {
+            log_info("Firmware v%lu.%lu.%lu (0x%06lX) — image @ 0x%08lX",
+                     (unsigned long)((img_ver >> 16) & 0xFFUL),
+                     (unsigned long)((img_ver >> 8) & 0xFFUL),
+                     (unsigned long)(img_ver & 0xFFUL),
+                     (unsigned long)img_ver,
+                     (unsigned long)boot_app_slot_base());
+            if (img_ver != {{ "0x%06X" | format(project_version_packed) }}UL) {
+                log_error("version mismatch: image header 0x%06lX != built 0x%06lX",
+                          (unsigned long)img_ver,
+                          (unsigned long){{ "0x%06X" | format(project_version_packed) }}UL);
+            }
+        }
+    }
+{% else %}
+    log_info("Firmware v%lu.%lu.%lu (0x%06lX)",
+             (unsigned long)(({{ "0x%06X" | format(project_version_packed) }}UL >> 16) & 0xFFUL),
+             (unsigned long)(({{ "0x%06X" | format(project_version_packed) }}UL >> 8) & 0xFFUL),
+             (unsigned long)({{ "0x%06X" | format(project_version_packed) }}UL & 0xFFUL),
+             (unsigned long){{ "0x%06X" | format(project_version_packed) }}UL);
+{% endif %}
 
     /*
      * Report a fault trapped before the previous reset.  Without this the

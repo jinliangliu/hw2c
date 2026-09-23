@@ -77,6 +77,12 @@ SECTIONS
   ASSERT(SIZEOF(.app_header) == {{ fota_fmt.img_hdr_size }},
          "镜像头段大小与 fota_format.json 不一致")
 
+  /* 导出给 C 侧（FR-15.6），与 app_slot_a.ld 同一份说明：
+     开机横幅打印的版本必须是从 flash 读出来的镜像头 fw_version，
+     地址只能由链接器给出。 */
+  PROVIDE(__hw2c_img_header = ADDR(.app_header));
+  PROVIDE(__hw2c_slot_base  = ORIGIN(FLASH));
+
   .text :
   {
     . = ALIGN(4);

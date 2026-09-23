@@ -7,6 +7,11 @@
 #ifndef __BOOT_APP_H
 #define __BOOT_APP_H
 
+/* 本头文件对外给出 `uint32_t` 返回值，必须自带 stdint：boot_app.h 被
+   main.c 包含时，调用方是否恰好先包含了 stdint 是不可依赖的（编译自检
+   就是这样炸的：只有 main.c 一处调用，顺序一变就 unknown type name）。 */
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,6 +23,30 @@ extern "C" {
  *         如果 App 卡死 → WDG 复位 → Bootloader 检测 BOOT_OK 未写入 → 计为失败。
  */
 void boot_app_mark_ok(void);
+
+/**
+ * @brief  读取**本镜像自己**头部里的固件版本（FR-15.6）
+ * @return 版本号（24-bit，major<<16|minor<<8|patch）；镜像头无效或
+ *         fw_version 仍是擦除态时返回 0xFFFFFFFF
+ * @note   读的是 flash 上真实存在的字节，不是编译期常量 —— 开机横幅靠它
+ *         证明"这块板子上装的是哪一版"。头部地址由链接脚本 PROVIDE
+ *         （`__hw2c_img_header`），C 侧不得自己猜基址。
+ */
+uint32_t boot_app_image_version(void);
+
+/**
+ * @brief  本镜像头 magic 的实际值（用于诊断打印）
+ * @note   `boot_app_image_version()` 返回 0xFFFFFFFF 时，把这个值打出来才
+ *         能区分"烧了未走 patch_crc 的裸 .bin"（全 0xFF）与"偏移错位"。
+ */
+uint32_t boot_app_image_magic(void);
+
+/**
+ * @brief  本镜像所在的槽基址（链接期钉死）
+ * @note   打印地址而不是"A/B"字样：只打字母分辨不出"给槽 B 种了按槽 A
+ *         链接的镜像"——那种镜像会带着槽 A 的基址跑起来。
+ */
+uint32_t boot_app_slot_base(void);
 
 #ifdef __cplusplus
 }

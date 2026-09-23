@@ -10,6 +10,31 @@
 /* 启动成功魔数（与 boot_nvm.h 保持一致） */
 #define BOOT_OK_MAGIC  0xB007C0DEUL
 
+/* ---- 自身镜像头（FR-15.6）------------------------------------------------
+ *
+ * 两个地址都由 linker/app_slot_{a,b}.ld 用 PROVIDE 导出，C 侧只负责用。
+ * 声明成**数组**而不是标量：我们要的是符号的地址本身，数组名退化即地址，
+ * 写成标量再取地址反而容易被误读成"读该地址上的内容"。
+ *
+ * 偏移常量的真源是 generator/data/fota_format.json（与 boot_crc.c 同一份，
+ * 由 generator/tests/test_fota_format.py 校验），这里按它展开，不写死字面量。
+ */
+extern const uint32_t __hw2c_img_header[];
+extern const uint32_t __hw2c_slot_base[];
+
+#define APP_HEADER_MAGIC        {{ "0x%08X" | format(fota_fmt.img_magic) }}UL
+#define APP_HEADER_MAGIC_OFF    {{ fota_fmt.img_off_magic }}U
+#define APP_HEADER_VERSION_OFF  {{ fota_fmt.img_off_fw_version }}U
+#define APP_VERSION_MASK        0x00FFFFFFUL
+
+/* 与 boot_crc.c 同一处权衡：`(uintptr_t)` 这个中间类型是给主机看的，
+   目标上（32 位）与 uint32_t 同宽，生成的机器码不受影响。 */
+static uint32_t img_hdr_read(uint32_t byte_off)
+{
+    uintptr_t addr = (uintptr_t)__hw2c_img_header + (uintptr_t)byte_off;
+    return ((const volatile uint32_t *)addr)[0];
+}
+
 /**
  * @brief  标记应用启动成功
  *         写入 TAMP 备份寄存器 2，Bootloader 在上电时读取此寄存器。
@@ -31,4 +56,30 @@ void boot_app_mark_ok(void)
 
     /* 写入启动成功魔数 */
     TAMP->BKP2R = BOOT_OK_MAGIC;
+}
+
+uint32_t boot_app_image_magic(void)
+{
+    return img_hdr_read(APP_HEADER_MAGIC_OFF);
+}
+
+uint32_t boot_app_image_version(void)
+{
+    uint32_t raw_version;
+
+    if (img_hdr_read(APP_HEADER_MAGIC_OFF) != APP_HEADER_MAGIC) {
+        return 0xFFFFFFFFUL;   /* 头不存在 = 烧了裸 .bin，或头部偏移被破坏 */
+    }
+
+    raw_version = img_hdr_read(APP_HEADER_VERSION_OFF);
+    if (raw_version == 0xFFFFFFFFUL) {
+        return 0xFFFFFFFFUL;   /* 擦除态：版本字段没有被 patch_crc.py 回填 */
+    }
+
+    return raw_version & APP_VERSION_MASK;
+}
+
+uint32_t boot_app_slot_base(void)
+{
+    return (uint32_t)(uintptr_t)__hw2c_slot_base;
 }

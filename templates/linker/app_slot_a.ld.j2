@@ -78,6 +78,14 @@ SECTIONS
   ASSERT(SIZEOF(.app_header) == {{ fota_fmt.img_hdr_size }},
          "镜像头段大小与 fota_format.json 不一致")
 
+  /* 把镜像头与槽基址导出给 C 侧（FR-15.6 开机版本自检）。
+     开机横幅要打印的是**从 flash 里读出来的**镜像版本，而不是编译期常量：
+     只有前者能证明这块板子上装的是哪一版（烧错槽 / 烧了未回填的裸 .bin /
+     镜像头停留在上次 configure 的旧值，全都是"没有报错、只是版本不对"的
+     失效模式）。地址由链接器给出，C 侧不得自己猜基址。 */
+  PROVIDE(__hw2c_img_header = ADDR(.app_header));
+  PROVIDE(__hw2c_slot_base  = ORIGIN(FLASH));
+
   .text :
   {
     . = ALIGN(4);
