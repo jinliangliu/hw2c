@@ -193,6 +193,18 @@
       "scan_step": "record_size",
       "record_count": 85,
       "unused_tail_bytes": 8,
+      "_fixed_slots_rationale": [
+        "一条补丁的生命周期里，除了『每个提交的分片各一条』，还有 4 条**与",
+        "分片数无关**的固定记录：START 一条、收齐一条、应用一条、出错一条。",
+        "分片能用掉的只有 record_count - fixed_slots 条 —— 这就是『掉电免重传』",
+        "的真实上限（FR-14.9），而不是『槽还剩多少空间』。",
+        "按 1024 B 分片算：81 条 × 1024 B ≈ 81 KB。差分补丁（实测 2.4 KB）",
+        "远在界内；YMODEM 传整包镜像（≈111 KB ≈ 108 分片）越界。",
+        "越界必须**在 START 阶段显式拒绝**（FOTA_E_META_FULL）：放任它进来的",
+        "话，第 85 条记录会触发 append 内部擦页，擦除窗口正好落在传输中途，",
+        "已收的几百 KB 断点全丢，而设备一声不吭（FR-14.9）。"
+      ],
+      "fixed_slots": 4,
       "newest_wins": "max(seq)",
       "validity": "magic && seq != 0 && seq != 0xFFFFFFFF && crc16 matches",
       "append_target": "first record slot whose first word reads 0xFFFFFFFF",

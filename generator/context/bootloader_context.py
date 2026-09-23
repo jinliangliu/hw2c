@@ -414,12 +414,24 @@ def fota_meta_for_templates(boot_config: dict) -> dict:
     # "记录"，其 magic 恰好为 0xFFFFFFFF 而 seq 也是 0xFFFFFFFF。
     unused_tail = page_size - rec_count * rec_size
 
+    # 与分片数无关的固定开销（START / 收齐 / 应用 / 出错各一条）。它是
+    # "掉电免重传"上限的另一半（FR-14.9）：分片能用掉的只有
+    # rec_count - fixed_slots 条。取自真源而不是写死在模板里 —— 把提交粒度
+    # 从"每分片"放宽成"每 N 个分片"时，上限随之放大，改这一处即可。
+    fixed_slots = int(spec['journal']['fixed_slots'])
+    if fixed_slots < 1 or fixed_slots >= rec_count:
+        raise ValueError(
+            "metadata.journal.fixed_slots=%d 不在 [1, %d) 内：它要么吃掉全部"
+            "记录（没有任何分片能记），要么为负"
+            % (fixed_slots, rec_count))
+
     return {
         'meta_magic': magic,
         'meta_page_base': page_base,
         'meta_page_size': page_size,
         'meta_record_size': rec_size,
         'meta_record_count': rec_count,
+        'meta_fixed_slots': fixed_slots,
         'meta_unused_tail': unused_tail,
         # 字段偏移（来自真源，模板里不写字面量）
         'meta_off_magic': int(fields['magic']['offset']),

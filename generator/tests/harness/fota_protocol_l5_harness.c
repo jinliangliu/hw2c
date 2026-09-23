@@ -756,6 +756,70 @@ static void case_apply_failure_failsafe(void)
     check(cli_rx_sink_active() == 0U, "ERROR 之后 UART 应已交还");
 }
 
+/* ---- 4.12 元数据日志容量准入（FR-14.9）----------------------------------
+ *
+ * 被拒绝的东西是**格式完全合法**的：magic / format_ver / flags / hdr_crc16 /
+ * auth_len / 槽容量全部合格，唯一的毛病是补丁比"日志页能记住的分片数"还长。
+ * 判据因此只能是"分片数 + 固定开销 > 页容量"这一条。
+ *
+ * 这一条以前是缺的，缺了之后的形态是**静默退化**：`fota_meta_reserve()` 擦
+ * 一页腾地方，但擦完不复查够不够就返回成功；等第 N 条记录到来时 append
+ * 内部再擦一次 —— 擦除窗口正好落在传输中途，已经收了几百 KB 的断点全丢，
+ * 而设备一声不吭。所以这条用例断言的不只是"被拒"，还有三条"没动过"。
+ */
+static int meta_page_has_record(void)
+{
+    uint32_t head;
+    memcpy(&head, flash_ptr((uint32_t)FOTA_META_PAGE_BASE), sizeof(head));
+    return head == FOTA_META_MAGIC;
+}
+
+static void case_meta_capacity_rejection(void)
+{
+    uint8_t  frame[64];
+    uint32_t len;
+
+    printf("case 12: 元数据日志容量准入（补丁过大 ⇒ 显式拒绝）\n");
+
+    /* 先自证"正常补丁确实在续传上限之内" —— 否则下面所有断言都可能只是
+     * "这条向量也被拒了"的另一种写法，用例会变成恒真的。 */
+    check((long)L5_PATCH_SIZE <= (long)L5_RESUME_MAX_BYTES,
+          "台架的正常补丁必须落在续传上限内（否则 happy path 也是被拒的）");
+    check((long)g_l5_big_env[0] != 0U, "越界信封必须从真源生成（非空）");
+
+    l5_reset();
+    check_eq((long)fota_receive_begin(NULL, 0U), 0L, "fota_receive_begin");
+
+    /* 先用**正常**信封建立一条有效断点：START + DATA 0 落盘。
+     * 有了它，"拒绝"才有可对照的东西 —— 空页上无论擦没擦都读不出差别。 */
+    resp_reset();
+    l5_feed(frame_at(0U), frame_len(0U));
+    l5_feed(frame_at(1U), frame_len(1U));
+    check_eq((long)fota_get_staged_bytes(),
+             (long)L5_ENV_SIZE + (long)L5_CHUNK_SIZE, "正常信封应已提交 DATA 0");
+    check(meta_page_has_record(), "元数据页应已有有效记录（对照组的起点）");
+
+    /* 现在发一条合法但过大的信封。 */
+    resp_reset();
+    len = build_start_frame(frame, g_l5_big_env, (uint16_t)L5_BIG_ENV_CRC16);
+    l5_feed(frame, len);
+
+    check_eq((long)g_resp_len, 0L, "被拒的大信封不应产生应答");
+    check_eq((long)fota_get_last_error(), (long)FOTA_E_META_FULL,
+             "错误码必须是 FOTA_E_META_FULL（不是「槽装不下」，也不是「信封不合法」）");
+    check_eq((long)fota_get_state(), (long)FOTA_STATE_RECEIVING,
+             "应留在 RECEIVING（等另一条 START，与 case 7 同一语义）");
+
+    /* 三条"没动过"：这条拒绝的代价必须是零。 */
+    check_eq((long)fota_get_staged_bytes(),
+             (long)L5_ENV_SIZE + (long)L5_CHUNK_SIZE,
+             "已收的断点不得被擦掉");
+    check(meta_page_has_record(), "元数据页不得被擦除（擦了就丢掉既有断点）");
+    check_eq((long)fota_get_pending_slot(), (long)FOTA_META_SLOT_B,
+             "目标槽元数据应保持原样");
+    check(cli_rx_sink_active() != 0U, "被拒后仍应保持接管（等另一条 START）");
+}
+
 /* ===========================================================================
  * 5. main
  * =========================================================================== */
@@ -817,6 +881,7 @@ int main(void)
     L5_CASE(case_ready_survives_reset());
     L5_CASE(case_idle_timeout());
     L5_CASE(case_apply_failure_failsafe());
+    L5_CASE(case_meta_capacity_rejection());
 
     if (g_resp_drop != 0U) {
         printf("  [FAIL] 应答缓冲溢出 %u 次\n", (unsigned)g_resp_drop);
@@ -827,7 +892,7 @@ int main(void)
         printf("RESULT: FAILED (%d failures)\n", g_failures);
         return 1;
     }
-    printf("RESULT: OK (11 cases, %u response bytes checked)\n",
+    printf("RESULT: OK (12 cases, %u response bytes checked)\n",
            (unsigned)L5_RESP_SIZE);
     return 0;
 }

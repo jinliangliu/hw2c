@@ -112,6 +112,23 @@ typedef enum {
 #define FOTA_E_STAGING_LOST      110   /* 记录说"已收齐"，但暂存区里的信封读不回来/对不上 */
 #define FOTA_E_LENGTH            111   /* 主机声明的长度与信封不符，或实际收到的字节数超出声明 */
 #define FOTA_E_ABORTED           112   /* 传输被中止（主机发 CAN，或本侧重试耗尽后主动放弃） */
+#define FOTA_E_META_FULL         113   /* 元数据日志页放不下"每分片一条"记录 ⇒ 无法保证掉电续传（FR-14.9） */
+
+/* ---- 断点续传的容量上限（FR-14.9）---------------------------------------
+ *
+ * 续传靠"每提交一个分片就追加一条 24 B 记录"，而元数据页的容量是固定的
+ * （`FOTA_META_RECORD_COUNT`，由 `fota_format.json` 的 `metadata` 段派生）。
+ * 除了分片，还要留固定开销：START 一条、收齐一条、应用一条、出错一条。
+ *
+ * 于是"掉电免重传"的真实上限是下面这个数，**不是**"槽还剩多少空间"：
+ * 差分补丁实测 2.4 KB 远在界内；而 YMODEM 传整包镜像（≈111 KB ≈ 108 分片）
+ * 会越界 —— 越界必须**显式拒绝**（见 `fota_session_open()`），不能靠
+ * `fota_meta_reserve()` 的"不够就擦一页"蒙混过去：那会把擦除窗口挪到传输
+ * 中途，已经收到的断点全部作废，而设备一声不吭。
+ */
+#define FOTA_META_FIXED_SLOTS    {{ fota_meta.meta_fixed_slots }}U
+#define FOTA_MAX_RESUMABLE_BYTES ((FOTA_META_RECORD_COUNT - FOTA_META_FIXED_SLOTS) \
+                                  * FOTA_CHUNK_SIZE)
 
 /* ---- 传输方式 -----------------------------------------------------------
  *

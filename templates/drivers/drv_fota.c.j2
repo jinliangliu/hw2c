@@ -561,8 +561,17 @@ int fota_session_open(const uint8_t *env_bytes, uint32_t record_size,
         return -1;
     }
 
-    /* ③ 容量准入。**必须用"实际会擦掉的整页数"**，不能用 new_size：
-     * 擦除按整页做，用声明长度会让边界情况少算一页，从而把暂存区首页擦掉。 */
+    /* ③ 容量准入 —— **两道都要过**，且都必须用"实际会占用的量"算，
+     * 不能用声明长度：
+     *
+     *   a) 槽空间（下面这段）：擦除按整页做，用 `new_size` 算会让边界情况
+     *      少算一页，从而把暂存区首页擦掉 —— 暂存区就在同一个槽的尾部。
+     *   b) 元数据日志（紧接其后）：续传靠"每提交一个分片追加一条记录"，
+     *      而日志页只有 `FOTA_META_RECORD_COUNT` 条。
+     *
+     * 两道都必须在**一个字节都还没收**的时刻判死：此刻拒绝，主机换一条
+     * 补丁即可，设备上什么都没动过；晚一步就是"收了几百 KB 才发现"。
+     */
     slot      = fota_target_slot();
     slot_base = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_BASE : FOTA_SLOT_B_BASE;
     slot_size = (slot == FOTA_META_SLOT_A) ? FOTA_SLOT_A_SIZE : FOTA_SLOT_B_SIZE;
@@ -572,6 +581,38 @@ int fota_session_open(const uint8_t *env_bytes, uint32_t record_size,
 
     if (image_bytes + staged_total > slot_size) {
         g_last_error = FOTA_E_STAGING_FULL;
+        return -1;
+    }
+
+    /* b) 元数据日志容量。**这一条以前是缺的**，缺了之后的形态是"静默退化"：
+     * `fota_meta_reserve()` 发现空位不够就擦一页，但**擦完不复查够不够就
+     * 返回成功**；于是第 N 条记录到来时 `append` 内部还会再擦一次 —— 擦除
+     * 窗口正好落在传输中途，已经收了几百 KB 的断点全部作废。设备不报任何
+     * 错，现场看到的是"掉电后从 0 重传"，查不到原因（FR-14.9）。
+     *
+     * 现在显式拒绝：补丁过大就从 START 阶段起不接收。上限
+     * `FOTA_MAX_RESUMABLE_BYTES` 由 `fota_format.json` 的 `metadata.journal`
+     * 真源派生，主机侧可以提前自查，不必等设备回一个错误码。
+     *
+     * ⚠️ 上限的"每分片一条"是**当前提交粒度**的函数：哪天把粒度放宽到
+     * 每 N 个分片提交一次，这个判据要跟着改成 `frames_est / N`，同时
+     * `FOTA_MAX_RESUMABLE_BYTES` 放大 N 倍 —— 两边必须一起改。 */
+    frames_est = (g_env.patch_size + FOTA_CHUNK_SIZE - 1U) / FOTA_CHUNK_SIZE;
+    if (frames_est + FOTA_META_FIXED_SLOTS > (uint32_t)FOTA_META_RECORD_COUNT) {
+        g_last_error = FOTA_E_META_FULL;
+{% if has_log %}
+        /* 这条日志是**唯一**能区分"补丁太大"与"槽装不下"的线索：
+         * 两者都表现为 START 被拒，但只有这里能看出是日志页放不下分片数。
+         * 错误码只活在 RAM 的 `g_last_error` 里（元数据记录没有错误码字段），
+         * 而这次拒绝**不写任何记录** —— 不留日志就是彻底的哑谜。 */
+        log_error("fota: patch %lu B = %lu chunks > %u resumable slots "
+                  "(meta page %u records, %u reserved)",
+                  (unsigned long)g_env.patch_size, (unsigned long)frames_est,
+                  (unsigned)(FOTA_META_RECORD_COUNT - FOTA_META_FIXED_SLOTS),
+                  (unsigned)FOTA_META_RECORD_COUNT,
+                  (unsigned)FOTA_META_FIXED_SLOTS);
+        log_flush();
+{% endif %}
         return -1;
     }
 
@@ -613,9 +654,12 @@ int fota_session_open(const uint8_t *env_bytes, uint32_t record_size,
     /* 让日志给本次传输留够空位。**页擦除必须挪到传输开始之前**：擦一页会让
      * 整页元数据同时消失，落在传输中途就等于白白丢掉已经收了几百 KB 的断点。
      * 此刻还没开始收数据，丢掉记录最坏只是让主机多传一遍 START。
-     * 擦过之后下面无论走哪条分支都会重新写一条记录。 */
-    frames_est = (g_env.patch_size + FOTA_CHUNK_SIZE - 1U) / FOTA_CHUNK_SIZE;
-    (void)fota_meta_reserve(frames_est + 4U, &erased);
+     * 擦过之后下面无论走哪条分支都会重新写一条记录。
+     *
+     * `frames_est` 已在准入 b) 里算过，`+ FOTA_META_FIXED_SLOTS` 也刚被判过
+     * 不超过页容量 —— 所以"擦一次就一定够"在这里是**已被上游保证**的，
+     * 不用再靠 `reserve()` 的返回值猜。 */
+    (void)fota_meta_reserve(frames_est + FOTA_META_FIXED_SLOTS, &erased);
 
     fota_flash_unlock();
 

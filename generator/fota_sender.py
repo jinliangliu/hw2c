@@ -109,6 +109,11 @@ class Framing:
         self.finish_total = int(t["finish"]["total_size"])
         self.resp_total = int(t["ack"]["total_size"])
 
+        # 「掉电免重传」的容量上限（FR-14.9）：元数据页能记多少个分片。
+        # 与设备侧 `FOTA_MAX_RESUMABLE_BYTES` 同源（都来自 `metadata.journal`）。
+        journal = spec["metadata"]["journal"]
+        self.meta_slots = int(journal["record_count"]) - int(journal["fixed_slots"])
+
         # 自检：真源里声明的长度必须与算式一致。写错一处就会让**所有**帧
         # 都少/多几个字节 —— 那是"能发出去、设备永远收不齐"的形态。
         if self.start_total != 1 + self.env_size + 2:
@@ -146,6 +151,16 @@ class Framing:
         return bytes([self.nak]) + struct.pack("<H", want_seq & 0xFFFF)
 
     # -- 整流 --------------------------------------------------------------
+
+    def resume_budget(self) -> tuple:
+        """「掉电免重传」的容量上限 `(可用记录条数, 可用字节数)`。
+
+        设备侧会在 START 阶段拒掉越界的补丁（`FOTA_E_META_FULL`）。主机在
+        **发出第一个字节之前**就判出同一件事，现场看到的就是一句明确的
+        "补丁太大"，而不是"设备不回 ACK、等到超时" —— 后者的原因要翻设备
+        日志才知道（FR-14.9）。
+        """
+        return self.meta_slots, self.meta_slots * self.chunk_size
 
     def split_chunks(self, patch: bytes) -> list:
         """把补丁切成**数据分片**：跳过前 48 B 信封（信封由 START 帧携带）。
@@ -204,6 +219,18 @@ def send_fota(port: str, patch_path: str, baud: int = 115200,
     patch = Path(patch_path).read_bytes()
     fr = Framing(spec)
     chunks = fr.split_chunks(patch)
+
+    # FR-14.9：在发出第一个字节之前判一次"续传上限"。设备侧也会判，但那里
+    # 的表现只是"START 没有应答" —— 主机要等满 ACK_TIMEOUT 才知道，且看不
+    # 出原因。这里失败，信息才是完整的。
+    slots, max_bytes = fr.resume_budget()
+    body_bytes = len(patch) - fr.env_size
+    if body_bytes > max_bytes:
+        print("ERROR: 补丁正文 %d B 超出「掉电免重传」上限 %d B（%d 个分片 × %d B）"
+              % (body_bytes, max_bytes, slots, fr.chunk_size))
+        print("  设备会在 START 阶段拒收（FOTA_E_META_FULL）：元数据页记不住")
+        print("  这么多分片，掉电续传无法保证。改用差分补丁，或放宽提交粒度。")
+        sys.exit(1)
 
     print(f"Patch file: {len(patch)} bytes")
     print(f"Chunks: {len(chunks)} × ≤{fr.chunk_size} bytes")

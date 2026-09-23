@@ -60,9 +60,11 @@ from generator.context.bootloader_context import (  # noqa: E402
     fota_align_up,
     fota_delta_budget,
     fota_l5_negative_envelopes,
+    load_fota_format,
 )
 from generator.context.builder import build_context  # noqa: E402
 from generator.delta_tool import build as build_patch  # noqa: E402
+from generator.delta_tool import pack_envelope  # noqa: E402
 from generator.fota_sender import Framing, crc16  # noqa: E402
 from generator.tests.delta_fixtures import (  # noqa: E402
     SLOT_A_BASE,
@@ -225,6 +227,41 @@ def _build_patch() -> tuple:
     return old_image, new_image, patch
 
 
+def _resume_budget(chunk_size: int) -> tuple:
+    """「掉电免重传」的容量上限（FR-14.9）：(可用记录数, 可用字节数)。
+
+    取自真源 `fota_format.json` 的 `metadata.journal` —— 与设备侧
+    `FOTA_MAX_RESUMABLE_BYTES` 同源。这里再算一遍不是为了复制一份常量，
+    而是为了让"向量悄悄长过上限"在 **Python 侧**就失败（那时失败信息是
+    "补丁变大了"），而不是等到 C 台架里报一句 `FOTA_E_META_FULL`。
+    """
+    journal = load_fota_format()["metadata"]["journal"]
+    slots = journal["record_count"] - journal["fixed_slots"]
+    return slots, slots * chunk_size
+
+
+def _build_oversized_env(chunk_size: int) -> bytes:
+    """一条**格式完全合法、但补丁过大**的信封（FR-14.9 的越界用例）。
+
+    刻意比上限多 5 个分片：刚过界（多 1 片）也该被拒，但"刚过界"容易被
+    误判成边界算错；多几片之后，任何"差一错误"都不可能让它通过。
+    `new_size` 仍要过槽准入 —— 否则被拒的原因是"槽装不下"而不是"日志
+    放不下"，用例就测错了东西。
+    """
+    slots, _ = _resume_budget(chunk_size)
+    patch_size = (slots + 5) * chunk_size
+    return pack_envelope(
+        old_size=len(slot_image(firmware_like(_OLD_CODE, seed=101),
+                                fw_version=1, slot_base=SLOT_A_BASE)),
+        old_crc32=0x12345678,
+        new_size=128 * 1024,
+        new_crc32=0x9ABCDEF0,
+        patch_size=patch_size,
+        fw_version=3,
+        compressed=False,
+    )
+
+
 def _c_array(name: str, blob: bytes, per_line: int = 16) -> str:
     lines = ["static const unsigned char %s[%d] = {" % (name, len(blob))]
     for i in range(0, len(blob), per_line):
@@ -261,6 +298,16 @@ def _emit_vectors_header(path: Path, old_image: bytes, new_image: bytes,
     negs = fota_l5_negative_envelopes(boot_config)
     budget = fota_delta_budget(boot_config)
 
+    # ---- FR-14.9：一条合法但过大的信封（越界 ⇒ 必须在 START 阶段被拒） ----
+    big_env = _build_oversized_env(fr.chunk_size)
+    big_slots, big_bytes = _resume_budget(fr.chunk_size)
+    big_patch = (big_slots + 5) * fr.chunk_size
+    assert fota_align_up(128 * 1024, budget["page_size"]) \
+        + ((fr.env_size + big_patch + 7) & ~7) <= _SLOT_B_SIZE, (
+            "越界用例的补丁必须**先能过槽准入**：否则它被拒的原因是「槽装不下」"
+            "而不是「日志页放不下」，用例就测错了东西"
+        )
+
     parts = [
         "/* 自动生成，请勿手工编辑。见 generator/tests/test_fota_protocol_l5.py */",
         "#ifndef __FOTA_L5_VECTORS_H",
@@ -283,6 +330,11 @@ def _emit_vectors_header(path: Path, old_image: bytes, new_image: bytes,
         "#define L5_OLD_IMAGE_SIZE      %d" % len(old_image),
         "#define L5_NEW_IMAGE_SIZE      %d" % len(new_image),
         "",
+        # FR-14.9：续传上限，以及一条「合法但越界」的信封
+        "#define L5_RESUME_MAX_SLOTS    %d" % big_slots,
+        "#define L5_RESUME_MAX_BYTES    %d" % big_bytes,
+        "#define L5_BIG_ENV_CRC16       %d" % crc16(big_env),
+        "",
         _c_array("g_l5_frames", stream),
         "",
         "static const unsigned short g_l5_frame_off[%d] = {%s};"
@@ -295,6 +347,8 @@ def _emit_vectors_header(path: Path, old_image: bytes, new_image: bytes,
         _c_array("g_l5_old_image", old_image),
         "",
         _c_array("g_l5_new_image", new_image),
+        "",
+        _c_array("g_l5_big_env", big_env),
         "",
     ]
 
@@ -371,6 +425,16 @@ def _run_bench(tmp_path: Path, override: dict | None = None) -> subprocess.Compl
         % (nchunks, len(patch), Framing().env_size + Framing().chunk_size)
     )
 
+    # 正常向量必须落在「掉电免重传」上限内（FR-14.9）。若将来把 _NEW_CODE
+    # 调到让补丁越界，happy path 会被日志容量准入拒掉 —— 症状看着像"准入
+    # 写错了"，其实是"测试向量长大了"。在这里先失败，信息才对得上。
+    _, max_bytes = _resume_budget(Framing().chunk_size)
+    assert len(patch) <= max_bytes, (
+        "正常补丁 %d B 超过了续传上限 %d B：所有 happy path 都会被 "
+        "FOTA_E_META_FULL 拒掉。加大页容量/分片粒度，或减小 _NEW_CODE"
+        % (len(patch), max_bytes)
+    )
+
     boot_config = {
         "size_kb": 8,
         "app_a_offset": 0x2000,
@@ -434,8 +498,37 @@ def test_l5_protocol(tmp_path):
     )
     assert "RESULT: OK" in run.stdout, run.stdout
     # 每个用例都必须真的跑过（防止有人在 main 里注释掉一条）
-    for n in range(1, 11):
+    for n in range(1, 13):
         assert ("case %d:" % n) in run.stdout, run.stdout
+
+
+def test_host_and_device_resume_budget_share_one_source(tmp_path):
+    """设备侧的容量上限与主机侧的自查必须来自同一份真源（FR-14.9）。
+
+    防的是"两边各写一个数"：设备按 85 条拒绝、主机按 100 条放行（或反之），
+    于是现场出现"主机说可以、设备一声不吭"这种谁都查不出来的错位。
+    """
+    import re as _re
+
+    text = _render_sources(tmp_path)["drv_fota.h"].read_text(encoding="utf-8")
+    journal = load_fota_format()["metadata"]["journal"]
+
+    m = _re.search(r"#define FOTA_META_FIXED_SLOTS\s+(\d+)U", text)
+    assert m, "生成的 drv_fota.h 里找不到 FOTA_META_FIXED_SLOTS —— 容量上限被删了"
+    assert int(m.group(1)) == int(journal["fixed_slots"]), (
+        "设备侧的固定开销 %s 与真源 %s 不一致"
+        % (m.group(1), journal["fixed_slots"])
+    )
+    # 算式本身也要同形：上限必须是 (页容量 - 固定开销) × 分片大小
+    assert "FOTA_META_RECORD_COUNT - FOTA_META_FIXED_SLOTS" in text, (
+        "FOTA_MAX_RESUMABLE_BYTES 不再由「页容量 - 固定开销」算出 —— 与主机侧"
+        "的算式分叉了，两边会给出不同的上限"
+    )
+
+    fr = Framing()
+    slots, max_bytes = fr.resume_budget()
+    assert slots == int(journal["record_count"]) - int(journal["fixed_slots"])
+    assert max_bytes == slots * fr.chunk_size
 
 
 def test_l5_negative_envelopes_each_violate_one_rule():
@@ -586,4 +679,82 @@ def test_l5_bench_detects_dropping_the_ready_restore(tmp_path):
     assert run.returncode != 0, (
         "L5 没有抓到「收齐后掉电不恢复 READY」—— 已校验通过的补丁会被"
         "下一次 START 静默擦掉重收：\n%s" % run.stdout
+    )
+
+
+# M5/M6/M7：FR-14.9 的元数据日志容量准入被改坏。
+#
+# 三条变异分别对应三种改坏方式，缺一条都不算证明 —— 只测"删掉判据"的话，
+# 一个把上限放大到荒谬值的改动仍能全绿（它只是把拒绝推迟得更晚）。
+_M5_ANCHOR = ("    if (frames_est + FOTA_META_FIXED_SLOTS "
+              "> (uint32_t)FOTA_META_RECORD_COUNT) {")
+_M5_REPL = ("    if (0) {   /* MUTATION M5: 删掉日志容量准入，退回静默退化 */")
+
+_M6_ANCHOR = "> (uint32_t)FOTA_META_RECORD_COUNT) {"
+_M6_REPL = "> ((uint32_t)FOTA_META_RECORD_COUNT * 100U)) {   /* MUTATION M6: 上限放大 */"
+
+_M7_ANCHOR = "        g_last_error = FOTA_E_META_FULL;"
+_M7_REPL = "        g_last_error = FOTA_E_STAGING_FULL;   /* MUTATION M7: 错误码错位 */"
+
+
+def _mutate(anchor: str, repl: str) -> dict:
+    text = (_TEMPLATES_DIR / _DRIVER_C).read_text(encoding="utf-8")
+    assert text.count(anchor) == 1, (
+        "变异锚点在模板里不再唯一 —— 模板改过，请同步更新本测试的锚点：\n%s"
+        % anchor
+    )
+    return {_DRIVER_C: text.replace(anchor, repl)}
+
+
+def test_l5_bench_detects_missing_meta_capacity_guard(tmp_path):
+    """删掉日志容量准入，L5 必须报错（否则退化成"传输中途擦页"）。"""
+    run = _run_bench(tmp_path, override=_mutate(_M5_ANCHOR, _M5_REPL))
+    assert run.returncode != 0, (
+        "L5 没有抓到「日志容量准入被删」—— 大补丁会被放行，擦除窗口落到"
+        "传输中途，已收断点全丢且不报错：\n%s" % run.stdout
+    )
+
+
+def test_l5_bench_detects_inflated_meta_capacity(tmp_path):
+    """把上限放大到荒谬值，L5 必须报错（判据存在但阈值写错等于没有）。"""
+    run = _run_bench(tmp_path, override=_mutate(_M6_ANCHOR, _M6_REPL))
+    assert run.returncode != 0, (
+        "L5 没有抓到「日志容量上限被放大」—— 阈值写错与没有判据是同一个后果：\n%s"
+        % run.stdout
+    )
+
+
+def test_l5_bench_detects_wrong_meta_full_error_code(tmp_path):
+    """错误码错位成"槽装不下"，L5 必须报错。
+
+    这一条防的是现场误诊：两个原因的表现都是"START 被拒"，但补救方式完全
+    不同 —— 槽装不下要换更小的镜像，日志放不下要换传输方式（或放宽提交粒度）。
+    """
+    run = _run_bench(tmp_path, override=_mutate(_M7_ANCHOR, _M7_REPL))
+    assert run.returncode != 0, (
+        "L5 没有抓到「错误码错位」—— 现场会按「槽装不下」去补救一个"
+        "日志容量问题：\n%s" % run.stdout
+    )
+
+
+# M8：置了错误码却**不 return**（记一笔之后照收不误）。
+# 这是"报警但不停机"那一类改坏方式：错误码看着是对的，设备却继续往下走，
+# 于是 reserve 照样擦页、暂存区照样被擦 —— 与没有判据的后果完全相同。
+_M8_ANCHOR = """        log_flush();
+{% endif %}
+        return -1;
+    }"""
+
+_M8_REPL = """        log_flush();
+{% endif %}
+        (void)0;   /* MUTATION M8: 只报错、不拦截 */
+    }"""
+
+
+def test_l5_bench_detects_reported_but_not_rejected(tmp_path):
+    """置了 FOTA_E_META_FULL 却没有真拒绝，L5 必须报错。"""
+    run = _run_bench(tmp_path, override=_mutate(_M8_ANCHOR, _M8_REPL))
+    assert run.returncode != 0, (
+        "L5 没有抓到「只报错不拦截」—— 错误码是对的，但设备照收不误，"
+        "擦除窗口依旧落在传输中途：\n%s" % run.stdout
     )
