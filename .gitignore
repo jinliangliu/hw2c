@@ -51,3 +51,6 @@ __pycache__/
 
 # WorkBuddy workspace data (local session memory, not project source)
 .workbuddy/
+
+# CodeGraph local index (regenerable via `codegraph init`)
+.codegraph/
