@@ -230,17 +230,30 @@ int main(void)
         /* 跳转失败不应到达此处 */
     }
 
-    /* 固件校验失败 */
-    /* CRC 损坏说明固件写入不完整或 Flash 故障，直接切换槽位 */
-    boot_nvm_swap_active_slot();
+    /* 固件校验失败：**直接验另一个槽**，而不是"先切过去再试一次"（FR-14.8）。
+     *
+     * 旧写法在这里先 `boot_nvm_swap_active_slot()`，再比较切回来的槽位是否
+     * 还是原来那个，想以此判断"两个槽都试过了"。但 `swap_active_slot()` 的
+     * 定义就是取反 —— 那个条件恒为假，`led_error_blink()` 是永不执行的死代码。
+     * 后果：两槽都坏时设备在 A/B 之间无限软复位乒乓，灯一直在闪却永远起不来，
+     * 现场没有任何判据能区分"还在重试"和"彻底没救"。
+     *
+     * 判据改成"另一个槽现在能不能用"。`boot_crc_verify()` 是纯函数、无副作用，
+     * 跨复位也不需要任何持久状态 —— 于是这里既不必占用最后一个空闲的备份
+     * 寄存器（BKP4R），也不必回答"谁在什么时候清除这个标志"这种生命周期问题。
+     */
+    uint32_t other_addr = (slot == BOOT_SLOT_A) ? APP_B_START : APP_A_START;
+    uint32_t other_size = (slot == BOOT_SLOT_A) ? APP_B_SIZE  : APP_A_SIZE;
 
-    /* 如果两个槽位都已尝试过且仍失败 → Recovery */
-    if ((slot == BOOT_SLOT_A && boot_nvm_get_active_slot() == BOOT_SLOT_A) ||
-        (slot == BOOT_SLOT_B && boot_nvm_get_active_slot() == BOOT_SLOT_B)) {
-        /* 已经切换过一次又回到原来的槽位 → 两个槽位都有问题 */
-        led_error_blink();  /* SOS 信号，死循环 */
+    if (!boot_crc_verify(other_addr, other_size)) {
+        /* 两个槽的镜像都不可用 → 停在 SOS，不再复位。
+           继续乒乓只会把"彻底没救"伪装成"还在重试"。
+           活动槽保持不动（不 swap），便于现场取证最后尝试的是哪一槽。 */
+        led_error_blink();   /* SOS 信号，死循环，不会返回 */
     }
 
-    /* 切换后软复位，尝试另一个槽位 */
+    /* 另一个槽可用 → 切过去并软复位，让阶段 5 重新校验它
+       （swap 同时把重试计数归零，与新槽上"重新数 3 次"的语义一致） */
+    boot_nvm_swap_active_slot();
     soft_reset();
 }
