@@ -1,9 +1,16 @@
 # ============================================================
-# hw2c minimal system unit — software tasks layer
+# hw2c FOTA demo — software tasks layer
+#
+# 与 examples/base 逐字节相同（唯一差别是下面的 project.name）。
+# ⚠️ project.name **不是**工程名的来源：生成器取输出目录名
+#    （generator/generate.py:1187 `os.path.basename(actual_output)`），
+#    所以这里写 `base` 既不生效又误导 —— 产物里的 project()/横幅都是
+#    `fota_demo`。改回正确名字只为消除"照着抄就写错"的示范效应。
 #
 # System tasks (FreeRTOS):
 #   events_process_task  Centralized event dispatch via queue
 #   cli_task             CLI interaction + log output via USART2 (auto)
+#   fota_task            FOTA 接收任务（由 has_bootloader 注入）
 #
 # Components (hw2c component framework):
 #   led                  LED multi-instance pattern driver
@@ -11,7 +18,7 @@
 # ============================================================
 
 project:
-  name: base
+  name: fota_demo
   version: "1.0.0"
 
 event_task:

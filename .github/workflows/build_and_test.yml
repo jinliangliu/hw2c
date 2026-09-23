@@ -15,9 +15,11 @@ permissions:
 env:
   # 锁定 Python 版本，避免行为不一致
   PYTHON_VERSION: "3.11"
-  # 示例项目路径（可根据需要调整）
-  EXAMPLE_PATH: "examples/base"
-  OUTPUT_DIR: "output/base"
+  # ⚠️ 示例路径 / 输出目录**不要**放这里 —— 它们由 build job 的 matrix 提供。
+  # 单示例时代这两行是 `examples/base` / `output/base`，后果是：bootloader、
+  # 差分 OTA 的整批模板从不参与构建（FR-14 被误标 ✅ 的根因）。
+  # 依据：docs/reviews/merge-feasibility-base-fota-2026-09-23.md
+  # 护栏：generator/tests/test_ci_workflow.py
 
 jobs:
   # ============================================================
@@ -59,9 +61,26 @@ jobs:
   # Job 2: Build & Test（主要构建任务）
   # ============================================================
   build:
-    name: Build & Test
+    name: Build & Test (${{ matrix.name }})
     runs-on: ubuntu-latest
     needs: lint  # 只有 Lint 通过才执行构建
+
+    # 两个示例都必须进构建闸门：
+    #   · base       覆盖「无 bootloader」侧（模板里 {% if has_bootloader %} 的 else 分支）
+    #   · fota_demo  覆盖「有 bootloader」侧（boot_main / boot_crc / boot_nvm / drv_fota / fota_delta）
+    # 只留一个 ⇒ 另一侧永不渲染、永不编译，等于不存在。
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: base
+            example: examples/base
+            output: output/base
+            bootloader: false
+          - name: fota_demo
+            example: examples/fota_demo
+            output: output/fota_demo
+            bootloader: true
 
     steps:
       # ---------- 1. Checkout ----------
@@ -119,15 +138,15 @@ jobs:
       - name: Generate code from YAML
         id: generate
         run: |
-          mkdir -p ${{ env.OUTPUT_DIR }}
+          mkdir -p ${{ matrix.output }}
           python -m generator.generate \
-            -i ${{ env.EXAMPLE_PATH }}/hardware.yaml \
-            --task ${{ env.EXAMPLE_PATH }}/task.yaml \
-            --bind ${{ env.EXAMPLE_PATH }}/bind.yaml \
-            --components ${{ env.EXAMPLE_PATH }}/components.yaml \
-            --params ${{ env.EXAMPLE_PATH }}/params.yaml \
-            --pubsub ${{ env.EXAMPLE_PATH }}/pubsub.yaml \
-            -o ${{ env.OUTPUT_DIR }} \
+            -i ${{ matrix.example }}/hardware.yaml \
+            --task ${{ matrix.example }}/task.yaml \
+            --bind ${{ matrix.example }}/bind.yaml \
+            --components ${{ matrix.example }}/components.yaml \
+            --params ${{ matrix.example }}/params.yaml \
+            --pubsub ${{ matrix.example }}/pubsub.yaml \
+            -o ${{ matrix.output }} \
             --force -v
         continue-on-error: false
 
@@ -136,29 +155,67 @@ jobs:
         if: failure() && steps.generate.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: generation-error-logs
+          name: generation-error-logs-${{ matrix.name }}
           path: |
-            ${{ env.OUTPUT_DIR }}/*.log
+            ${{ matrix.output }}/*.log
             generator/*.log
 
-      # ---------- 7. Build Firmware ----------
+      # ---------- 7. Build Firmware（默认目标） ----------
       - name: Build firmware
         id: build
-        working-directory: ${{ env.OUTPUT_DIR }}
+        working-directory: ${{ matrix.output }}
         run: |
           cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake 2>&1 | tee build.log
           cmake --build build 2>&1 | tee -a build.log
         continue-on-error: false
 
-      # ---------- 7b. Run generated host unit tests ----------
+      # ---------- 7a. Bootloader 侧（只有 fota_demo 有这些目标） ----------
+      # ⚠️ bootloader / app / combined 都是 add_custom_target，**不带 ALL**：
+      #    上面那句 `cmake --build build` 一个都不会构建。少了这一步，
+      #    "把 fota_demo 加进矩阵"就等于什么也没覆盖。
+      - name: Build bootloader + patched app image + combined image
+        if: matrix.bootloader
+        working-directory: ${{ matrix.output }}
+        run: |
+          cmake --build build --target bootloader 2>&1 | tee -a build.log
+          cmake --build build --target app        2>&1 | tee -a build.log
+          cmake --build build --target combined   2>&1 | tee -a build.log
+
+      # ---------- 7b. 槽 B 镜像：必须单独一次 configure ----------
+      # 应用按槽分别链接（app_slot_a.ld 0x08002000 / app_slot_b.ld 0x08040000），
+      # 由 -DHW2C_APP_SLOT 选择。不单独 configure 就永远只有槽 A 版本。
+      - name: Build Slot B image
+        if: matrix.bootloader
+        working-directory: ${{ matrix.output }}
+        run: |
+          cmake -B build_b -G Ninja -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake -DHW2C_APP_SLOT=B 2>&1 | tee build_b.log
+          cmake --build build_b 2>&1 | tee -a build_b.log
+
+      # ---------- 7c. 判据：每个槽的镜像是不是按自己的槽基址链接的 ----------
+      # CRC 只覆盖文件本身、与链接基址无关 ⇒ "给槽 B 种了按槽 A 链接的镜像"
+      # 会一路校验通过，然后跳进错误的地址崩溃复位、串口零输出。
+      # 判据取向量表第二字（Reset_Handler）：它落在哪个槽区间，就是按哪个槽链接的。
+      - name: Verify each slot image is linked for its own slot
+        if: matrix.bootloader
+        working-directory: ${{ matrix.output }}
+        run: |
+          python ../../tools/ci/verify_slot_images.py \
+            --slot-a build/${{ matrix.name }}.bin \
+            --slot-b build_b/${{ matrix.name }}.bin \
+            --linker-a linker/app_slot_a.ld \
+            --linker-b linker/app_slot_b.ld \
+            --bootloader-ld linker/bootloader.ld \
+            --combined build/combined.bin
+
+      # ---------- 7d. Run generated host unit tests ----------
       - name: Run generated unit tests (host C)
-        working-directory: ${{ env.OUTPUT_DIR }}/test
+        working-directory: ${{ matrix.output }}/test
         run: |
           python run_tests.py
 
-      # ---------- 7c. Build & run SIL component tests ----------
+      # ---------- 7e. Build & run SIL component tests ----------
       - name: Build and run SIL component tests
-        working-directory: ${{ env.OUTPUT_DIR }}/test/sil
+        working-directory: ${{ matrix.output }}/test/sil
         run: |
           cmake -B build -S .
           cmake --build build
@@ -169,19 +226,25 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
-          path: ${{ env.OUTPUT_DIR }}/build.log
+          name: build-logs-${{ matrix.name }}
+          path: |
+            ${{ matrix.output }}/build.log
+            ${{ matrix.output }}/build_b.log
 
       # ---------- 8. Upload generated firmware ----------
       - name: Upload firmware binaries
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
-          name: firmware
+          name: firmware-${{ matrix.name }}
+          if-no-files-found: warn
           path: |
-            ${{ env.OUTPUT_DIR }}/build/*.elf
-            ${{ env.OUTPUT_DIR }}/build/*.bin
-            ${{ env.OUTPUT_DIR }}/build/*.hex
+            ${{ matrix.output }}/build/*.elf
+            ${{ matrix.output }}/build/*.bin
+            ${{ matrix.output }}/build/*.hex
+            ${{ matrix.output }}/build/bootloader/*.elf
+            ${{ matrix.output }}/build/bootloader/*.bin
+            ${{ matrix.output }}/build_b/*.bin
 
   # ============================================================
   # Job 3: Deploy MkDocs to GitHub Pages
