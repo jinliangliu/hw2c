@@ -516,7 +516,7 @@ hw2c://artifacts/{request_id}/{filename}    # 本机工作根内的生成产物
 | Python | 3.10+；PyYAML ≥6.0、Jinja2 ≥3.0、Pydantic ≥2.0、libcst ≥1.0.0、Click ≥8.1.0、pytest ≥7.0 |
 | 系统工具 | arm-none-eabi-gcc、CMake、Ninja、OpenOCD（可选） |
 | 硬件调试 | CMSIS-DAP (DAP-Link) / ST-Link |
-| 本机环境（开发机） | Python `C:/Users/pc/anaconda3/python.exe`；工具链 `C:/Arm/mingw-w64-i686-arm-none-eabi/bin/`、`C:/mingw64/bin/`；OpenOCD `C:/Arm/openocd-cb52502-i686-w64-mingw32/bin/openocd.exe`；串口 COM4 |
+| 本机环境（开发机） | Python 3.10+（如 conda 环境）；工具链 `arm-none-eabi-gcc` + CMake + Ninja；OpenOCD（可选）；USB 串口适配器 |
 | **供应商源码（强制）** | **`static/stm32g0/` 下的 ST 官方 HAL、CMSIS 与 FreeRTOS 内核「系统代码」一律不得修改**；仅允许修改**配置文件**（`FreeRTOSConfig.h`、`stm32g0xx_hal_conf.h` 等）与**中断向量/回调类文件**（`stm32g0xx_it.c`）。生成器、模板、补丁脚本、构建脚本均不得写入这些目录 |
 
 ### 6.1 供应商源码只读约束（Vendor Source Read-Only）

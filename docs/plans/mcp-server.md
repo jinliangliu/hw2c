@@ -50,7 +50,7 @@ build / 额外 target 三阶段，见 `generator/generate.py:829-926`）。
 
 ### 2.3 本机形态是优势，不再是限制
 
-pyOCD + ST-Link/DAP-Link、COM5 串口、`arm-none-eabi-gcc` 都在用户机器上，
+pyOCD + ST-Link/DAP-Link、USB 串口、`arm-none-eabi-gcc` 都在用户机器上，
 本机 stdio 进程可以直接访问。上一版"远程形态做不到烧录"的物理限制自然消失，
 但仍不能让智能体无闸门地改板子——见 §5.1。
 
