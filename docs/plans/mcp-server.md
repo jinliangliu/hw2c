@@ -168,15 +168,27 @@ hw2c 主仓只改 `docs/requirements.md` 与本文档；**不改 `generator/`、
 `generate_firmware` 立即返回 `request_id`；后台线程执行 `generate_service`：
 
 1. subprocess 调 `parser.cli gen`，产物落在
-   `<workspace>/<request_id>/<project_name>/`（含 build/）。
-2. 从 `<project>/build/` 收集 `*.elf / *.bin / *.hex / *.map / combined.bin`，
+   `<workspace>/<request_id>/<project_name>/`。**不能带 `--force`**：
+   `generator/generate.py:1307` 会因此整个跳过编译自检；每次用全新目录即可。
+2. 生成解释器与 MCP host **分开配**：本机 WorkBuddy 内置 Python 有 MCP SDK
+   但没有 `jinja2`，直接拿它跑生成器必然 `ModuleNotFoundError`。由
+   `HW2C_BUILD_PYTHON` 指定带 hw2c 依赖的解释器；`connector/local/install.py`
+   探测后写进 mcp.json，不写死在仓库里。
+3. hw2c 的编译自检在 staging 目录做，原子提交**不带 `build/`**
+   ⇒ 生成成功后必须在输出目录再跑一次
+   `cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake` +
+   `cmake --build build -j`，否则 manifest 恒为空、交付不了 `.elf/.bin`。
+   带 bootloader 的工程要额外点名 `bootloader` / `app` / `combined`
+   ——它们是 `add_custom_target`，不在默认目标里。
+4. 从 `<project>/build/` **顶层**收集 `*.elf / *.bin / *.hex / *.map`，
+   递归扫会捡到 CMake 的 `CMakeDetermineCompilerABI_*.bin` 探测文件。
    计算 size + sha256，生成 `artifact_manifest`。**这就是"可执行固件"的交付物**。
-3. 任务状态机：`queued → running → succeeded | failed | cancelled`，
+5. 任务状态机：`queued → running → succeeded | failed | cancelled`，
    存内存表（不做数据库），TTL 1 小时。WorkBuddy 侧每 2 s 轮询 `get_build_status`，上限 180 s。
-4. 编译状态三态：`compile_check ∈ {passed, failed, skipped}`。MCP 侧自己探测
-   cmake/ninja/arm-none-eabi-gcc 是否存在；缺任一即 `skipped` + warning，
+6. 编译状态三态：`compile_check ∈ {passed, failed, skipped}`。MCP 侧自己探测
+   cmake/ninja/arm-none-eabi-* 是否存在；缺任一即 `skipped` + warning，
    **不得**把 hw2c 的静默绿灯报成 `passed`。
-5. 输出目录固定，禁止接受用户传入 output 路径或 `--force`；命中返回 `E_FORBIDDEN`。
+7. 输出目录固定，禁止接受用户传入 output 路径或 `--force`；命中返回 `E_FORBIDDEN`。
 
 ### 5.4 加固项（本机仍必须）
 
