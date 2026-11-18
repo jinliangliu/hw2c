@@ -314,27 +314,28 @@
 | FR-18.7 | 实时 YAML 预览与 diff，可视化操作与手写 YAML 可切换 | ⏳ |
 | FR-18.8 | 解析进度可视化反馈（当前为 WebSocket 单次推送最终结果） | ⏳ |
 
-### FR-19 外部智能体访问（MCP server / WorkBuddy Connector）⏳
+### FR-19 外部智能体访问（本机 MCP / WorkBuddy Connector）⏳
 
-使 WorkBuddy 用户能以自然语言完成"提示词 → 可执行固件"闭环：解析、校验、生成源码、
-编译出固件产物；本机形态另可按提示词烧录。实现落在独立仓 `hw2c-web`，
-本仓只提供能力入口与知识契约。详细规划见 `docs/plans/mcp-server.md`。
+使 WorkBuddy 用户**在本机**以自然语言完成"提示词 → 可执行固件"闭环：解析、校验、
+生成源码、编译出固件产物；按需可烧录到接在这台机器上的板子。
+**只做本机 stdio Connector，不上架市场、不提供云端形态、不监听网络端口。**
+实现落在独立仓 `hw2c-web`，本仓只提供能力入口与知识契约。详细规划见 `docs/plans/mcp-server.md`。
 
 | ID | 需求 | 状态 |
 |----|------|------|
-| FR-19.1 | 提供两种 Connector 包：`hw2c-local`（stdio，本机，含编译与烧录）与 `hw2c-cloud`（streamableHttp，远程，仅生成/编译）。WorkBuddy 的 `mcpServers` 只取一个 Server，两者必须独立包、独立 source | ⏳ |
-| FR-19.2 | 共用工具固定为 `parse_eda` / `validate_config` / `list_examples` / `get_example` / `get_mcu_pinout` / `generate_firmware` / `get_build_status` / `list_artifacts`；仅本机另有 `list_probes` / `flash_firmware` / `verify_flash` / `capture_serial` | ⏳ |
+| FR-19.1 | 只提供一个 Connector 包 `hw2c-local`（stdio，本地安装）；工具注册不按形态分叉，烧录四工具由 `HW2C_ENABLE_FLASH=1` 控制 | ⏳ |
+| FR-19.2 | 工具集固定为 `parse_eda` / `validate_config` / `list_examples` / `get_example` / `get_mcu_pinout` / `generate_firmware` / `get_build_status` / `list_artifacts`，另有 `list_probes` / `flash_firmware` / `verify_flash` / `capture_serial` | ⏳ |
 | FR-19.3 | 生成/编译采用异步任务：`generate_firmware` 在 1 s 内返回 `request_id`，后台执行；智能体轮询 `get_build_status`。**禁止**同步等待完成——WorkBuddy MCP 默认超时 30 s，而生成+编译需 60–180 s | ⏳ |
 | FR-19.4 | 交付物必须是**可执行固件**：`artifact_manifest` 至少含 `.elf` 与 `.bin`（带 bootloader 的工程另含 `combined.bin`），附 size 与 sha256；不只是源码 ZIP | ⏳ |
-| FR-19.5 | 资源集覆盖需求文档、六层配置指南、由 Pydantic 动态生成的 schema、示例、FOTA/YMODEM 格式真源、器件模型与生成产物；**不得**复制出第四套 schema，不得暴露 `output/`、`build/`、`.workbuddy/`、`static/` 原始源码 | ⏳ |
-| FR-19.6 | 生成必须子进程隔离 + 每次请求独立临时目录 + 120 s 硬超时 + 并发上限 2；hw2c 生成入口的 `sys.exit` 与全局 logging 不得进入 MCP 进程 | ⏳ |
+| FR-19.5 | 资源集覆盖需求文档、六层配置指南、由 Pydantic 动态生成的 schema、示例、FOTA/YMODEM 格式真源、器件模型与生成产物；**不得**复制出第四套 schema，不得暴露 `.workbuddy/`、`static/` 内部资料 | ⏳ |
+| FR-19.6 | 生成必须子进程隔离 + 每次请求独立工作目录 + 120 s 硬超时 + 并发上限 2；hw2c 生成入口的 `sys.exit` 与全局 logging 不得进入 MCP 进程 | ⏳ |
 | FR-19.7 | 编译自检结果为 `passed` / `failed` / `skipped` 三态；MCP 侧自行探测工具链，cmake/ninja/arm-none-eabi-gcc 缺失导致 hw2c 静默通过时必须标 `skipped` 并给 warning，不得报 `passed` | ⏳ |
-| FR-19.8 | 子进程 stderr 不原样回传，须解析为结构化 issues（白名单字段、单条 ≤ 200 字符、最多 20 条）；产物以 `artifact_uri` 交付，不把二进制塞进工具结果 | ⏳ |
-| FR-19.9 | 远程形态须 Bearer token + workspace 目录隔离，鉴权配置缺失时不注册 MCP 路由（fail-closed），日志只记 token 哈希前缀；明确 CORS 不是安全边界 | ⏳ |
-| FR-19.10 | 烧录工具**仅本机形态**可用且默认禁用（`HW2C_ENABLE_FLASH=1` 才注册）；`flash_firmware` 的 `confirm` 必须为 true，否则只返回 dry-run；烧前必须回读对拍，带 bootloader 的工程默认烧 `combined.bin` | ⏳ |
-| FR-19.11 | Web 的 `/api/*` 与两种 MCP 入口共用同一 service 层，消除两处 subprocess 重复实现；鉴权策略互不合并 | ⏳ |
-| FR-19.12 | Connector 包符合开放平台规范（`connector-meta.json` / `mcp.json` / 图标 / `SKILL.md`；远程另需 `token-schema.json`）；SKILL.md 逐一说明工具参数与提示词示例 | ⏳ |
-| FR-19.13 | 新增契约护栏并做变异验证（≥ 6 个变异体全部被抓，含"异步改同步"）；变异仍全绿即判断言恒真，须重写 | ⏳ |
+| FR-19.8 | 子进程 stderr 不原样回传，须解析为结构化 issues（白名单字段、单条 ≤ 200 字符、最多 20 条）；产物以本机 `uri` 交付，不把二进制塞进工具结果 | ⏳ |
+| FR-19.9 | 本机 stdio 不监听端口、不引入 token / CORS / workspace 隔离；但路径穿越、超尺寸、编译状态三态、烧录 confirm 等本地护栏一条都不能省——智能体仍是必须约束的调用方 | ⏳ |
+| FR-19.10 | 烧录工具默认禁用（`HW2C_ENABLE_FLASH=1` 才注册）；`flash_firmware` 的 `confirm` 必须为 true，否则只返回 dry-run 且不调用 pyOCD；烧前必须回读对拍，带 bootloader 的工程默认烧 `combined.bin` | ⏳ |
+| FR-19.11 | Web 的 `/api/*` 与 MCP 共用同一 service 层，消除两处 subprocess 重复实现；MCP 是独立 stdio 进程，不挂在 FastAPI 上 | ⏳ |
+| FR-19.12 | Connector 包符合本地安装规范（`connector-meta.json` / `mcp.json` / 图标 / `SKILL.md`），无需 `token-schema.json`、不上架审核；SKILL.md 逐一说明工具参数与提示词示例 | ⏳ |
+| FR-19.13 | 新增契约护栏并做变异验证（≥ 6 个变异体全部被抓，含"异步改同步"与"删 confirm 闸门"）；变异仍全绿即判断言恒真，须重写 | ⏳ |
 
 ---
 
@@ -434,10 +435,10 @@ output/<demo>/
 
 ### 5.6 MCP 工具与资源契约
 
-传输：`hw2c-local` 用 stdio（本机，工具全集）；`hw2c-cloud` 用 streamableHttp
-（远程 HTTPS + Bearer token，无烧录类工具）。完整规划见 `docs/plans/mcp-server.md`。
+传输：仅 `hw2c-local`，**stdio 本机进程**；不上架 Connector 市场、无云端形态、
+不监听网络端口、不需要 token。完整规划见 `docs/plans/mcp-server.md`。
 
-**共用工具**（入参 → 出参，均为 JSON）：
+**工具**（入参 → 出参，均为 JSON）：
 
 ```text
 parse_eda(netlist_text, bom_text?, filename?)
@@ -462,7 +463,7 @@ list_artifacts(request_id)
     → [{ name, size, sha256, uri }]             # 至少含 .elf 与 .bin
 ```
 
-**仅本机工具**（`HW2C_ENABLE_FLASH=1` 才注册）：
+**烧录工具**（`HW2C_ENABLE_FLASH=1` 才注册，默认不注册）：
 
 ```text
 list_probes()                                  → 调试器列表
@@ -473,7 +474,8 @@ capture_serial(port, seconds?, trigger?)       → 带速率自检的串口文�
 ```
 
 - `layers` 形状：`{hardware, task?, components?, bind?, params?, pubsub?}`，值为 YAML 文本。
-- 禁止参数：output 路径、`--force`；远程形态另禁止一切烧录/串口参数 —— 命中 `E_FORBIDDEN`。
+- 禁止参数：output 路径、`--force` —— 命中 `E_FORBIDDEN`；本机不禁止烧录/串口参数，
+  但烧录工具默认不注册，且 `flash_firmware` 未带 `confirm: true` 时只返回 dry-run。
 - 限制：每层 ≤ 64 KiB、总 ≤ 256 KiB、产物 ZIP ≤ 32 MiB；超限 `E_TOO_LARGE`。
 - 超时：生成 subprocess 120 s，排队 30 s；超时 kill 进程组；智能体轮询上限 180 s。
 
@@ -487,7 +489,7 @@ hw2c://schema/{layer}                       # Model.model_json_schema() 动态�
 hw2c://examples/{name}/{layer}.yaml
 hw2c://format/{fota_format,ymodem_format}.json
 hw2c://models/{name}.yaml
-hw2c://artifacts/{request_id}/{filename}    # 仅同 workspace 可读
+hw2c://artifacts/{request_id}/{filename}    # 本机工作根内的生成产物
 ```
 
 ---
@@ -560,7 +562,7 @@ hw2c 的处理方式（**不修改 vendor**）：
 | 状态机 | 仅一层嵌套复合状态；不支持 Choice Point / Fork-Join；`event_t` 仅含 `id`，事件不带参数 |
 | 模拟外设 | 内部温度传感器绝对精度依赖片上 TS_CAL1/TS_CAL2，适合相对变化检测 |
 | Web 前端 | 解析进度无可视化反馈；YAML 编辑器仅支持单体 legacy 格式预览 |
-| 外部智能体访问（规划中） | 远程形态受 WorkBuddy MCP 默认 30 s 超时约束，必须异步轮询；远程形态无法访问本机 USB/串口，**不支持烧录**；本机形态要求用户自行准备 Python、编译链、pyOCD 与调试探针；鉴权仅静态 token → workspace 映射，多人共享前必须换 OAuth |
+| 外部智能体访问（规划中） | 受 WorkBuddy MCP 默认 30 s 超时约束，生成必须异步轮询；只做本机 stdio，不上架、无云端形态；要求用户在本机自行准备 Python、编译链、pyOCD 与调试探针；烧录工具默认禁用且需二次确认 |
 | 代码索引 | codegraph MCP 不索引 `.j2` / `.ld`（索引数为 0）；模板语义与链接脚本只能靠资源文档与 Grep，调用点结论必须复核 |
 | 工具链 | 环境依赖手工配置（Phase 6 计划用 Docker 固化） |
 
@@ -574,7 +576,7 @@ hw2c 的处理方式（**不修改 vendor**）：
 | Phase 5 | 可视化配置台（YAML 编辑器 / 外设面板 / 引脚可视化 / 状态机编辑器 / 任务分配 / 生成下载） | ⏳ 进行中 |
 | Phase 6 | 质量与合规：MISRA C:2012 扫描 + 自动修复、复杂度控制、静态分析、Docker 编译环境 | ⏳ |
 | Phase 7 | 多平台与生态：STM32F4/H7、Zephyr 后端、增量生成、插件市场、VSCode 扩展、CI 模板 | ⏳ |
-| Phase 8 | 外部智能体访问：WorkBuddy Connector（本机 stdio 含烧录 / 远程 streamableHttp），异步生成与编译，交付可执行固件（FR-19） | ⏳ 规划中 |
+| Phase 8 | 外部智能体访问：本机 WorkBuddy Connector（stdio，含默认禁用的烧录），异步生成与编译，交付可执行固件（FR-19） | ⏳ 规划中 |
 | v0.5 | 多 MCU 后端（ESP32、NXP） | ⏳ |
 | v0.6 | `bind.yaml` 事件系统完整实现 + Web BindGraph 联动 | ⏳ |
 | v1.0 | 免编程工作流闭环：EDA 上传 → 拖拽编排 → 一键固件 | ⏳ |
@@ -605,7 +607,7 @@ hw2c 的处理方式（**不修改 vendor**）：
 | FR-16 测试体系 | `templates/test/`、`generator/run_tests.py`、`generator/tests/`、`tests/`、`parser/tests/` |
 | FR-17 工具链/CI | `templates/project/*`、`templates/vscode/*`、`.github/workflows/build_and_test.yml` |
 | FR-18 可视化配置台 | `docs/roadmap/phase5-plan.md`、`docs/plans/three-layer-split.md`（Web 章节） |
-| FR-19 外部智能体访问 | `docs/plans/mcp-server.md`、`hw2c-web/backend/{auth.py,services/,mcp/,tests/test_mcp_contract.py}`、`hw2c-web/connector/{local,cloud}/`（均待建）、`generator/schemas/*.py`（动态 schema 真源） |
+| FR-19 外部智能体访问 | `docs/plans/mcp-server.md`、`hw2c-web/backend/{services/,mcp/,tests/test_mcp_contract.py}`、`hw2c-web/connector/local/`（均待建）、`generator/schemas/*.py`（动态 schema 真源） |
 | NFR-3 / Phase 6 | `docs/roadmap/milestones.md` |
 | NFR-12 子模块约束 | `AGENTS.md` 教训 1、`docs/requirements.md` §6.1、`templates/src/main.c.j2`（以初始化**排序**替代生成期补丁，旧的 `generate.py::_apply_vendored_patches()` 已删除） |
 | 全部 | `README.md`、`AGENTS.md`、`docs/developer-guide/architecture-overview.md` |
