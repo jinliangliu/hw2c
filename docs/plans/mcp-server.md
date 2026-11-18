@@ -1,6 +1,6 @@
 # 外部智能体访问（MCP Server / WorkBuddy Connector）实施规划
 
-> 状态：规划定稿（第三版），待实现。需求入口为 `docs/requirements.md` FR-19 / §5.6。
+> 状态：规划定稿（第三版）；P1–P3 已实现，P4 待做。需求入口为 `docs/requirements.md` FR-19 / §5.6。
 > 本文件只写"怎么做"，不重复需求条款。日期：2026-11-18。
 > **范围：本机 stdio 单形态，不上架 Connector 市场，不暴露网络端口。**
 
@@ -141,13 +141,17 @@ hw2c 主仓只改 `docs/requirements.md` 与本文档；**不改 `generator/`、
 |---|---|---|
 | `list_probes` | 无 | pyOCD 探测到的调试器列表 |
 | `flash_firmware` | `request_id`, `artifact`, `slot?`, `confirm` | 回读对拍结果 + 烧录结果 |
-| `verify_flash` | `request_id`, `artifact` | 逐字节比对结果 |
-| `capture_serial` | `port`, `seconds?`, `trigger?` | 带速率自检的串口文本 |
+| `verify_flash` | `request_id`, `artifact`, `slot?` | 逐字节比对结果（只读，槽位可按向量表自动定位） |
+| `capture_serial` | `port`, `seconds?`, `trigger?` | 带速率自检的串口文本（只读，不向设备写字节） |
 
-`flash_firmware` 的安全闸门：`confirm` 必须为 `true`，否则只返回 dry-run 计划（目标地址、
-预计覆盖区、镜像 sha256）；先回读对拍再决定是否烧；带 bootloader 的工程默认烧
+`flash_firmware` 的安全闸门：`confirm` 必须为**字面 JSON 布尔 true**，否则只返回 dry-run
+计划（目标地址、预计覆盖区、镜像 sha256）；先回读对拍再决定是否烧；带 bootloader 的工程默认烧
 `combined.bin` 到 `0x08000000`；槽 B 需显式 `slot: "B"`（且必须单独按槽 B 基址链接，
 见项目教训 15/22）。这些约束来自项目教训，工具描述里必须写清楚，不能指望智能体自己知道。
+
+**SDK 会强转 `confirm`**：签名若写 `confirm: bool`，MCP 的 pydantic 参数校验会把字符串
+`"true"` 变成 `True` 再进函数，闸门形同虚设（P3 实测）。因此签名故意不写 `bool`，
+在函数内用 `confirm is not True` 判断，并用渲染级护栏钉死这个注解。
 
 ### 5.2 资源集
 
@@ -211,6 +215,25 @@ hw2c 主仓只改 `docs/requirements.md` 与本文档；**不改 `generator/`、
   "把上次生成的固件烧到板子的槽 B，烧之前先回读对拍"。
   模型主要靠工具描述决定是否调用，描述写糊了就不会被用。
 
+### 5.5.1 P3 实施事实
+
+- `services/flash_service.py` 只做纯规划与受控子进程：bin 镜像必须来自 manifest，
+  sha256 与 size 二次核对；Reset_Handler 与**本次构建产物里的** `linker/*.ld`
+  区间对账，不猜基址。`combined.bin` 故意跨 bootloader 与槽 A（实测 122668 B，
+  bootloader 区只有 6144 B），按"必须装进单个区间"判会误拒，已按两区总上限放行。
+- pyOCD 目标只由 `hardware.yaml::mcu.part` 映射到已验证的 `stm32g0b1retx` /
+  `stm32g0b1vetx`；未知型号直接拒绝，不 "自动检测"。
+- 回读走 `services/pyocd_readback.py`（pyOCD Python API + `read_memory_block8`），
+  因为 CLI `savemem` 在本机对任何路径都报 invalid argument（教训 13）。
+- 写入走 `pyocd load -e sector -a <base> --no-reset`，**不整片擦除**：槽 B 写入不能
+  波及引导器/槽 A；写完保持停机，不给串口监听制造竞态。
+- 本机 Connector 的 `timeout` 从默认 30 s 提到 180000 ms：全片回读 + 写 + 再回读
+  无法塞进 30 s。生成仍然异步，不靠放宽超时解决（§2.1 不变）。
+- 真机状态（2026-11-18）：stdio 闭环已拿到 12 工具、探针 UID、fota_demo 六层生成
+  （`compile_check=passed`，manifest 含 `combined.bin`）、dry-run 计划与字符串确认
+  拒绝；回读阶段 ST-Link 枚举正常但 SWD 报 `Get IDCODE error`（1 MHz 同样失败），
+  属硬件链路问题，待板子断电重插后补做写前/写后对拍。
+
 ## 6. 实施阶段
 
 | 阶段 | 内容 | 验收 |
@@ -218,7 +241,7 @@ hw2c 主仓只改 `docs/requirements.md` 与本文档；**不改 `generator/`、
 | P0 | 本文档 + FR-19 / §5.6 / §8 / §9 / §10（本轮） | 需求评审通过 |
 | P1 | service 抽取 + 只读工具 + 全部 resources + local Connector 骨架 | stdio 接入 WorkBuddy，工具可见 |
 | P2 | 异步 `generate_firmware` + `get_build_status` + 编译产物 manifest | 提示词到 `.elf/.bin` 闭环，30 s 内返回 request_id |
-| P3 | flash 四工具（默认禁用）+ 真机烧录回读对拍 | COM5/探针实跑通过 |
+| P3 | flash 四工具（默认禁用）+ 真机烧录回读对拍 | 契约 33/33、变异 33/33、stdio dry-run 已过；回读待 SWD 硬件恢复 |
 | P4 | Web 路由切 service；SKILL.md 与提示词示例打磨 | e2e 全绿；Skill 能引导智能体一次成功 |
 
 ## 7. 护栏与验收

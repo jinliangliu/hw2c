@@ -323,19 +323,19 @@
 
 | ID | 需求 | 状态 |
 |----|------|------|
-| FR-19.1 | 只提供一个 Connector 包 `hw2c-local`（stdio，本地安装）；工具注册不按形态分叉，烧录四工具由 `HW2C_ENABLE_FLASH=1` 控制 | ⏳ |
-| FR-19.2 | 工具集固定为 `parse_eda` / `validate_config` / `list_examples` / `get_example` / `get_mcu_pinout` / `generate_firmware` / `get_build_status` / `list_artifacts`，另有 `list_probes` / `flash_firmware` / `verify_flash` / `capture_serial` | ⏳ |
-| FR-19.3 | 生成/编译采用异步任务：`generate_firmware` 在 1 s 内返回 `request_id`，后台执行；智能体轮询 `get_build_status`。**禁止**同步等待完成——WorkBuddy MCP 默认超时 30 s，而生成+编译需 60–180 s | ⏳ |
-| FR-19.4 | 交付物必须是**可执行固件**：`artifact_manifest` 至少含 `.elf` 与 `.bin`（带 bootloader 的工程另含 `combined.bin`），附 size 与 sha256；不只是源码 ZIP | ⏳ |
-| FR-19.5 | 资源集覆盖需求文档、六层配置指南、由 Pydantic 动态生成的 schema、示例、FOTA/YMODEM 格式真源、器件模型与生成产物；**不得**复制出第四套 schema，不得暴露 `.workbuddy/`、`static/` 内部资料 | ⏳ |
-| FR-19.6 | 生成必须子进程隔离 + 每次请求独立工作目录 + 120 s 硬超时 + 并发上限 2；hw2c 生成入口的 `sys.exit` 与全局 logging 不得进入 MCP 进程 | ⏳ |
-| FR-19.7 | 编译自检结果为 `passed` / `failed` / `skipped` 三态；MCP 侧自行探测工具链，cmake/ninja/arm-none-eabi-gcc 缺失导致 hw2c 静默通过时必须标 `skipped` 并给 warning，不得报 `passed` | ⏳ |
-| FR-19.8 | 子进程 stderr 不原样回传，须解析为结构化 issues（白名单字段、单条 ≤ 200 字符、最多 20 条）；产物以本机 `uri` 交付，不把二进制塞进工具结果 | ⏳ |
-| FR-19.9 | 本机 stdio 不监听端口、不引入 token / CORS / workspace 隔离；但路径穿越、超尺寸、编译状态三态、烧录 confirm 等本地护栏一条都不能省——智能体仍是必须约束的调用方 | ⏳ |
-| FR-19.10 | 烧录工具默认禁用（`HW2C_ENABLE_FLASH=1` 才注册）；`flash_firmware` 的 `confirm` 必须为 true，否则只返回 dry-run 且不调用 pyOCD；烧前必须回读对拍，带 bootloader 的工程默认烧 `combined.bin` | ⏳ |
+| FR-19.1 | 只提供一个 Connector 包 `hw2c-local`（stdio，本地安装）；工具注册不按形态分叉，烧录四工具由 `HW2C_ENABLE_FLASH=1` 控制 | ✅ |
+| FR-19.2 | 工具集固定为 `parse_eda` / `validate_config` / `list_examples` / `get_example` / `get_mcu_pinout` / `generate_firmware` / `get_build_status` / `list_artifacts`，另有 `list_probes` / `flash_firmware` / `verify_flash` / `capture_serial` | ✅ |
+| FR-19.3 | 生成/编译采用异步任务：`generate_firmware` 在 1 s 内返回 `request_id`，后台执行；智能体轮询 `get_build_status`。**禁止**同步等待完成——WorkBuddy MCP 默认超时 30 s，而生成+编译需 60–180 s | ✅ |
+| FR-19.4 | 交付物必须是**可执行固件**：`artifact_manifest` 至少含 `.elf` 与 `.bin`（带 bootloader 的工程另含 `combined.bin`），附 size 与 sha256；不只是源码 ZIP | ✅ |
+| FR-19.5 | 资源集覆盖需求文档、六层配置指南、由 Pydantic 动态生成的 schema、示例、FOTA/YMODEM 格式真源、器件模型与生成产物；**不得**复制出第四套 schema，不得暴露 `.workbuddy/`、`static/` 内部资料 | ✅ |
+| FR-19.6 | 生成必须子进程隔离 + 每次请求独立工作目录 + 120 s 硬超时 + 并发上限 2；hw2c 生成入口的 `sys.exit` 与全局 logging 不得进入 MCP 进程 | ✅ |
+| FR-19.7 | 编译自检结果为 `passed` / `failed` / `skipped` 三态；MCP 侧自行探测工具链，cmake/ninja/arm-none-eabi-gcc 缺失导致 hw2c 静默通过时必须标 `skipped` 并给 warning，不得报 `passed` | ✅ |
+| FR-19.8 | 子进程 stderr 不原样回传，须解析为结构化 issues（白名单字段、单条 ≤ 200 字符、最多 20 条）；产物以本机 `uri` 交付，不把二进制塞进工具结果 | ✅ |
+| FR-19.9 | 本机 stdio 不监听端口、不引入 token / CORS / workspace 隔离；但路径穿越、超尺寸、编译状态三态、烧录 confirm 等本地护栏一条都不能省——智能体仍是必须约束的调用方 | ✅ |
+| FR-19.10 | 烧录工具默认禁用（`HW2C_ENABLE_FLASH=1` 才注册）；`flash_firmware` 的 `confirm` 必须为 true，否则只返回 dry-run 且不调用 pyOCD；烧前必须回读对拍，带 bootloader 的工程默认烧 `combined.bin` | ✅ |
 | FR-19.11 | Web 的 `/api/*` 与 MCP 共用同一 service 层，消除两处 subprocess 重复实现；MCP 是独立 stdio 进程，不挂在 FastAPI 上 | ⏳ |
-| FR-19.12 | Connector 包符合本地安装规范（`connector-meta.json` / `mcp.json` / 图标 / `SKILL.md`），无需 `token-schema.json`、不上架审核；SKILL.md 逐一说明工具参数与提示词示例 | ⏳ |
-| FR-19.13 | 新增契约护栏并做变异验证（≥ 6 个变异体全部被抓，含"异步改同步"与"删 confirm 闸门"）；变异仍全绿即判断言恒真，须重写 | ⏳ |
+| FR-19.12 | Connector 包符合本地安装规范（`connector-meta.json` / `mcp.json` / 图标 / `SKILL.md`），无需 `token-schema.json`、不上架审核；SKILL.md 逐一说明工具参数与提示词示例 | ✅ |
+| FR-19.13 | 新增契约护栏并做变异验证（≥ 6 个变异体全部被抓，含"异步改同步"与"删 confirm 闸门"）；变异仍全绿即判断言恒真，须重写 | ✅ |
 
 ---
 
@@ -469,15 +469,27 @@ list_artifacts(request_id)
 list_probes()                                  → 调试器列表
 flash_firmware(request_id, artifact, slot?, confirm)
     → { dry_run?, before_sha256, after_sha256, written }
-verify_flash(request_id, artifact)             → 逐字节比对结果
+verify_flash(request_id, artifact, slot?)             → 逐字节比对结果
 capture_serial(port, seconds?, trigger?)       → 带速率自检的串口文本
 ```
+
+- 烧录目标由**镜像向量表第二字（Reset_Handler）落在哪个区间**反推，并与链接脚本
+  （`linker/app_slot_{a,b}.ld` / `bootloader.ld`，真源）对账：默认只接受
+  `combined.bin` → `0x08000000`；应用镜像必须显式 `slot: "A" | "B"`，
+  镜像的 Reset_Handler 必须落在该槽区间内，否则 `E_FORBIDDEN`。
+  `verify_flash` 只读，可省略 `slot`（按向量表自动定位区间）。
+- 烧录用 sector 擦除并限定目标地址，不做整片擦除（槽 B 写入不得波及引导器/槽 A）；
+  写前回读对拍，已经一致则不写；写后再回读逐字节校验，不一致 `E_VERIFY_FAILED`。
+  烧录结束保持停机、不自动复位，避免串口监听错过开机横幅。
 
 - `layers` 形状：`{hardware, task?, components?, bind?, params?, pubsub?}`，值为 YAML 文本。
 - 禁止参数：output 路径、`--force` —— 命中 `E_FORBIDDEN`；本机不禁止烧录/串口参数，
   但烧录工具默认不注册，且 `flash_firmware` 未带 `confirm: true` 时只返回 dry-run。
 - 限制：每层 ≤ 64 KiB、总 ≤ 256 KiB、产物 ZIP ≤ 32 MiB；超限 `E_TOO_LARGE`。
 - 超时：生成 subprocess 120 s，排队 30 s；超时 kill 进程组；智能体轮询上限 180 s。
+- `flash_firmware` 的 `confirm` 必须拒绝 `"true"` / `1` 等非布尔输入：MCP SDK 会按
+  参数类型强转，签名写成 `bool` 时闸门会被字符串绕过；必须做字面布尔判断并加护栏。
+  烧录全流程含全片回读，本机 Connector 的 `timeout` 设为 180 s（生成仍走异步）。
 
 **资源**（只读）：
 
